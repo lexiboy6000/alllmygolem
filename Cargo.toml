@@ -1,0 +1,63 @@
+[package]
+name = "golem"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+arboard = "3.6.1"
+async-trait = "0.1.89"
+# We attach to an already-running Chrome over ws://localhost, so we do NOT need
+# the binary fetcher (which pulls a zip backend) nor a TLS feature.
+chromiumoxide = { version = "0.9.1", default-features = false }
+chrono = { version = "0.4.45", features = ["serde"] }
+directories = "6.0.0"
+# Use the glow (OpenGL/EGL) renderer, not the default wgpu one: this device has no
+# Vulkan driver, so wgpu probes Vulkan, errors ("Found no drivers!"), and falls
+# back anyway — glow avoids that entirely and is the right fit for a GL-only box.
+eframe = { version = "0.34.3", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.34.3"
+egui_extras = { version = "0.34.3", features = ["image", "file"] }
+enigo = { version = "0.6.1", default-features = false, features = ["x11rb", "wayland"] }
+futures = "0.3.32"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+libc = "0.2.186"
+parking_lot = "0.12.5"
+rand = "0.10.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "charset"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "process", "fs", "io-util", "rt"] }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.23.3", features = ["v4"] }
+
+# Stability is the #1 requirement (see docs/STABILITY.md): keep unwinding enabled
+# in every profile so a panic in a worker task is isolated and caught, never
+# aborting the whole process and losing hours of work.
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+# Keep symbols so the panic hook can log useful backtraces from long runs.
+strip = false
+debug = 1
+
+# No-panic guardrails. These fire under `cargo clippy` and flag the constructs
+# that can crash a multi-hour run. The engine hot path must stay clean.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "warn"

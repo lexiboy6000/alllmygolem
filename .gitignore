@@ -1,0 +1,3 @@
+/target
+# Golem runtime output (logs, checkpoints, downloads, extracted task data)
+/golem-output
