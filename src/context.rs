@@ -175,6 +175,19 @@ impl Default for PromptBus {
 }
 
 /// Everything passed to `Workflow::run`.
+/// Whether this process is running under a Wayland compositor. Golem and the
+/// browser it drives share a session, so the answer applies to both.
+///
+/// It matters because a Wayland client is never told where its own window sits
+/// on screen -- there is no protocol for it -- so `window.screenX`/`screenY`
+/// are a constant 0 and the real OS cursor cannot be aimed at a page element.
+/// enigo can't read the pointer position under Wayland either, so the native
+/// input path is unusable here regardless.
+fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland"))
+}
+
 pub struct WorkflowCtx {
     /// Raw browser/CDP backend — escape hatch for anything not wrapped below.
     pub browser: Arc<dyn BrowserBackend>,
@@ -669,6 +682,19 @@ impl WorkflowCtx {
     /// so callers fall back to the CDP click, which works purely in viewport
     /// coordinates and is unaffected.
     async fn viewport_screen_offset(&self) -> Result<(f64, f64)> {
+        // Check the session first: the frame height DOES measure non-zero on
+        // Wayland once the window is settled (observed: outerHeight-innerHeight
+        // = 87 for the tab strip + URL bar), so the geometry heuristic below
+        // can't be relied on to spot it. `screenX`/`screenY` are still a
+        // constant 0, so the mapping is still wrong -- just less obviously.
+        if is_wayland_session() {
+            return Err(GolemError::Other(
+                "this is a Wayland session, and a Wayland client is never told where its \
+                 own window sits (window.screenX/Y are always 0), so viewport coordinates \
+                 cannot be mapped to screen pixels"
+                    .into(),
+            ));
+        }
         let v = self
             .browser
             .eval(
@@ -742,8 +768,13 @@ impl WorkflowCtx {
                 Ok(())
             }
             Err(e) => {
+                // Whatever stopped the native cursor (no Wayland protocol for
+                // reading the pointer, revoked macOS Accessibility, ...) will
+                // stop it for every later click too, so stop retrying it.
+                self.pointer_unmappable = true;
                 self.warn(format!(
-                    "native cursor click failed ({e}) -- falling back to CDP click"
+                    "native cursor click failed ({e}) -- using CDP clicks for the rest of \
+                     this run"
                 ));
                 self.click_at(x, y).await
             }
