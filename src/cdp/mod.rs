@@ -518,18 +518,30 @@ impl BrowserBackend for CdpBrowser {
             if let Some(b) = browser
                 && let Ok(pages) = b.pages().await
             {
-                // Pick the LAST (newest) page that matches and isn't excluded — so a
-                // stale/expired session tab from an earlier run never wins.
-                let mut chosen: Option<Page> = None;
+                let mut matches: Vec<Page> = Vec::new();
                 for p in pages {
                     if let Some(u) = page_url_opt(&p, self.config.call_timeout).await
                         && u.contains(url_substring)
                         && (exclude.is_empty() || !u.contains(exclude))
                     {
-                        chosen = Some(p);
+                        matches.push(p);
                     }
                 }
-                if let Some(p) = chosen {
+                // Newest first — a stale/expired session tab from an earlier run
+                // must never win over a freshly opened one.
+                for p in matches.into_iter().rev() {
+                    // A tab that was just closed can still be listed here: the
+                    // `Target.targetDestroyed` event that would drop it from
+                    // `pages()` may not have arrived yet, and it still reports
+                    // its old URL. Adopting one is silent until the next real
+                    // command, which then fails with "lost the connection to
+                    // Chrome" — observed right after the pre-step closes the
+                    // extra multimango tab, where the following workflow is
+                    // filesystem-only and the breakage only surfaces a step
+                    // later. Make it prove it answers before committing to it.
+                    if !page_responds(&p, self.config.call_timeout).await {
+                        continue;
+                    }
                     // Make it the controlled page (keep it active even if occluded,
                     // like the initial attach does).
                     let _ = p.execute(SetFocusEmulationEnabledParams::new(true)).await;
@@ -818,6 +830,16 @@ fn char_key(c: char) -> Option<(String, i64, bool)> {
 }
 
 /// Best-effort current URL of a page, swallowing errors to `None`.
+/// Whether `page` still answers a trivial round-trip to its own session.
+///
+/// `pages()` and `Page::url()` can both be satisfied from target info that is
+/// already stale, so a closed tab looks perfectly healthy right up until the
+/// first command that actually needs the renderer. This is the cheapest thing
+/// that doesn't.
+async fn page_responds(page: &Page, timeout: Duration) -> bool {
+    matches!(tokio::time::timeout(timeout, page.evaluate("1")).await, Ok(Ok(_)))
+}
+
 async fn page_url_opt(page: &Page, timeout: Duration) -> Option<String> {
     match tokio::time::timeout(timeout, page.url()).await {
         Ok(Ok(opt)) => opt,
