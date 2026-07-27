@@ -190,6 +190,11 @@ pub struct WorkflowCtx {
     store: BTreeMap<String, Value>,
     inputs: BTreeMap<String, String>,
     last_mouse: Point,
+    /// Set once the window turns out to be unmappable to screen pixels (the
+    /// Wayland case — see [`viewport_screen_offset`](Self::viewport_screen_offset)).
+    /// It cannot become mappable later in a run, so cache it: without this,
+    /// every native-cursor click re-probes and logs the same warning.
+    pointer_unmappable: bool,
     step_index: usize,
     http: reqwest::Client,
     /// Sender back into the engine's command queue (see [`queue_chain`](Self::queue_chain)).
@@ -225,6 +230,7 @@ impl WorkflowCtx {
             store: BTreeMap::new(),
             inputs,
             last_mouse: Point::ZERO,
+            pointer_unmappable: false,
             step_index: 0,
             http,
             commands,
@@ -651,15 +657,37 @@ impl WorkflowCtx {
     /// `outerHeight - innerHeight`. Both `screenX/Y` and enigo speak logical
     /// (not physical-Retina) pixels, so no DPR scaling is needed — but this
     /// does assume 100% page zoom and no docked devtools.
+    ///
+    /// Under a Wayland compositor (Hyprland, GNOME, Sway, ...) none of that
+    /// holds: a Wayland client is never told where its own window sits, so
+    /// Chromium reports `screenX`/`screenY` as a constant 0, and with
+    /// client-side decorations `outerHeight == innerHeight` — the tab strip
+    /// and URL bar measure as zero height. The naive arithmetic then yields a
+    /// perfectly plausible-looking `(0, 0)`, which would silently aim the real
+    /// cursor at raw screen coordinates and click somewhere else entirely
+    /// (possibly in another window). Detect that signature and fail instead,
+    /// so callers fall back to the CDP click, which works purely in viewport
+    /// coordinates and is unaffected.
     async fn viewport_screen_offset(&self) -> Result<(f64, f64)> {
         let v = self
             .browser
             .eval(
                 "(function(){ var side = (window.outerWidth - window.innerWidth) / 2; \
+                 var chrome = window.outerHeight - window.innerHeight; \
                  return { sx: window.screenX + side, \
-                          sy: window.screenY + (window.outerHeight - window.innerHeight) - side }; })()",
+                          sy: window.screenY + chrome - side, \
+                          positioned: chrome > 0 || window.screenX !== 0 || window.screenY !== 0 }; })()",
             )
             .await?;
+        if v.get("positioned").and_then(Value::as_bool) == Some(false) {
+            return Err(GolemError::Other(
+                "the window reports neither a screen position nor a frame height \
+                 (screenX/Y are 0 and outerHeight == innerHeight) -- a Wayland compositor \
+                 never tells a page where its window is, so viewport coordinates cannot be \
+                 mapped to screen pixels"
+                    .into(),
+            ));
+        }
         match (
             v.get("sx").and_then(Value::as_f64),
             v.get("sy").and_then(Value::as_f64),
@@ -687,11 +715,16 @@ impl WorkflowCtx {
             self.warn("native input unavailable -- falling back to CDP click");
             return self.click_at(x, y).await;
         }
+        if self.pointer_unmappable {
+            return self.click_at(x, y).await;
+        }
         let (ox, oy) = match self.viewport_screen_offset().await {
             Ok(o) => o,
             Err(e) => {
+                self.pointer_unmappable = true;
                 self.warn(format!(
-                    "couldn't map viewport to screen coordinates ({e}) -- falling back to CDP click"
+                    "couldn't map viewport to screen coordinates ({e}) -- using CDP clicks \
+                     for the rest of this run"
                 ));
                 return self.click_at(x, y).await;
             }

@@ -577,11 +577,67 @@ pub fn current_task_dir(ctx: &WorkflowCtx) -> Result<std::path::PathBuf> {
 
 /// The OS's real Downloads folder (e.g. `~/Downloads` on macOS) -- where
 /// Chrome saves files when we DON'T redirect it, which is exactly what a
-/// manual click does.
-fn system_downloads_dir() -> Result<std::path::PathBuf> {
-    directories::UserDirs::new()
-        .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
-        .ok_or_else(|| GolemError::Other("couldn't determine the system Downloads folder".into()))
+/// manual click does. The `bool` is whether the browser has to be *told* to
+/// use it (see below).
+///
+/// Deliberately NOT `directories::UserDirs::download_dir()`. That follows the
+/// XDG convention where a user directory pointing at `$HOME` means "disabled"
+/// and returns `None` -- but a stock `xdg-user-dirs-update` on a fresh Arch /
+/// Hyprland install writes exactly that (`XDG_DOWNLOAD_DIR="$HOME/"` for every
+/// entry, when none of the folders existed at the time it ran). Golem then
+/// failed with "couldn't determine the system Downloads folder" on a machine
+/// where Chromium itself was saving downloads perfectly happily. So resolve it
+/// the way Chromium does: `$XDG_DOWNLOAD_DIR`, then `user-dirs.dirs`, then
+/// `~/Downloads`.
+///
+/// `$HOME` is never returned as the folder to WATCH. That resolution is legal
+/// (and is what Chromium uses on such a machine), but this module moves the
+/// new file it spots into the task folder, and `$HOME` gains unrelated files
+/// all the time. When the lookup lands there, fall back to `~/Downloads` and
+/// report `true` so the caller redirects the browser to match.
+fn system_downloads_dir() -> Result<(std::path::PathBuf, bool)> {
+    let home = directories::UserDirs::new()
+        .map(|u| u.home_dir().to_path_buf())
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .ok_or_else(|| GolemError::Other("couldn't determine the home directory".into()))?;
+
+    let resolved = std::env::var_os("XDG_DOWNLOAD_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| xdg_download_dir_from_config(&home))
+        .unwrap_or_else(|| home.join("Downloads"));
+
+    // Normalize so a trailing separator ("$HOME/") compares equal to "$HOME".
+    let resolved: std::path::PathBuf = resolved.components().collect();
+    if resolved == home {
+        return Ok((home.join("Downloads"), true));
+    }
+    Ok((resolved, false))
+}
+
+/// `XDG_DOWNLOAD_DIR` as written in `~/.config/user-dirs.dirs`, with a leading
+/// `$HOME` expanded. This is the same file `xdg-user-dir DOWNLOAD` reads, and
+/// what Chromium consults for its default download directory.
+fn xdg_download_dir_from_config(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("user-dirs.dirs");
+    let text = std::fs::read_to_string(config).ok()?;
+    for line in text.lines() {
+        let Some(value) = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=") else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"');
+        let path = match value.strip_prefix("$HOME") {
+            Some(rest) => home.join(rest.trim_start_matches('/')),
+            None => std::path::PathBuf::from(value),
+        };
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Click a link (found via `find_js`, an IIFE returning `{x, y}` or `null`)
@@ -616,7 +672,18 @@ pub async fn click_and_wait_for_download(
 ) -> Result<std::path::PathBuf> {
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| GolemError::Io(format!("mkdir {}: {e}", dest_dir.display())))?;
-    let downloads = system_downloads_dir()?;
+    let (downloads, redirect) = system_downloads_dir()?;
+    if redirect {
+        // This machine's XDG config points the Downloads folder at $HOME, so
+        // the browser would save into a directory we must not sweep for new
+        // files. Send it somewhere dedicated instead.
+        ctx.set_download_dir(&downloads).await?;
+        ctx.output(format!(
+            "system Downloads folder is configured as the home directory -- \
+             pointing the browser at {} for this download",
+            downloads.display()
+        ));
+    }
     let before = list_names(&downloads);
 
     // The page can take a moment to render (SPA route change, data still
@@ -724,7 +791,15 @@ pub async fn click_and_wait_for_download(
 
 fn list_names(dir: &std::path::Path) -> std::collections::HashSet<std::ffi::OsString> {
     std::fs::read_dir(dir)
-        .map(|read| read.flatten().map(|e| e.file_name()).collect())
+        .map(|read| {
+            read.flatten()
+                .map(|e| e.file_name())
+                // Dotfiles are never the download we asked for, and whatever
+                // this scan picks gets MOVED -- so a shell/editor temp file
+                // appearing mid-wait must not be mistaken for the payload.
+                .filter(|name| !name.to_string_lossy().starts_with('.'))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
