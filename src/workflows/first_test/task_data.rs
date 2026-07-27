@@ -1,6 +1,7 @@
-//! Step 2: inside task1, create task_data/, download+unzip the "Download all
-//! task data (ZIP)" link, and save the Task Data block's text as a file named
-//! "information".
+//! Step 2: inside task1, create task_data/, download+unzip the task data
+//! (either the "Download all task data (ZIP)" link or the newer archive
+//! viewer's "Download" button), and save the Task Data block's text as a file
+//! named "information".
 
 use crate::prelude::*;
 
@@ -38,16 +39,58 @@ impl Workflow for SaveTaskData {
             .map_err(|e| GolemError::Io(format!("mkdir {}: {e}", data_dir.display())))?;
 
         ctx.step("download + unzip task data (if available)").await?;
-        // Not every task has a downloadable ZIP -- some Task Data blocks are
-        // just description text with no "Download all task data (ZIP)" link
-        // at all. Wait (in case the page is still rendering) to see whether a
-        // link genuinely exists; if it doesn't, skip the download entirely
-        // instead of halting, and still fall through to save the text below.
-        match util::wait_for_task_data_zip_url(ctx, Duration::from_secs(15)).await? {
-            Some(url) => {
-                ctx.output(format!("task data zip (informational): {url}"));
-                // The actual download happens by clicking it for real, not by
-                // fetching this URL directly -- that's 404'd inconsistently.
+        // Not every task has downloadable data -- some Task Data blocks are
+        // just description text with no download link/button at all. Wait (in
+        // case the page is still rendering) to see whether one genuinely
+        // exists; if it doesn't, skip the download entirely instead of
+        // halting, and still fall through to save the text below.
+        match util::wait_for_task_data_download(ctx, Duration::from_secs(15)).await? {
+            Some(util::TaskDataSource::DirectUrl(url)) => {
+                ctx.output(format!("task data zip: {url}"));
+                // Fetch the href directly with a bare curl first -- the same
+                // mechanism the response downloads use. An earlier direct-fetch
+                // attempt "404'd inconsistently", but that went through
+                // ctx.download, which attaches the page's multimango cookies;
+                // this host 404s on foreign cookies (see util::download_into),
+                // while a bare curl gets a clean 200. Clicking the link is kept
+                // only as a fallback: on the newer task layout (responses shown
+                // as "Download archive" file-listing pages) the physical click
+                // stopped producing a file in ~/Downloads at all.
+                let zip_path = match util::download_into(ctx, &url, &data_dir, "all_files.zip")
+                    .await
+                {
+                    Ok(path) => path,
+                    Err(e) => {
+                        ctx.warn(format!(
+                            "direct download of the Task Data ZIP failed ({e}); falling back \
+                             to clicking the link"
+                        ));
+                        util::click_and_wait_for_download(
+                            ctx,
+                            util::TASK_DATA_ZIP_CLICK_JS,
+                            &data_dir,
+                            "all_files.zip",
+                            Duration::from_secs(30),
+                        )
+                        .await
+                        .map_err(|e| {
+                            ctx.halt(format!(
+                                "found a Task Data ZIP link but couldn't download it directly \
+                                 or by clicking it: {e}. Make sure you're on a loaded, active \
+                                 task page (not the homepage or an expired task)."
+                            ))
+                        })?
+                    }
+                };
+                util::unzip_and_cleanup(ctx, &zip_path, &data_dir).await?;
+                ctx.output(format!("unzipped task data into {}", data_dir.display()));
+            }
+            Some(util::TaskDataSource::DownloadButton) => {
+                // Newer layout: the Task Data block shows an archive viewer
+                // ("Input Data Files", a file tree) whose Download control is
+                // a <button> with no href anywhere in the DOM -- nothing to
+                // curl, so clicking it is the only way to get the file.
+                ctx.output("task data is behind a Download button (no direct link) -- clicking it");
                 let zip_path = util::click_and_wait_for_download(
                     ctx,
                     util::TASK_DATA_ZIP_CLICK_JS,
@@ -58,18 +101,31 @@ impl Workflow for SaveTaskData {
                 .await
                 .map_err(|e| {
                     ctx.halt(format!(
-                        "found a Task Data ZIP link but couldn't download it by clicking it: \
-                         {e}. Make sure you're on a loaded, active task page (not the homepage \
-                         or an expired task)."
+                        "found the Task Data Download button but clicking it produced no \
+                         file: {e}. Make sure you're on a loaded, active task page (not the \
+                         homepage or an expired task)."
                     ))
                 })?;
-                util::unzip_and_cleanup(ctx, &zip_path, &data_dir).await?;
-                ctx.output(format!("unzipped task data into {}", data_dir.display()));
+                // The button is expected to serve a ZIP of the listed files,
+                // but nothing in the DOM guarantees that -- sniff the magic
+                // bytes and keep a non-ZIP as-is rather than halting on unzip.
+                let is_zip = std::fs::read(&zip_path)
+                    .map(|b| b.starts_with(b"PK"))
+                    .unwrap_or(false);
+                if is_zip {
+                    util::unzip_and_cleanup(ctx, &zip_path, &data_dir).await?;
+                    ctx.output(format!("unzipped task data into {}", data_dir.display()));
+                } else {
+                    ctx.warn(format!(
+                        "downloaded file doesn't look like a ZIP -- keeping it as-is at {}",
+                        zip_path.display()
+                    ));
+                }
             }
             None => {
                 ctx.output(
-                    "no Task Data ZIP link found on this task -- skipping download (this task \
-                     has no downloadable data, only the description text).",
+                    "no Task Data download link or button found on this task -- skipping \
+                     download (this task has no downloadable data, only the description text).",
                 );
             }
         }

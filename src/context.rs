@@ -26,9 +26,12 @@ use crate::backend::{BrowserBackend, InputBackend, MouseButton};
 use crate::checkpoint::RunState;
 use crate::error::{GolemError, Result};
 use crate::geometry::Point;
+use rand::RngExt;
+
 use crate::humanize;
 use crate::messages::{
-    EngineEvent, EngineStatus, EventTx, LogLevel, PromptKind, PromptRequest, PromptResponse,
+    CommandTx, EngineEvent, EngineStatus, EventTx, LogLevel, PromptKind, PromptRequest,
+    PromptResponse,
 };
 use crate::settings::{InputStrategy, Settings};
 
@@ -189,6 +192,8 @@ pub struct WorkflowCtx {
     last_mouse: Point,
     step_index: usize,
     http: reqwest::Client,
+    /// Sender back into the engine's command queue (see [`queue_chain`](Self::queue_chain)).
+    commands: CommandTx,
 }
 
 impl WorkflowCtx {
@@ -200,6 +205,7 @@ impl WorkflowCtx {
         prompts: Arc<PromptBus>,
         events: EventTx,
         settings: Settings,
+        commands: CommandTx,
         run_id: String,
         workflow: String,
         inputs: BTreeMap<String, String>,
@@ -221,7 +227,19 @@ impl WorkflowCtx {
             last_mouse: Point::ZERO,
             step_index: 0,
             http,
+            commands,
         })
+    }
+
+    /// Queue another workflow chain to start as soon as the CURRENT chain
+    /// finishes (the engine holds exactly one queued chain while busy; Stop
+    /// discards it). Used by the pipeline's final workflow to hand off to the
+    /// next round. The queued chain runs its prerequisites without a confirm
+    /// prompt, exactly like a programmatic `RunChain`.
+    pub fn queue_chain(&self, workflows: Vec<String>, inputs: BTreeMap<String, String>) {
+        let _ = self
+            .commands
+            .send(crate::messages::UiCommand::RunChain { workflows, inputs });
     }
 
     // ----- reporting -------------------------------------------------------
@@ -623,6 +641,169 @@ impl WorkflowCtx {
         self.info(format!("click @ ({x:.0},{y:.0})"));
         self.move_to(Point::new(x, y)).await?;
         self.press_release_at(MouseButton::Left, Point::new(x, y)).await
+    }
+
+    /// Screen-pixel position of the page viewport's origin: add it to
+    /// viewport coordinates to aim the REAL OS cursor at a page element.
+    /// Derived from the window's own geometry: side borders are
+    /// `(outerWidth - innerWidth) / 2` (zero on macOS), and everything above
+    /// the viewport (title bar, tab strip, URL bar) is the remainder of
+    /// `outerHeight - innerHeight`. Both `screenX/Y` and enigo speak logical
+    /// (not physical-Retina) pixels, so no DPR scaling is needed — but this
+    /// does assume 100% page zoom and no docked devtools.
+    async fn viewport_screen_offset(&self) -> Result<(f64, f64)> {
+        let v = self
+            .browser
+            .eval(
+                "(function(){ var side = (window.outerWidth - window.innerWidth) / 2; \
+                 return { sx: window.screenX + side, \
+                          sy: window.screenY + (window.outerHeight - window.innerHeight) - side }; })()",
+            )
+            .await?;
+        match (
+            v.get("sx").and_then(Value::as_f64),
+            v.get("sy").and_then(Value::as_f64),
+        ) {
+            (Some(sx), Some(sy)) => Ok((sx, sy)),
+            _ => Err(GolemError::Other(
+                "couldn't read the window's screen position".into(),
+            )),
+        }
+    }
+
+    /// Like [`click_at`](Self::click_at), but moves the REAL OS cursor to the
+    /// element and physically clicks it, regardless of the configured input
+    /// strategy. Falls back to the CDP `click_at` (with a warning) if native
+    /// input is unavailable or fails mid-flight — e.g. the macOS
+    /// Accessibility permission was revoked — so a workflow using this never
+    /// halts just because the cursor couldn't be driven.
+    ///
+    /// The browser window must be visible and frontmost at the target point:
+    /// a native click lands on whatever is on screen there, including any
+    /// window covering it (even Golem's own overlay).
+    pub async fn click_at_cursor(&mut self, x: f64, y: f64) -> Result<()> {
+        self.guard().await?;
+        if !self.input.is_available() {
+            self.warn("native input unavailable -- falling back to CDP click");
+            return self.click_at(x, y).await;
+        }
+        let (ox, oy) = match self.viewport_screen_offset().await {
+            Ok(o) => o,
+            Err(e) => {
+                self.warn(format!(
+                    "couldn't map viewport to screen coordinates ({e}) -- falling back to CDP click"
+                ));
+                return self.click_at(x, y).await;
+            }
+        };
+        let target = Point::new(x + ox, y + oy);
+        self.info(format!(
+            "cursor click @ ({x:.0},{y:.0}) -> screen ({:.0},{:.0})",
+            target.x, target.y
+        ));
+        match self.cursor_click_native(target).await {
+            Ok(()) => {
+                // Keep the CDP-side virtual cursor roughly in sync so a later
+                // CDP-humanized move starts from a believable spot.
+                self.last_mouse = Point::new(x, y);
+                Ok(())
+            }
+            Err(e) => {
+                self.warn(format!(
+                    "native cursor click failed ({e}) -- falling back to CDP click"
+                ));
+                self.click_at(x, y).await
+            }
+        }
+    }
+
+    /// Humanized native-cursor move + click, all in absolute screen pixels,
+    /// starting from wherever the real cursor currently is.
+    async fn cursor_click_native(&mut self, target: Point) -> Result<()> {
+        let start = {
+            let (cx, cy) = self.input.cursor_pos().await?;
+            Point::new(cx as f64, cy as f64)
+        };
+        let cfg = self.cfg();
+        let path = {
+            let mut rng = rand::rng();
+            humanize::mouse_path(start, target, &cfg, &mut rng)
+        };
+        for s in path {
+            self.guard().await?;
+            self.input
+                .mouse_move_abs(s.point.x.round() as i32, s.point.y.round() as i32)
+                .await?;
+            if !s.delay.is_zero() {
+                tokio::time::sleep(s.delay).await;
+            }
+        }
+        let (settle, hold) = {
+            let mut rng = rand::rng();
+            (
+                humanize::pre_click_settle(&cfg, &mut rng),
+                humanize::click_hold(&cfg, &mut rng),
+            )
+        };
+        tokio::time::sleep(settle).await;
+        self.guard().await?;
+        self.input.mouse_press(MouseButton::Left).await?;
+        tokio::time::sleep(hold).await;
+        self.input.mouse_release(MouseButton::Left).await
+    }
+
+    /// Idly drift the REAL OS cursor through a few random nearby waypoints
+    /// WITHOUT clicking -- sprinkled between form selections so the pointer
+    /// doesn't travel dead bee-lines from one control to the next. Purely
+    /// cosmetic: no button is ever pressed, and every real click re-finds
+    /// its target's fresh coordinates before pressing, so wandering can
+    /// never change which control gets clicked. Best-effort: a quiet no-op
+    /// when native input is unavailable or a move fails.
+    pub async fn wander_cursor(&mut self) -> Result<()> {
+        self.guard().await?;
+        if !self.input.is_available() {
+            return Ok(());
+        }
+        let Ok((cx, cy)) = self.input.cursor_pos().await else {
+            return Ok(());
+        };
+        let cfg = self.cfg();
+        let hops = {
+            let mut rng = rand::rng();
+            rng.random_range(1..=3)
+        };
+        let mut at = Point::new(cx as f64, cy as f64);
+        for _ in 0..hops {
+            let (target, pause) = {
+                let mut rng = rand::rng();
+                let (dx, dy) = humanize::gaussian_jitter(90.0, 260.0, &mut rng);
+                (
+                    Point::new((at.x + dx).max(4.0), (at.y + dy).max(4.0)),
+                    humanize::random_pause(150, 600, &cfg, &mut rng),
+                )
+            };
+            let path = {
+                let mut rng = rand::rng();
+                humanize::mouse_path(at, target, &cfg, &mut rng)
+            };
+            for s in path {
+                self.guard().await?;
+                if self
+                    .input
+                    .mouse_move_abs(s.point.x.round() as i32, s.point.y.round() as i32)
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                if !s.delay.is_zero() {
+                    tokio::time::sleep(s.delay).await;
+                }
+            }
+            at = target;
+            tokio::time::sleep(pause).await;
+        }
+        Ok(())
     }
 
     /// Double-click at viewport coordinates.

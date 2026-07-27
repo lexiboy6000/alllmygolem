@@ -134,6 +134,7 @@ fn main() -> eframe::Result<()> {
     // isolated by tokio; if the whole runtime thread somehow dies, the GUI keeps
     // running and the user can see it in the connection/status indicators.
     let engine_settings = settings.clone();
+    let engine_cmd_tx = cmd_tx.clone();
     std::thread::Builder::new()
         .name("golem-engine".into())
         .spawn(move || {
@@ -143,7 +144,9 @@ fn main() -> eframe::Result<()> {
             {
                 Ok(rt) => {
                     rt.block_on(async move {
-                        if let Err(e) = Engine::run(engine_settings, registry, cmd_rx, evt_tx).await
+                        if let Err(e) =
+                            Engine::run(engine_settings, registry, cmd_rx, evt_tx, engine_cmd_tx)
+                                .await
                         {
                             tracing::error!("engine exited with error: {e}");
                         }
@@ -632,7 +635,7 @@ fn run_workflow_cli(
     rt.block_on(async move {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let engine = tokio::spawn(Engine::run(settings, registry, cmd_rx, evt_tx));
+        let engine = tokio::spawn(Engine::run(settings, registry, cmd_rx, evt_tx, cmd_tx.clone()));
         let mut run_sent = false;
         if needs_browser {
             println!("[connect] attaching to Chrome before running '{workflow}'...");

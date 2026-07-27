@@ -88,6 +88,11 @@ pub struct CdpBrowser {
     /// enumerate targets (e.g. switch to a popup tab the page opened). `None`
     /// while reconnecting.
     browser: RwLock<Option<Arc<Browser>>>,
+    /// Bumped by the supervisor every time the connection is torn down. Lets
+    /// `with_page` tell "this call failed on a connection that has since
+    /// died" (retry against the rebuilt one) apart from a genuine failure on
+    /// a healthy connection (surface it).
+    conn_generation: std::sync::atomic::AtomicU64,
 }
 
 impl CdpBrowser {
@@ -104,6 +109,7 @@ impl CdpBrowser {
             events: events.clone(),
             page: RwLock::new(Some(page)),
             browser: RwLock::new(Some(Arc::new(browser))),
+            conn_generation: std::sync::atomic::AtomicU64::new(0),
         });
 
         let _ = events.send(EngineEvent::Connection(ConnState::Connected { target_url }));
@@ -143,12 +149,30 @@ impl CdpBrowser {
         let mut delay = Duration::from_millis(250);
         let mut last: Option<GolemError> = None;
         for i in 0..TRIES {
+            let gen_before = self
+                .conn_generation
+                .load(std::sync::atomic::Ordering::SeqCst);
             match self.page() {
                 Ok(page) => match f(page).await {
                     Ok(v) => return Ok(v),
                     // Retry only connection-type errors; surface real failures.
                     Err(e) if is_conn_err(&e) => last = Some(e),
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        // A timeout (or any other error) can also be a casualty
+                        // of the socket dying mid-call: the command went into
+                        // the void and its response never arrives. If the
+                        // connection has been torn down since this attempt
+                        // started, retry against the rebuilt one instead of
+                        // failing the workflow.
+                        let gen_now = self
+                            .conn_generation
+                            .load(std::sync::atomic::Ordering::SeqCst);
+                        if gen_now != gen_before {
+                            last = Some(e);
+                        } else {
+                            return Err(e);
+                        }
+                    }
                 },
                 Err(e) => last = Some(e), // no target yet (mid-reconnect)
             }
@@ -541,6 +565,43 @@ impl BrowserBackend for CdpBrowser {
         Ok(closed)
     }
 
+    async fn list_targets(&self, url_substring: &str) -> Result<Vec<String>> {
+        let browser = self.browser.read().clone();
+        let Some(b) = browser else { return Ok(Vec::new()) };
+        let Ok(pages) = b.pages().await else {
+            return Ok(Vec::new());
+        };
+        let mut ids = Vec::new();
+        for p in pages {
+            if url_substring.is_empty()
+                || page_url_opt(&p, self.config.call_timeout)
+                    .await
+                    .is_some_and(|u| u.contains(url_substring))
+            {
+                ids.push(p.target_id().as_ref().to_string());
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn close_target_by_id(&self, target_id: &str) -> Result<bool> {
+        let keep = self.page.read().clone().map(|p| p.target_id().clone());
+        if keep.as_ref().is_some_and(|k| k.as_ref() == target_id) {
+            return Ok(false); // never close the controlled page
+        }
+        let browser = self.browser.read().clone();
+        let Some(b) = browser else { return Ok(false) };
+        let Ok(pages) = b.pages().await else {
+            return Ok(false);
+        };
+        for p in pages {
+            if p.target_id().as_ref() == target_id {
+                return Ok(p.close().await.is_ok());
+            }
+        }
+        Ok(false)
+    }
+
     async fn bring_to_front(&self) -> Result<()> {
         let timeout = self.config.call_timeout;
         self.with_page("bring_to_front", async move |page: Arc<Page>| {
@@ -859,10 +920,21 @@ async fn establish(
         .await
         .map_err(|e| GolemError::Connection(format!("connect: {e}")))?;
 
-    // Drive the handler stream to completion; signal on disconnect.
+    // Drive the handler stream until it ends OR yields an error; signal on
+    // either. chromiumoxide's Handler does NOT end its stream when the socket
+    // dies -- it keeps yielding `Some(Err(...))` forever (observed live:
+    // `WS Connection error: Ws(AlreadyClosed)` logged on every later command,
+    // while the supervisor sat waiting for a stream end that never came and
+    // every eval timed out against the dead socket). Treat the first error as
+    // a disconnect so the supervisor actually reconnects.
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        while handler.next().await.is_some() {}
+        while let Some(item) = handler.next().await {
+            if let Err(e) = item {
+                tracing::warn!("cdp handler error (treating as disconnect): {e}");
+                break;
+            }
+        }
         let _ = tx.send(());
     });
 
@@ -980,6 +1052,12 @@ async fn supervise(cdp: Arc<CdpBrowser>, mut disc_rx: oneshot::Receiver<()>) {
         // iteration after a successful reconnect.
         let _ = disc_rx.await;
         tracing::warn!("cdp connection lost; starting reconnect");
+        // Invalidate in-flight calls: a command that was mid-socket when it
+        // died will hang until its timeout; the bumped generation tells
+        // `with_page` to retry it against the rebuilt connection instead of
+        // failing the workflow.
+        cdp.conn_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *cdp.page.write() = None;
         // Release the dead browser handle (drops the connection).
         *cdp.browser.write() = None;

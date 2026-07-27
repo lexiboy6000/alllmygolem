@@ -60,6 +60,21 @@ pub trait BrowserBackend: Send + Sync {
         Ok(())
     }
 
+    /// Target ids of every open page whose URL contains `url_substring`
+    /// (`""` matches all). Lets a workflow snapshot the tab set before an
+    /// action that opens a new tab, then close only what appeared. Default:
+    /// unsupported (empty).
+    async fn list_targets(&self, _url_substring: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Close the page with exactly this target id (from [`list_targets`](Self::list_targets)),
+    /// unless it is the controlled one. Returns whether a tab was closed.
+    /// Default: no-op.
+    async fn close_target_by_id(&self, _target_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Capture a PNG screenshot of the controlled page (composited surface, so a
     /// streamed `<video>` is included). Default: unsupported.
     async fn screenshot(&self) -> Result<Vec<u8>> {

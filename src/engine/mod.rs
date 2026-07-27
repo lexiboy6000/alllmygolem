@@ -27,7 +27,7 @@ use crate::context::{Control, PromptBus};
 use crate::error::{GolemError, Result};
 use crate::input::NativeInput;
 use crate::messages::{
-    CommandRx, ConnState, EngineEvent, EngineStatus, EventTx, LogLevel, UiCommand,
+    CommandRx, CommandTx, ConnState, EngineEvent, EngineStatus, EventTx, LogLevel, UiCommand,
 };
 use crate::registry::WorkflowRegistry;
 use crate::settings::Settings;
@@ -45,6 +45,9 @@ impl Engine {
         registry: WorkflowRegistry,
         mut commands: CommandRx,
         events: EventTx,
+        // A sender back into our own command queue, handed to workflows so the
+        // pipeline's final workflow can enqueue the next chain (`queue_chain`).
+        command_tx: CommandTx,
     ) -> Result<()> {
         // The registry is shared, read-only, into each spawned chain task.
         let registry = Arc::new(registry);
@@ -77,6 +80,11 @@ impl Engine {
         let mut browser: Option<Arc<dyn BrowserBackend>> = None;
         // The currently-running chain task, if any.
         let mut current: Option<JoinHandle<()>> = None;
+        // A chain queued while another was running (one slot; used by the
+        // pipeline to hand off to its next round). Started as soon as the
+        // running chain's task finishes; cleared by Stop.
+        let mut pending_chain: Option<(Vec<String>, std::collections::BTreeMap<String, String>)> =
+            None;
 
         // --- startup announcements ---
         let _ = events.send(EngineEvent::Workflows(registry.list()));
@@ -104,7 +112,62 @@ impl Engine {
         }
 
         // --- command loop ---
-        while let Some(cmd) = commands.recv().await {
+        // Waits on BOTH the command channel and (when a chain is running) that
+        // chain's task finishing — the latter so a chain queued via
+        // `pending_chain` can start the moment the engine goes idle, without
+        // needing another command to wake the loop.
+        loop {
+            let cmd = if let Some(handle) = current.as_mut() {
+                tokio::select! {
+                    maybe = commands.recv() => match maybe {
+                        Some(c) => c,
+                        None => break,
+                    },
+                    _ = handle => {
+                        current = None;
+                        if let Some((workflows, inputs)) = pending_chain.take() {
+                            match resolve_browser(browser.as_ref(), &noop_browser, &registry, &workflows) {
+                                Some(b) => {
+                                    let _ = events.send(EngineEvent::Log {
+                                        level: LogLevel::Info,
+                                        message: format!(
+                                            "starting queued chain: {}",
+                                            workflows.join(", ")
+                                        ),
+                                    });
+                                    let args = ChainArgs {
+                                        registry: registry.clone(),
+                                        browser: b,
+                                        input: input.clone(),
+                                        control: control.clone(),
+                                        prompts: prompts.clone(),
+                                        events: events.clone(),
+                                        settings: settings.clone(),
+                                        busy: busy.clone(),
+                                        commands: command_tx.clone(),
+                                        targets: workflows,
+                                        inputs,
+                                        restore: None,
+                                        confirm_prereqs: false,
+                                    };
+                                    current = Some(tokio::spawn(args.run()));
+                                }
+                                None => {
+                                    let _ = events.send(EngineEvent::Error(
+                                        "queued chain dropped: not connected to Chrome".into(),
+                                    ));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                match commands.recv().await {
+                    Some(c) => c,
+                    None => break,
+                }
+            };
             match cmd {
                 UiCommand::Connect => {
                     let _ = events.send(EngineEvent::Status(EngineStatus::Connecting));
@@ -254,6 +317,7 @@ impl Engine {
                                     events: events.clone(),
                                     settings: settings.clone(),
                                     busy: busy.clone(),
+                                    commands: command_tx.clone(),
                                     targets,
                                     inputs,
                                     restore: None,
@@ -272,8 +336,23 @@ impl Engine {
 
                 UiCommand::RunChain { workflows, inputs } => {
                     if busy.load(Ordering::SeqCst) {
-                        let _ = events
-                            .send(EngineEvent::Error("a workflow is already running".into()));
+                        // Queue it (one slot) instead of refusing: the pipeline's
+                        // final workflow enqueues the NEXT round moments before its
+                        // own chain finishes, and must not lose the race.
+                        if pending_chain.is_some() {
+                            let _ = events.send(EngineEvent::Log {
+                                level: LogLevel::Warn,
+                                message: "replacing a previously queued chain".into(),
+                            });
+                        }
+                        let _ = events.send(EngineEvent::Log {
+                            level: LogLevel::Info,
+                            message: format!(
+                                "chain queued (starts when the current run finishes): {}",
+                                workflows.join(", ")
+                            ),
+                        });
+                        pending_chain = Some((workflows, inputs));
                     } else {
                         let targets = workflows;
                         match resolve_browser(browser.as_ref(), &noop_browser, &registry, &targets) {
@@ -287,6 +366,7 @@ impl Engine {
                                     events: events.clone(),
                                     settings: settings.clone(),
                                     busy: busy.clone(),
+                                    commands: command_tx.clone(),
                                     targets,
                                     inputs,
                                     restore: None,
@@ -304,6 +384,15 @@ impl Engine {
                 }
 
                 UiCommand::Stop => {
+                    // Stop also discards any queued follow-up chain — the user
+                    // pressing Stop must end the pipeline loop, not just the
+                    // current round.
+                    if pending_chain.take().is_some() {
+                        let _ = events.send(EngineEvent::Log {
+                            level: LogLevel::Info,
+                            message: "queued chain discarded by Stop".into(),
+                        });
+                    }
                     // Cooperative first: wake any paused/await points and unblock
                     // a pending prompt so the workflow can unwind cleanly.
                     control.request_stop();
@@ -370,6 +459,7 @@ impl Engine {
                                             events: events.clone(),
                                             settings: settings.clone(),
                                             busy: busy.clone(),
+                                            commands: command_tx.clone(),
                                             targets,
                                             inputs: rs.inputs.clone(),
                                             restore: Some(rs),
