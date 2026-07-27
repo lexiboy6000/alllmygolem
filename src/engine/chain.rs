@@ -157,19 +157,37 @@ async fn run_inner(
             .collect::<Vec<_>>()
             .join("\n");
         let message = format!(
-            "Running \"{target_label}\" first runs its prerequisite workflow(s), in order:\n\n{list}\n\nRun all of them?"
+            "Running \"{target_label}\" normally runs its prerequisite workflow(s) first, in \
+             order:\n\n{list}\n\nRun them too, or skip straight to \"{target_label}\" (use skip \
+             when the prerequisites' work is already done, e.g. re-running just this leg)?"
         );
-        if !confirm_run(prompts, events, control, message).await {
-            emit(
-                events,
-                EngineEvent::Log {
-                    level: LogLevel::Info,
-                    message: format!(
-                        "Run cancelled: declined prerequisites for \"{target_label}\"."
-                    ),
-                },
-            );
-            return;
+        match ask_prereqs(prompts, events, control, message).await {
+            PrereqDecision::RunAll => {}
+            PrereqDecision::SkipPrereqs => {
+                pending.retain(|n| target_set.contains(n.as_str()));
+                emit(
+                    events,
+                    EngineEvent::Log {
+                        level: LogLevel::Info,
+                        message: format!(
+                            "Skipping {} prerequisite(s); running only \"{target_label}\".",
+                            prereqs.len()
+                        ),
+                    },
+                );
+            }
+            PrereqDecision::Cancel => {
+                emit(
+                    events,
+                    EngineEvent::Log {
+                        level: LogLevel::Info,
+                        message: format!(
+                            "Run cancelled: declined prerequisites for \"{target_label}\"."
+                        ),
+                    },
+                );
+                return;
+            }
         }
     }
 
@@ -298,16 +316,27 @@ async fn run_inner(
     }
 }
 
-/// Ask the user a yes/no question through the normal prompt UI (main window +
-/// overlay) and await the answer. Returns `false` if stopped or dismissed.
-async fn confirm_run(
+/// What the user chose to do about a target's resolved prerequisites.
+enum PrereqDecision {
+    /// Run the full chain (prerequisites first, then the target).
+    RunAll,
+    /// Run only the explicitly selected target(s) -- their prerequisites'
+    /// work is already done (e.g. re-running the last leg of a pipeline).
+    SkipPrereqs,
+    /// Don't run anything.
+    Cancel,
+}
+
+/// Ask, through the normal prompt UI, how to handle resolved prerequisites.
+/// Stop or a dismissed prompt count as cancel -- never as "go ahead".
+async fn ask_prereqs(
     prompts: &PromptBus,
     events: &EventTx,
     control: &Control,
     message: String,
-) -> bool {
+) -> PrereqDecision {
     if control.is_stopped() {
-        return false;
+        return PrereqDecision::Cancel;
     }
     let id = Uuid::new_v4();
     let rx = prompts.register(id);
@@ -316,10 +345,20 @@ async fn confirm_run(
         EngineEvent::Prompt(PromptRequest {
             id,
             message,
-            kind: PromptKind::Confirm,
+            kind: PromptKind::Choice {
+                options: vec![
+                    "Run prerequisites first (full chain)".to_string(),
+                    "Skip prerequisites -- run only the selected workflow".to_string(),
+                    "Cancel".to_string(),
+                ],
+            },
         }),
     );
-    matches!(rx.await, Ok(PromptResponse::Bool(true)))
+    match rx.await {
+        Ok(PromptResponse::Choice(0)) => PrereqDecision::RunAll,
+        Ok(PromptResponse::Choice(1)) => PrereqDecision::SkipPrereqs,
+        _ => PrereqDecision::Cancel,
+    }
 }
 
 /// Resolve `name`'s dependency order and append any not-yet-queued names to

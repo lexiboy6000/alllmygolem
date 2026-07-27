@@ -50,6 +50,7 @@ registry.register(Arc::new(first_test::DownloadResponseA));
 registry.register(Arc::new(first_test::DownloadResponseB));
 registry.register(Arc::new(first_test::SaveEvaluationCriteria));
 registry.register(Arc::new(first_test::AnswerAndApplyCriteria));
+registry.register(Arc::new(first_test::HandshakePreOpenMultimango));
 registry.register(Arc::new(first_test::HandshakeReviewAndSubmit));
 
   
