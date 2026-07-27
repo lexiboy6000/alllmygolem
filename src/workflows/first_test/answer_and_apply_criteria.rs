@@ -41,7 +41,7 @@ impl Workflow for AnswerAndApplyCriteria {
         let task_dir = util::current_task_dir(ctx)?;
 
         ctx.step("ask Claude to judge each criterion").await?;
-        util::ask_claude_for_answers(ctx, &task_dir).await?;
+        util::ask_claude_for_answers(ctx, &task_dir, None).await?;
         let answers_path = task_dir.join("claude_answers");
         if !answers_path.exists() {
             return Err(ctx
@@ -59,33 +59,20 @@ impl Workflow for AnswerAndApplyCriteria {
         ));
 
         ctx.step("apply answers on the page").await?;
-        let mut applied = 0usize;
-        let mut missed: Vec<String> = Vec::new();
-        for a in &answers.criteria {
-            for (label, want) in [
-                ("Response A", a.response_a.as_str()),
-                ("Response B", a.response_b.as_str()),
-            ] {
-                let ok = util::click_criterion_button(ctx, a.number, label, want).await?;
-                if ok {
-                    applied += 1;
-                    ctx.human_pause(150, 350).await?;
-                } else {
-                    missed.push(format!("#{} {} -> {}", a.number, label, want));
-                }
-            }
-        }
-
-        let overall_ok = util::click_overall_button(ctx, &answers.overall.winner).await?;
-        if overall_ok {
-            applied += 1;
-            ctx.output(format!("overall quality: {}", answers.overall.winner));
-        } else {
-            missed.push(format!("overall quality -> {}", answers.overall.winner));
-        }
+        let (applied, missed) = util::apply_answers(ctx, &answers).await?;
         ctx.output(format!("clicked {applied} button(s)"));
         if !missed.is_empty() {
             ctx.warn(format!("couldn't find/click: {}", missed.join(", ")));
+        }
+
+        // In the full pipeline the chain carries a `defer_submit` input: the
+        // review workflow (step 8) owns the submission, gated behind a human
+        // sign-off -- so this workflow must NOT touch Submit at all.
+        if ctx.input("defer_submit").is_some_and(|v| !v.trim().is_empty()) {
+            ctx.output(
+                "submission deferred: the review workflow submits after the human signs off.",
+            );
+            return Ok(WorkflowOutcome::Completed);
         }
 
         ctx.step("confirm submit").await?;

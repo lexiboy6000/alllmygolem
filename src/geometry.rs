@@ -57,26 +57,24 @@ impl Rect {
     }
 
     /// A point inside the rect biased toward the centre, the way a human tends
-    /// to land clicks rather than hitting the exact middle or the edges. Uses
-    /// the average of two uniform samples (a triangular distribution) so the
-    /// result clusters around the centre but stays well inside the box.
+    /// to land clicks rather than hitting the exact middle or the edges.
+    /// Gaussian around the centre (σ = a sixth of the usable span per axis, so
+    /// ±3σ spans the inset box), clamped inside an inset so the click never
+    /// lands on the very edge / border.
     pub fn humanlike_point<R: Rng>(&self, rng: &mut R) -> Point {
-        // Inset a few percent so we never land on the very edge / border.
         let inset_x = (self.width * 0.15).min(6.0);
         let inset_y = (self.height * 0.15).min(6.0);
         let left = self.x + inset_x;
         let right = (self.x + self.width - inset_x).max(left);
         let top = self.y + inset_y;
         let bottom = (self.y + self.height - inset_y).max(top);
+        let c = self.center();
 
-        let tri = |rng: &mut R, lo: f64, hi: f64| -> f64 {
-            if hi <= lo {
-                return lo;
-            }
-            let a: f64 = rng.random_range(lo..hi);
-            let b: f64 = rng.random_range(lo..hi);
-            (a + b) / 2.0
-        };
-        Point::new(tri(rng, left, right), tri(rng, top, bottom))
+        let (jx, _) = crate::humanize::gaussian_jitter((right - left) / 6.0, f64::MAX, rng);
+        let (jy, _) = crate::humanize::gaussian_jitter((bottom - top) / 6.0, f64::MAX, rng);
+        Point::new(
+            (c.x + jx).clamp(left, right),
+            (c.y + jy).clamp(top, bottom),
+        )
     }
 }

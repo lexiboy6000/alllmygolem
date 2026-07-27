@@ -15,6 +15,7 @@
 //! (`current_task_dir`). A file is the one thing that reliably crosses the
 //! fresh-ctx-per-workflow boundary.
 
+use rand::RngExt;
 use serde::Deserialize;
 
 use crate::prelude::*;
@@ -22,6 +23,18 @@ use crate::prelude::*;
 /// Quote a Rust string as a safe JS string literal (e.g. `a` -> `"a"`).
 fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Gaussian landing jitter for a click target: the finder JS returns a
+/// control's exact centre, and clicking that same pixel on every selection is
+/// a strong automation tell. Offsets the point with N(0, σ²) per axis
+/// (σ from Settings > humanize jitter, clamped ±5px -- safe for the smallest
+/// Good/Bad buttons). The verify-and-retry in `click_until_selected` catches
+/// the (rare) case where even that lands off the control.
+pub fn jittered(ctx: &WorkflowCtx, x: f64, y: f64) -> (f64, f64) {
+    let mut rng = rand::rng();
+    let (jx, jy) = crate::humanize::click_landing_jitter(&ctx.settings.humanize, &mut rng);
+    (x + jx, y + jy)
 }
 
 // ----- step 7: ask Claude, then click its answers in ----------------------
@@ -59,7 +72,15 @@ pub struct ClaudeAnswers {
 /// `task_dir/claude_answers`. Reuses the same launcher settings as the Solve
 /// pipeline (Settings > Claude path / model / effort / timeout) -- this isn't
 /// a "solve" workflow, but those settings are general-purpose, not solve-only.
-pub async fn ask_claude_for_answers(ctx: &WorkflowCtx, task_dir: &std::path::Path) -> Result<()> {
+///
+/// `reviewer_feedback`, when given, is a human reviewer's note on what to fix
+/// or reconsider: it is appended to the grading prompt and Claude is told to
+/// revise the existing `claude_answers` accordingly.
+pub async fn ask_claude_for_answers(
+    ctx: &WorkflowCtx,
+    task_dir: &std::path::Path,
+    reviewer_feedback: Option<&str>,
+) -> Result<()> {
     let claude = if ctx.settings.claude_path.trim().is_empty() {
         "claude".to_string()
     } else {
@@ -67,9 +88,19 @@ pub async fn ask_claude_for_answers(ctx: &WorkflowCtx, task_dir: &std::path::Pat
     };
     let model = ctx.settings.solve_model.clone();
     let effort = ctx.settings.solve_effort.clone();
+    let prompt: String = match reviewer_feedback {
+        Some(fb) => format!(
+            "{ANSWER_CRITERIA_PROMPT}\n\nIMPORTANT -- a human reviewer looked at the answers you \
+             previously wrote to claude_answers and asks for a revision:\n\n\"{fb}\"\n\nRe-read \
+             whatever is needed to address this, then REWRITE claude_answers completely (same \
+             JSON shape). Keep judgments the reviewer didn't question unless re-reading changes \
+             your mind."
+        ),
+        None => ANSWER_CRITERIA_PROMPT.to_string(),
+    };
     let mut args: Vec<&str> = vec![
         "-p",
-        ANSWER_CRITERIA_PROMPT,
+        prompt.as_str(),
         "--dangerously-skip-permissions",
         "--output-format",
         "stream-json",
@@ -106,11 +137,132 @@ pub fn read_claude_answers(path: &std::path::Path) -> Result<ClaudeAnswers> {
     })
 }
 
+/// Apply a full set of Claude answers onto the multimango page: bring the
+/// tab to the front (the clicks drive the real cursor), rate every criterion
+/// for both responses with human pacing, then make the Overall pick.
+/// Returns `(applied, missed-labels)`. Shared by workflow 7 and the review
+/// workflow's "reviewer asked for changes -> re-apply" path.
+pub async fn apply_answers(
+    ctx: &mut WorkflowCtx,
+    answers: &ClaudeAnswers,
+) -> Result<(usize, Vec<String>)> {
+    // The clicks drive the real OS cursor, so the task page has to actually
+    // be the visible tab -- a native click lands on whatever is on screen.
+    if let Err(e) = ctx.browser.bring_to_front().await {
+        ctx.warn(format!(
+            "couldn't bring the task tab to the front ({e}) -- continuing anyway"
+        ));
+    }
+    let mut applied = 0usize;
+    let mut missed: Vec<String> = Vec::new();
+    for (i, a) in answers.criteria.iter().enumerate() {
+        // scope the (non-Send) thread rng so it never crosses an await
+        let (b_first, reread, hesitate, wander) = {
+            let mut rng = rand::rng();
+            (
+                rng.random_bool(0.5),
+                rng.random_bool(0.2),
+                rng.random_bool(0.15),
+                rng.random_bool(0.35),
+            )
+        };
+        if i > 0 {
+            // a beat to "read" the next criterion before rating it
+            ctx.human_pause(700, 2600).await?;
+            if wander {
+                // idle mouse drift while "reading" -- moves only, no clicks
+                ctx.wander_cursor().await?;
+            }
+            if reread {
+                // sometimes a person goes back and re-reads the rubric line
+                ctx.human_pause(1500, 4200).await?;
+            }
+        }
+        // a real eye doesn't always sweep left-to-right: on some rows rate
+        // Response B before Response A. Only the CLICK ORDER flips -- each
+        // label keeps its own verdict, so the ratings applied are unchanged.
+        let mut pair = [
+            ("Response A", a.response_a.as_str()),
+            ("Response B", a.response_b.as_str()),
+        ];
+        if b_first {
+            pair.swap(0, 1);
+        }
+        for (j, (label, want)) in pair.into_iter().enumerate() {
+            if j > 0 && hesitate {
+                // occasional second-guessing pause before the second pick
+                ctx.human_pause(1200, 3000).await?;
+            }
+            let ok = click_criterion_button(ctx, a.number, label, want).await?;
+            if ok {
+                applied += 1;
+                // dwell between individual selections like a person deciding
+                ctx.human_pause(350, 1900).await?;
+            } else {
+                missed.push(format!("#{} {} -> {}", a.number, label, want));
+            }
+        }
+    }
+    // weighing the overall verdict takes longer than a single row
+    ctx.human_pause(1000, 3600).await?;
+    let wander = {
+        let mut rng = rand::rng();
+        rng.random_bool(0.35)
+    };
+    if wander {
+        ctx.wander_cursor().await?;
+    }
+    if click_overall_button(ctx, &answers.overall.winner).await? {
+        applied += 1;
+        ctx.output(format!("overall quality: {}", answers.overall.winner));
+    } else {
+        missed.push(format!("overall quality -> {}", answers.overall.winner));
+    }
+    Ok((applied, missed))
+}
+
+/// Re-check (without clicking) that every answer still shows as selected on
+/// the page. The platform can swap the open task under us -- submitting
+/// after a swap would rate a DIFFERENT task -- so the review workflow runs
+/// this immediately before the multimango submit. Returns the mismatches.
+pub async fn verify_answers_applied(
+    ctx: &mut WorkflowCtx,
+    answers: &ClaudeAnswers,
+) -> Result<Vec<String>> {
+    let mut wrong = Vec::new();
+    for a in &answers.criteria {
+        for (label, want) in [
+            ("Response A", a.response_a.as_str()),
+            ("Response B", a.response_b.as_str()),
+        ] {
+            let js = CLICK_CRITERION_BUTTON_JS
+                .replace("__NUM__", &js_str(&format!("{}.", a.number)))
+                .replace("__RESP__", &js_str(label))
+                .replace("__WANT__", &js_str(want));
+            let v = ctx.eval(&js).await?;
+            if !v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
+                wrong.push(format!("#{} {} -> {}", a.number, label, want));
+            }
+        }
+    }
+    let js = CLICK_OVERALL_BUTTON_JS.replace("__WANT__", &js_str(&answers.overall.winner));
+    let v = ctx.eval(&js).await?;
+    if !v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
+        wrong.push(format!("overall -> {}", answers.overall.winner));
+    }
+    Ok(wrong)
+}
+
 /// Find and click the `want` ("Good"/"Bad") button for `response_label`
 /// ("Response A"/"Response B") in the row numbered `number` under the
 /// Evaluation Criteria list. Returns `Ok(false)` if that exact button
 /// couldn't be found (page structure differs, or the row/label doesn't
 /// exist) rather than clicking something wrong.
+///
+/// These three appliers drive the REAL OS cursor (`click_at_cursor`, which
+/// falls back to CDP if native input is unavailable) so the selections look
+/// like a person working through the form, not events firing in a page
+/// nobody is touching.
 pub async fn click_criterion_button(
     ctx: &mut WorkflowCtx,
     number: u32,
@@ -121,51 +273,113 @@ pub async fn click_criterion_button(
         .replace("__NUM__", &js_str(&format!("{number}.")))
         .replace("__RESP__", &js_str(response_label))
         .replace("__WANT__", &js_str(want));
-    let v = ctx.eval(&js).await?;
-    match (
-        v.get("x").and_then(Value::as_f64),
-        v.get("y").and_then(Value::as_f64),
-    ) {
-        (Some(x), Some(y)) => {
-            ctx.click_at(x, y).await?;
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
+    click_until_selected(ctx, &js).await
 }
 
 /// Find and click the Overall Quality button matching `want` ("Response A",
 /// "Response B", or "Tie"), in the card headed by an `<h3>Overall Quality</h3>`.
 pub async fn click_overall_button(ctx: &mut WorkflowCtx, want: &str) -> Result<bool> {
     let js = CLICK_OVERALL_BUTTON_JS.replace("__WANT__", &js_str(want));
-    let v = ctx.eval(&js).await?;
-    match (
-        v.get("x").and_then(Value::as_f64),
-        v.get("y").and_then(Value::as_f64),
-    ) {
-        (Some(x), Some(y)) => {
-            ctx.click_at(x, y).await?;
-            Ok(true)
+    click_until_selected(ctx, &js).await
+}
+
+/// Click `find_js`'s target until its `selected` flag turns true. Each
+/// finder computes `selected` from how its own widget renders the choice
+/// (verified live on both): criterion Good/Bad buttons swap their neutral
+/// `bg-background` classes for a filled color (`bg-emerald-600 text-white`
+/// for Good), while the Overall buttons keep their classes and gain an
+/// inline `background-color` style instead.
+///
+/// Cursor clicks can miss: the target's coordinates are read BEFORE the
+/// humanized mouse travel (~0.5-1.5s), and this SPA re-renders every second
+/// (task timer), which can reset the scroll of the containers around the
+/// list in between -- the same race that hit the Task Data Download button.
+/// So: re-find fresh coordinates before every press, verify the selection
+/// actually registered after each, and after two missed cursor attempts fall
+/// back to a CDP click (the pre-cursor mechanism that never missed). The
+/// second cursor attempt starts with the cursor already next to the target,
+/// so its lookup->press window is tiny and usually lands.
+pub async fn click_until_selected(ctx: &mut WorkflowCtx, find_js: &str) -> Result<bool> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let v = ctx.eval(find_js).await?;
+        let (x, y) = match (
+            v.get("x").and_then(Value::as_f64),
+            v.get("y").and_then(Value::as_f64),
+        ) {
+            (Some(x), Some(y)) => (x, y),
+            _ => return Ok(false),
+        };
+        if v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(true);
         }
-        _ => Ok(false),
+        match attempt {
+            1 => {}
+            a if a < ATTEMPTS => {
+                ctx.output("selection didn't register -- clicking again at fresh coordinates")
+            }
+            _ => ctx.warn("cursor clicks didn't register -- falling back to a CDP click"),
+        }
+        let (x, y) = jittered(ctx, x, y);
+        if attempt < ATTEMPTS {
+            ctx.click_at_cursor(x, y).await?;
+        } else {
+            ctx.click_at(x, y).await?;
+        }
+        // give React a beat to repaint the button state before verifying
+        ctx.human_pause(300, 600).await?;
     }
+    let v = ctx.eval(find_js).await?;
+    Ok(v.get("selected").and_then(Value::as_bool).unwrap_or(false))
 }
 
 /// Find the Submit button (identified by being next to the "Skip" button)
 /// and click it IF it's currently enabled. Returns `Ok(false)` if it's
-/// missing or still disabled (e.g. not every criterion got rated).
+/// missing or still disabled (e.g. not every criterion got rated), or if
+/// even repeated clicks left it sitting there.
+///
+/// Verified like the selections above, but the success signal is inverted:
+/// a submit that landed makes the enabled button GO AWAY (the page submits /
+/// navigates), so "still findable after the click" means the click missed --
+/// re-find fresh coordinates and try again, ending with a CDP click. No
+/// double-submit risk: a click that actually submitted removes the button,
+/// which ends the loop before another press.
 pub async fn click_submit_if_enabled(ctx: &mut WorkflowCtx) -> Result<bool> {
-    let v = ctx.eval(FIND_SUBMIT_JS).await?;
-    match (
-        v.get("x").and_then(Value::as_f64),
-        v.get("y").and_then(Value::as_f64),
-    ) {
-        (Some(x), Some(y)) => {
-            ctx.click_at(x, y).await?;
-            Ok(true)
+    click_submit_with(ctx, FIND_SUBMIT_JS).await
+}
+
+/// The mechanism behind [`click_submit_if_enabled`], reusable with any
+/// find-JS returning `{x, y}` for an ENABLED submit control (the review
+/// workflow feeds it the Handshake page's submit button).
+pub async fn click_submit_with(ctx: &mut WorkflowCtx, find_js: &str) -> Result<bool> {
+    const ATTEMPTS: usize = 3;
+    let mut clicked = false;
+    for attempt in 1..=ATTEMPTS {
+        let v = ctx.eval(find_js).await?;
+        let (x, y) = match (
+            v.get("x").and_then(Value::as_f64),
+            v.get("y").and_then(Value::as_f64),
+        ) {
+            (Some(x), Some(y)) => (x, y),
+            // Not findable (any more): either it was never enabled, or our
+            // click just went through and the page moved on.
+            _ => return Ok(clicked),
+        };
+        if clicked {
+            ctx.output("Submit is still on screen -- the click may have missed; trying again");
         }
-        _ => Ok(false),
+        let (x, y) = jittered(ctx, x, y);
+        if attempt < ATTEMPTS {
+            ctx.click_at_cursor(x, y).await?;
+        } else {
+            ctx.click_at(x, y).await?;
+        }
+        clicked = true;
+        // submissions take a moment to go through / navigate
+        ctx.human_pause(900, 1600).await?;
     }
+    let v = ctx.eval(find_js).await?;
+    Ok(v.get("x").is_none())
 }
 
 const ANSWER_CRITERIA_PROMPT: &str = "You are evaluating two AI-generated responses to a task, \
@@ -228,7 +442,8 @@ const CLICK_CRITERION_BUTTON_JS: &str = r#"(function(){
           try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
           var r = e.getBoundingClientRect();
           if (r.width < 1 || r.height < 1) return null;
-          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2,
+                   selected: ((e.className || '').toString().indexOf('bg-background') === -1) };
         }
       }
     }
@@ -254,7 +469,12 @@ const CLICK_OVERALL_BUTTON_JS: &str = r#"(function(){
       try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
       var r = e.getBoundingClientRect();
       if (r.width < 1 || r.height < 1) return null;
-      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      /* Unlike the criterion buttons, the Overall buttons' CLASSES never
+         change -- the pick is rendered via an inline style: selected gets a
+         background-color (solid comparison color for A/B, muted fill for
+         Tie), unselected has border/text colors only (verified live). */
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2,
+               selected: ((e.getAttribute('style') || '').indexOf('background-color') !== -1) };
     }
   }
   return null;
@@ -377,6 +597,16 @@ fn system_downloads_dir() -> Result<std::path::PathBuf> {
 /// Detects "done downloading" by watching for a new filename to appear that
 /// ISN'T a Chrome in-progress file (`.crdownload`/`.tmp`), then confirming
 /// its size stops changing across a short pause.
+///
+/// The click itself is attempted up to 3 times within `timeout`, and the
+/// target is re-located with `find_js` immediately before EVERY press. The
+/// page is a live SPA that re-renders constantly (its task timer ticks every
+/// second), and a re-render can reset the scroll of the containers around
+/// the target between our lookup and the click, silently moving it out from
+/// under the recorded coordinates -- observed live on the Task Data
+/// "Download" button: Golem's click landed where the button used to be and
+/// did nothing, while an identical CDP click at re-checked coordinates
+/// downloaded immediately.
 pub async fn click_and_wait_for_download(
     ctx: &mut WorkflowCtx,
     find_js: &str,
@@ -391,36 +621,41 @@ pub async fn click_and_wait_for_download(
 
     // The page can take a moment to render (SPA route change, data still
     // loading, etc.), so poll for the click target the same way the other
-    // wait_for_* lookups do instead of giving up after a single eval.
+    // wait_for_* lookups do instead of giving up after a single eval. The
+    // coordinates found here are deliberately thrown away -- the click loop
+    // below re-reads them right before pressing.
     let find_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let (x, y) = loop {
+    loop {
         ctx.guard().await?;
         let target = ctx.eval(find_js).await?;
-        match (
-            target.get("x").and_then(Value::as_f64),
-            target.get("y").and_then(Value::as_f64),
-        ) {
-            (Some(x), Some(y)) => break (x, y),
-            _ => {
-                if tokio::time::Instant::now() >= find_deadline {
-                    return Err(GolemError::Other(
-                        "download link not found on the page".to_string(),
-                    ));
-                }
-                ctx.human_pause(250, 400).await?;
-            }
+        if target.get("x").and_then(Value::as_f64).is_some()
+            && target.get("y").and_then(Value::as_f64).is_some()
+        {
+            break;
         }
-    };
-    ctx.click_at(x, y).await?;
+        if tokio::time::Instant::now() >= find_deadline {
+            return Err(GolemError::Other(
+                "download link not found on the page".to_string(),
+            ));
+        }
+        ctx.human_pause(250, 400).await?;
+    }
 
+    const MAX_CLICKS: usize = 3;
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut clicks_done = 0usize;
+    // First click fires immediately; each later one only after the previous
+    // click has had a few seconds to produce a file.
+    let mut next_click_at = tokio::time::Instant::now();
     let downloaded = loop {
         ctx.guard().await?;
-        let now = list_names(&downloads);
+        let names = list_names(&downloads);
         let mut candidate: Option<std::path::PathBuf> = None;
-        for name in now.difference(&before) {
+        let mut in_progress = false;
+        for name in names.difference(&before) {
             let name_str = name.to_string_lossy();
             if name_str.ends_with(".crdownload") || name_str.ends_with(".tmp") {
+                in_progress = true;
                 continue;
             }
             candidate = Some(downloads.join(name));
@@ -436,10 +671,42 @@ pub async fn click_and_wait_for_download(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(GolemError::Other(format!(
-                "clicked the link but no new file appeared in {} within {}s",
+                "clicked the download control {clicks_done} time(s) but no new file \
+                 appeared in {} within {}s",
                 downloads.display(),
                 timeout.as_secs()
             )));
+        }
+        // Re-click only while nothing is downloading -- a second click over an
+        // active download would just fetch a duplicate.
+        if !in_progress && clicks_done < MAX_CLICKS && tokio::time::Instant::now() >= next_click_at
+        {
+            let target = ctx.eval(find_js).await?;
+            if let (Some(x), Some(y)) = (
+                target.get("x").and_then(Value::as_f64),
+                target.get("y").and_then(Value::as_f64),
+            ) {
+                if clicks_done > 0 {
+                    ctx.output("no download started yet -- clicking again at fresh coordinates");
+                }
+                // Make the long humanized approach FIRST, then re-locate and
+                // hop the short remaining distance -- the approach can take
+                // over a second, plenty of time for a re-render to move the
+                // target, so the final lookup->press window must stay small.
+                ctx.move_to(Point::new(x, y)).await?;
+                let fresh = ctx.eval(find_js).await?;
+                let (fx, fy) = match (
+                    fresh.get("x").and_then(Value::as_f64),
+                    fresh.get("y").and_then(Value::as_f64),
+                ) {
+                    (Some(fx), Some(fy)) => (fx, fy),
+                    _ => (x, y),
+                };
+                let (fx, fy) = jittered(ctx, fx, fy);
+                ctx.click_at(fx, fy).await?;
+                clicks_done += 1;
+                next_click_at = tokio::time::Instant::now() + Duration::from_secs(8);
+            }
         }
         ctx.human_pause(300, 500).await?;
     };
@@ -461,24 +728,43 @@ fn list_names(dir: &std::path::Path) -> std::collections::HashSet<std::ffi::OsSt
         .unwrap_or_default()
 }
 
-/// Finds the Task Data block's download link (same lookup as
-/// `TASK_DATA_ZIP_URL_JS`) and returns its clickable centre `{x, y}` instead
-/// of its href, for use with `click_and_wait_for_download`.
+/// Finds the Task Data block's download control -- an `<a href>` link (older
+/// layouts) or the archive-viewer's `<button>Download</button>` (newer
+/// layout, see the block-finder comment above `TASK_DATA_ZIP_URL_JS`) -- and
+/// returns its clickable centre `{x, y}`, for use with
+/// `click_and_wait_for_download`.
 ///
-/// Selects the block by its own class list, not by an `<h1>Task Data</h1>`
-/// inside it -- some tasks' Task Data block has no heading and no download
-/// link at all (just the description text), so anchoring on the heading text
-/// made this (and the two lookups below) fail to find anything at all on
-/// those tasks. The class combination `prose prose-sm max-w-none
-/// text-sm text-foreground` is unique to this one block on the page in both
-/// variants, so match on that directly.
+/// The bare-anchor fallback (first `<a href>` in the block) is skipped when
+/// the archive viewer is present: on that layout the description text itself
+/// may contain ordinary links, and none of them is a download.
 pub const TASK_DATA_ZIP_CLICK_JS: &str = r#"(function(){
-  var box = document.querySelector('div.prose.prose-sm.max-w-none.text-sm.text-foreground');
+  var all = document.querySelectorAll('div.prose.prose-sm.max-w-none');
+  var box = null;
+  for (var b = 0; b < all.length; b++) {
+    var h = all[b].querySelector('h1,h2,h3');
+    if (all[b].querySelector('[data-task-data-archive-viewer]') ||
+        (h && /task\s*data/i.test(h.textContent || ''))) { box = all[b]; break; }
+  }
+  if (!box && all.length) box = all[0];
   if (!box) return null;
-  var a = box.querySelector('a[href]');
-  if (!a) return null;
-  try { a.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
-  var r = a.getBoundingClientRect();
+  var t = null;
+  var as = box.querySelectorAll('a[href]');
+  for (var i = 0; i < as.length; i++) {
+    var href = as[i].getAttribute('href') || '';
+    var txt = (as[i].textContent || '').toLowerCase();
+    if (/\.zip(\?|$)/i.test(href) || txt.indexOf('download') !== -1) { t = as[i]; break; }
+  }
+  if (!t) {
+    var btns = box.querySelectorAll('button');
+    for (var j = 0; j < btns.length; j++) {
+      var btxt = (btns[j].textContent || '').toLowerCase();
+      if (btxt.indexOf('download') !== -1 || btns[j].querySelector('svg.lucide-download')) { t = btns[j]; break; }
+    }
+  }
+  if (!t && as.length && !box.querySelector('[data-task-data-archive-viewer]')) t = as[0];
+  if (!t) return null;
+  try { t.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+  var r = t.getBoundingClientRect();
   if (r.width < 1 || r.height < 1) return null;
   return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
 })()"#;
@@ -552,13 +838,34 @@ pub async fn unzip_and_cleanup(
     Ok(())
 }
 
+/// How a task's downloadable Task Data is exposed on the page.
+pub enum TaskDataSource {
+    /// An `<a href>` link ("Download all task data (ZIP)") -- fetch the href
+    /// directly.
+    DirectUrl(String),
+    /// The newer archive-viewer layout's `<button>Download</button>` -- there
+    /// is no href anywhere in the DOM (the download is wired up in JS), so
+    /// the only way to get the file is to physically click the button and
+    /// catch what lands in `~/Downloads`.
+    DownloadButton,
+}
+
 /// The Task Data block's direct "Download all task data (ZIP)" link href:
-/// find `<h1>Task Data</h1>`, read the first `<a href>` inside its wrapper div.
+/// prefer an anchor whose href ends in `.zip` or whose text mentions
+/// "download" (some layouts put other links first), else the first `<a href>`
+/// inside the wrapper div.
 /// This is a same-page, top-level anchor (unlike the response zips below), so
 /// it's directly readable -- no cross-origin issue here.
 pub async fn task_data_zip_url(ctx: &WorkflowCtx) -> Result<Option<String>> {
     let v = ctx.eval(TASK_DATA_ZIP_URL_JS).await?;
     Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
+}
+
+/// Whether the Task Data block holds an archive-viewer "Download" button
+/// (see `TASK_DATA_DOWNLOAD_BUTTON_JS`).
+pub async fn task_data_download_button(ctx: &WorkflowCtx) -> Result<bool> {
+    let v = ctx.eval(TASK_DATA_DOWNLOAD_BUTTON_JS).await?;
+    Ok(v.as_bool().unwrap_or(false))
 }
 
 /// The Task Data block's full visible text (innerText of its wrapper div).
@@ -588,19 +895,24 @@ pub async fn response_zip_url(ctx: &WorkflowCtx, label: &str) -> Result<Option<S
     Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
 }
 
-/// Poll `task_data_zip_url` every ~250-400ms until it finds something, or
-/// `timeout` elapses. The page is a client-rendered SPA, so a one-shot check
-/// right after navigation can race the render -- this rides that out instead
-/// of failing immediately. Cancellable via `ctx.guard` (Stop button works).
-pub async fn wait_for_task_data_zip_url(
+/// Poll every ~250-400ms until the page shows a way to download the Task
+/// Data -- a direct link href, or the archive-viewer's Download button -- or
+/// `timeout` elapses (None: this task has no downloadable data at all). The
+/// page is a client-rendered SPA, so a one-shot check right after navigation
+/// can race the render -- this rides that out instead of failing immediately.
+/// Cancellable via `ctx.guard` (Stop button works).
+pub async fn wait_for_task_data_download(
     ctx: &WorkflowCtx,
     timeout: Duration,
-) -> Result<Option<String>> {
+) -> Result<Option<TaskDataSource>> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         ctx.guard().await?;
         if let Some(url) = task_data_zip_url(ctx).await? {
-            return Ok(Some(url));
+            return Ok(Some(TaskDataSource::DirectUrl(url)));
+        }
+        if task_data_download_button(ctx).await? {
+            return Ok(Some(TaskDataSource::DownloadButton));
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);
@@ -679,21 +991,82 @@ const EVALUATION_CRITERIA_JS: &str = r#"(function(){
   return lines.length ? lines.join('\n') : null;
 })()"#;
 
-// Both lookups below select the Task Data block by its own class list (see
-// the comment on `TASK_DATA_ZIP_CLICK_JS`) rather than requiring an
-// `<h1>Task Data</h1>` -- some tasks' block has no heading/download link, only
-// the description text, and this still finds it.
+// All the Task Data lookups (URL / button / click / text) find the block the
+// same way. The block's class list differs between page variants -- older
+// tasks use `prose prose-sm max-w-none text-sm text-foreground`, the newer
+// archive-viewer layout uses `prose prose-sm dark:prose-invert max-w-none
+// ...` (no `text-sm text-foreground` at all) -- so match on the common
+// `prose prose-sm max-w-none` subset, preferring a candidate that contains
+// the archive viewer (`[data-task-data-archive-viewer]`) or a "Task Data"
+// heading, and falling back to the first match (some tasks' block has no
+// heading/download link at all, only the description text).
 
 const TASK_DATA_ZIP_URL_JS: &str = r#"(function(){
-  var box = document.querySelector('div.prose.prose-sm.max-w-none.text-sm.text-foreground');
+  var all = document.querySelectorAll('div.prose.prose-sm.max-w-none');
+  var box = null;
+  for (var b = 0; b < all.length; b++) {
+    var h = all[b].querySelector('h1,h2,h3');
+    if (all[b].querySelector('[data-task-data-archive-viewer]') ||
+        (h && /task\s*data/i.test(h.textContent || ''))) { box = all[b]; break; }
+  }
+  if (!box && all.length) box = all[0];
   if (!box) return null;
-  var a = box.querySelector('a[href]');
-  return a ? a.href : null;
+  var as = box.querySelectorAll('a[href]');
+  for (var i = 0; i < as.length; i++) {
+    var href = as[i].getAttribute('href') || '';
+    var txt = (as[i].textContent || '').toLowerCase();
+    if (/\.zip(\?|$)/i.test(href) || txt.indexOf('download') !== -1) return as[i].href;
+  }
+  if (box.querySelector('[data-task-data-archive-viewer]')) return null;
+  return as.length ? as[0].href : null;
 })()"#;
 
+// True when the block holds the newer archive-viewer's `<button>Download`
+// (identified by its text or its lucide download icon) -- that layout has no
+// `<a href>` to fetch, so the button must be physically clicked instead.
+const TASK_DATA_DOWNLOAD_BUTTON_JS: &str = r#"(function(){
+  var all = document.querySelectorAll('div.prose.prose-sm.max-w-none');
+  var box = null;
+  for (var b = 0; b < all.length; b++) {
+    var h = all[b].querySelector('h1,h2,h3');
+    if (all[b].querySelector('[data-task-data-archive-viewer]') ||
+        (h && /task\s*data/i.test(h.textContent || ''))) { box = all[b]; break; }
+  }
+  if (!box && all.length) box = all[0];
+  if (!box) return false;
+  var btns = box.querySelectorAll('button');
+  for (var i = 0; i < btns.length; i++) {
+    var txt = (btns[i].textContent || '').toLowerCase();
+    if (txt.indexOf('download') !== -1 || btns[i].querySelector('svg.lucide-download')) return true;
+  }
+  return false;
+})()"#;
+
+// The block's visible text, minus the archive viewer's file tree when one is
+// present -- that subtree is just a listing of the files the download itself
+// contains ("Input Data Files ... input_0.jpg 26.3 KB ..."), noise in the
+// saved `information` file.
 const TASK_DATA_TEXT_JS: &str = r#"(function(){
-  var box = document.querySelector('div.prose.prose-sm.max-w-none.text-sm.text-foreground');
-  return box ? (box.innerText || box.textContent || '') : '';
+  var all = document.querySelectorAll('div.prose.prose-sm.max-w-none');
+  var box = null;
+  for (var b = 0; b < all.length; b++) {
+    var h = all[b].querySelector('h1,h2,h3');
+    if (all[b].querySelector('[data-task-data-archive-viewer]') ||
+        (h && /task\s*data/i.test(h.textContent || ''))) { box = all[b]; break; }
+  }
+  if (!box && all.length) box = all[0];
+  if (!box) return '';
+  if (!box.querySelector('[data-task-data-archive-viewer]'))
+    return box.innerText || box.textContent || '';
+  var parts = [];
+  var kids = box.children;
+  for (var i = 0; i < kids.length; i++) {
+    if (kids[i].hasAttribute('data-task-data-archive-viewer') ||
+        kids[i].querySelector('[data-task-data-archive-viewer]')) continue;
+    var t = kids[i].innerText || kids[i].textContent || '';
+    if (t.trim()) parts.push(t);
+  }
+  return parts.join('\n');
 })()"#;
 
 const FIND_RESPONSE_ZIP_URL_JS: &str = r#"(function(){

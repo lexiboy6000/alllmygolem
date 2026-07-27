@@ -81,6 +81,37 @@ pub struct MoveStep {
     pub delay: Duration,
 }
 
+/// Standard-normal sample via Box-Muller. `rand` itself ships no Normal
+/// distribution and pulling in `rand_distr` for one transform isn't worth a
+/// dependency; this is the textbook two-uniforms version.
+fn gauss<R: Rng>(rng: &mut R) -> f64 {
+    let u1: f64 = rng.random_range(f64::EPSILON..1.0);
+    let u2: f64 = rng.random_range(0.0..1.0);
+    (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+}
+
+/// Gaussian positional jitter: independent N(0, sigma²) per axis, each
+/// clamped to ±`max_abs` so a rare 4σ outlier can't fling the cursor off a
+/// small target.
+pub fn gaussian_jitter<R: Rng>(sigma: f64, max_abs: f64, rng: &mut R) -> (f64, f64) {
+    if sigma <= 0.0 || max_abs <= 0.0 {
+        return (0.0, 0.0);
+    }
+    (
+        (gauss(rng) * sigma).clamp(-max_abs, max_abs),
+        (gauss(rng) * sigma).clamp(-max_abs, max_abs),
+    )
+}
+
+/// Where a click actually lands relative to the aimed-at point. Humans
+/// cluster around the centre of a control with roughly normal spread -- they
+/// don't hit the exact centre every time (and exact-centre clicks across a
+/// whole form are a strong automation tell). Clamped to ±5px so even the
+/// small Good/Bad buttons (~24px tall) are never missed from their centre.
+pub fn click_landing_jitter<R: Rng>(cfg: &HumanizeConfig, rng: &mut R) -> (f64, f64) {
+    gaussian_jitter(cfg.jitter_px * 1.6, 5.0, rng)
+}
+
 /// Cubic Bézier interpolation.
 fn cubic_bezier(p0: Point, p1: Point, p2: Point, p3: Point, t: f64) -> Point {
     let u = 1.0 - t;
@@ -140,10 +171,13 @@ pub fn mouse_path<R: Rng>(start: Point, end: Point, cfg: &HumanizeConfig, rng: &
     for i in 1..=steps {
         let t = ease(i as f64 / steps as f64);
         let mut p = cubic_bezier(start, c1, c2, end, t);
-        // Positional jitter on intermediate points only.
+        // Positional jitter on intermediate points only. Gaussian, not
+        // uniform: real hand tremor clusters near the ideal path with rare
+        // larger wobbles, where uniform noise has a flat, boxy signature.
         if i != steps && cfg.jitter_px > 0.0 {
-            p.x += rng.random_range(-cfg.jitter_px..cfg.jitter_px);
-            p.y += rng.random_range(-cfg.jitter_px..cfg.jitter_px);
+            let (jx, jy) = gaussian_jitter(cfg.jitter_px, cfg.jitter_px * 2.5, rng);
+            p.x += jx;
+            p.y += jy;
         }
         // Per-step delay: eased base * jitter, with rare micro-pauses.
         let mut ms = cfg.step_ms * rng.random_range(0.6..1.5);

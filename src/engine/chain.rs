@@ -19,8 +19,8 @@ use crate::context::{Control, PromptBus, WorkflowCtx};
 use crate::error::GolemError;
 use crate::backend::{BrowserBackend, InputBackend};
 use crate::messages::{
-    EngineEvent, EngineStatus, EventTx, LogLevel, OutcomeSummary, PromptKind, PromptRequest,
-    PromptResponse,
+    CommandTx, EngineEvent, EngineStatus, EventTx, LogLevel, OutcomeSummary, PromptKind,
+    PromptRequest, PromptResponse,
 };
 use crate::registry::WorkflowRegistry;
 use crate::settings::Settings;
@@ -37,6 +37,9 @@ pub struct ChainArgs {
     pub events: EventTx,
     pub settings: Settings,
     pub busy: Arc<AtomicBool>,
+    /// Sender back into the engine's own command queue, so workflows can
+    /// enqueue follow-up work (e.g. the pipeline's next round).
+    pub commands: CommandTx,
     /// The explicit, ordered list of target workflow names requested by the
     /// user. Each is expanded via [`WorkflowRegistry::resolve_order`] so its
     /// dependencies run first.
@@ -84,6 +87,7 @@ impl ChainArgs {
             events,
             settings,
             busy,
+            commands,
             targets,
             inputs,
             restore,
@@ -95,8 +99,8 @@ impl ChainArgs {
         control.reset();
 
         run_inner(
-            &registry, &browser, &input, &control, &prompts, &events, &settings, &targets, &inputs,
-            restore.as_ref(), confirm_prereqs,
+            &registry, &browser, &input, &control, &prompts, &events, &settings, &commands,
+            &targets, &inputs, restore.as_ref(), confirm_prereqs,
         )
         .await;
 
@@ -117,6 +121,7 @@ async fn run_inner(
     prompts: &Arc<PromptBus>,
     events: &EventTx,
     settings: &Settings,
+    commands: &CommandTx,
     targets: &[String],
     inputs: &BTreeMap<String, String>,
     restore: Option<&RunState>,
@@ -188,6 +193,7 @@ async fn run_inner(
             prompts.clone(),
             events.clone(),
             settings.clone(),
+            commands.clone(),
             run_id.clone(),
             name.clone(),
             inputs.clone(),
