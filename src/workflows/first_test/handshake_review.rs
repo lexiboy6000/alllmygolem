@@ -20,9 +20,10 @@
 //! 3. select the arena task-type button (id derived from the multimango tab's
 //!    URL), then click the up-arrow send button,
 //! 4. click the "Continue task" popup that follows,
-//! 5. wait out the handle time: the full `target_minutes` input +/- up to
-//!    ~3 min of jitter, counted from when this step starts (plain wall
-//!    clock, NOT the page timer),
+//! 5. wait out the handle time: the full `target_minutes` input +/- jitter
+//!    (capped at ~3 min, and never more than the input itself), counted from
+//!    when this step starts (plain wall clock, NOT the page timer); `0`
+//!    skips the wait entirely,
 //! 6. re-verify the answers on multimango, then on Handshake select
 //!    "I submitted my task on Multimango" and click the up-arrow send,
 //! 7. submit the evaluation on the multimango tab,
@@ -97,7 +98,7 @@ impl Workflow for HandshakeReviewAndSubmit {
             ),
             InputSpec::optional(
                 "target_minutes",
-                "Minutes the wait step holds before submitting, +/- ~3 min jitter",
+                "Minutes the wait step holds before submitting, +/- jitter (0 = no wait)",
                 "35",
             ),
             InputSpec::optional(
@@ -112,10 +113,13 @@ impl Workflow for HandshakeReviewAndSubmit {
         let timeout = Duration::from_millis(ctx.settings.default_wait_timeout_ms);
         let task_dir = util::current_task_dir(ctx)?;
 
+        // 0 is a legitimate answer ("don't wait"), so the accepted range starts
+        // there. It used to start at 1, which sent a deliberate 0 down the
+        // `unwrap_or` path and silently waited the 35-minute default instead.
         let target_minutes: u64 = ctx
             .input("target_minutes")
             .and_then(|v| v.trim().parse().ok())
-            .filter(|m| (1..=120).contains(m))
+            .filter(|m| *m <= 120)
             .unwrap_or(35);
 
         // ---- locate the two platform tabs -------------------------------
@@ -722,18 +726,32 @@ async fn found(ctx: &mut WorkflowCtx, find_js: &str) -> Result<bool> {
 // the handle-time wait + chat-composer send
 // ---------------------------------------------------------------------------
 
-/// Wait out the full handle time from RIGHT NOW: `target_minutes` +/- up to
-/// 3 min of jitter (so rounds don't all land on the exact same handle time).
-/// Plain wall clock -- the page's timer widget is not read. The project
-/// expects handle times near the human average; the wait only exists so
-/// tasks aren't turned around implausibly fast. Stop/Pause-aware; progress
-/// is reported about once a minute.
+/// Wait out the full handle time from RIGHT NOW: `target_minutes` +/- jitter
+/// (so rounds don't all land on the exact same handle time). Plain wall clock
+/// -- the page's timer widget is not read. The project expects handle times
+/// near the human average; the wait only exists so tasks aren't turned around
+/// implausibly fast. Stop/Pause-aware; progress is reported about once a
+/// minute.
+///
+/// `target_minutes == 0` means no wait at all -- the setting is honoured as
+/// given rather than floored, so it doubles as the way to turn the wait off
+/// while testing the rest of the pipeline.
 async fn wait_handle_time(ctx: &mut WorkflowCtx, target_minutes: u64) -> Result<()> {
+    if target_minutes == 0 {
+        ctx.output("handle-time wait is set to 0 minutes -- submitting without waiting");
+        return Ok(());
+    }
     let jitter_secs: i64 = {
         use rand::RngExt;
-        rand::rng().random_range(-180..=180)
+        // Never jitter by more than the requested time: at the 35-minute
+        // default this is the usual +/-3 min, but it keeps a deliberately
+        // short setting close to what was actually asked for instead of
+        // swamping it.
+        let cap = (target_minutes.saturating_mul(60)).min(180) as i64;
+        rand::rng().random_range(-cap..=cap)
     };
-    let total_secs = (target_minutes as i64 * 60 + jitter_secs).max(60) as u64;
+    // Floor at zero, not at a minute: the wait should be what was asked for.
+    let total_secs = (target_minutes as i64 * 60 + jitter_secs).max(0) as u64;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(total_secs);
     ctx.output(format!(
         "waiting {}:{:02} from now ({} min +/- up to 3 min jitter) before submitting",
