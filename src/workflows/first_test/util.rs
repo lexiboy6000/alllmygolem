@@ -543,6 +543,134 @@ const FIND_SUBMIT_JS: &str = r#"(function(){
   return null;
 })()"#;
 
+/// The multimango page's "Skip" button (bottom of the task), used to abandon
+/// a task whose deliverables the site can't actually serve. Same anchor as
+/// `FIND_SUBMIT_JS`, which identifies Submit by sitting next to this one.
+const SKIP_TASK_JS: &str = r#"(function(){
+  var btns = document.querySelectorAll('button');
+  for (var i = 0; i < btns.length; i++) {
+    var b = btns[i];
+    if ((b.textContent || '').trim().indexOf('Skip') === -1) continue;
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+    try { b.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+    var r = b.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+  return null;
+})()"#;
+
+/// Whether `e` is the site saying the file simply is not there -- an HTTP 4xx
+/// relayed by `curl -f` as `curl: (22) The requested URL returned error: 404`.
+///
+/// The distinction matters a lot, because the caller's response is to abandon
+/// a real task. A timeout, DNS failure or dropped connection must NOT skip: it
+/// says nothing about whether the deliverable exists, and skipping on one
+/// would throw away a perfectly good task over a blip.
+pub fn is_missing_file_error(e: &GolemError) -> bool {
+    e.to_string()
+        .split("returned error: ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (400..500).contains(&code))
+}
+
+/// Abandon the current multimango task and queue a fresh pipeline run.
+///
+/// For when a deliverable 404s: the task can never be completed, so clicking
+/// "Skip" moves the site to the next one and the whole pipeline starts over
+/// from workflow 1. Returns the error the caller should return, so the
+/// current chain stops right here instead of carrying on through steps that
+/// need files we don't have.
+///
+/// Queueing survives this chain failing -- only the user pressing Stop
+/// discards a queued chain -- so the restart happens once the current run
+/// unwinds. `rounds` is passed through UNCHANGED: a skipped task was never
+/// completed and must not count against the total.
+pub async fn skip_task_and_restart(ctx: &mut WorkflowCtx, reason: &str) -> GolemError {
+    ctx.output(format!("{reason} -- skipping this task and starting over"));
+
+    // The download steps run against multimango, but be explicit: a skip
+    // aimed at the wrong tab would be a click into someone else's page.
+    let timeout = Duration::from_millis(ctx.settings.default_wait_timeout_ms);
+    let _ = ctx
+        .browser
+        .switch_to_target("multimango.com", "", timeout)
+        .await;
+    let _ = ctx.browser.bring_to_front().await;
+
+    let mut skipped = false;
+    match wait_for_skip(ctx, Duration::from_secs(15)).await {
+        Ok(Some((x, y))) => {
+            let (x, y) = jittered(ctx, x, y);
+            match ctx.click_at(x, y).await {
+                Ok(()) => {
+                    skipped = true;
+                    ctx.output("clicked Skip on the multimango task");
+                    // Let the site load whatever comes next before the queued
+                    // chain starts poking at the DOM.
+                    let _ = ctx.human_pause(1500, 2500).await;
+                }
+                Err(e) => ctx.warn(format!("couldn't click Skip ({e})")),
+            }
+        }
+        Ok(None) => ctx.warn("no enabled 'Skip' button found on the multimango page"),
+        Err(e) => ctx.warn(format!("couldn't look for the Skip button ({e})")),
+    }
+
+    if !skipped {
+        // Don't restart into the same broken task forever. Stop and let the
+        // human decide -- this is the one outcome worth interrupting for.
+        return ctx
+            .stop_and_warn(format!(
+                "{reason}, and the 'Skip' button couldn't be clicked. Skip the task by \
+                 hand and re-run the pipeline."
+            ))
+            .await;
+    }
+
+    // Carry the pipeline's own inputs forward; task_dir stays empty so the
+    // restart creates a fresh taskN rather than reusing the half-filled one.
+    let mut inputs = std::collections::BTreeMap::new();
+    inputs.insert("defer_submit".to_string(), "yes".to_string());
+    if let Some(v) = ctx.input("target_minutes") {
+        inputs.insert("target_minutes".to_string(), v.to_string());
+    }
+    if let Some(v) = ctx.input("rounds") {
+        inputs.insert("rounds".to_string(), v.to_string());
+    }
+    ctx.queue_chain(vec![PIPELINE_WORKFLOW.to_string()], inputs);
+    ctx.output("pipeline queued to start over from workflow 1 on the next task");
+
+    GolemError::Halted(format!("{reason} -- task skipped, restarting"))
+}
+
+/// The pipeline's entry point, whose dependency chain is workflows 0 and 1-7.
+const PIPELINE_WORKFLOW: &str = "8. Handshake review + submit (pipeline)";
+
+/// Poll for an enabled Skip button, up to `timeout`.
+async fn wait_for_skip(
+    ctx: &mut WorkflowCtx,
+    timeout: Duration,
+) -> Result<Option<(f64, f64)>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        ctx.guard().await?;
+        let v = ctx.eval(SKIP_TASK_JS).await?;
+        if let (Some(x), Some(y)) = (
+            v.get("x").and_then(Value::as_f64),
+            v.get("y").and_then(Value::as_f64),
+        ) {
+            return Ok(Some((x, y)));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        ctx.human_pause(300, 600).await?;
+    }
+}
+
 /// Where we record which task folder this run is using -- see
 /// `resolve_or_create_task_dir` / `current_task_dir` below.
 fn marker_path(ctx: &WorkflowCtx) -> std::path::PathBuf {

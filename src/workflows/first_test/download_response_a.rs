@@ -45,7 +45,23 @@ impl Workflow for DownloadResponseA {
                 )
             })?;
         ctx.output(format!("response A zip: {zip_url}"));
-        let zip_path = util::download_into(ctx, &zip_url, &dir, "all_files.zip").await?;
+        // A 4xx here means the site is serving a link to a deliverable it
+        // doesn't actually have, so the task can never be completed: skip it
+        // and start the pipeline over on the next one. Any other failure
+        // (timeout, DNS, dropped connection) says nothing about whether the
+        // file exists, so it surfaces normally rather than throwing the task
+        // away.
+        let zip_path = match util::download_into(ctx, &zip_url, &dir, "all_files.zip").await {
+            Ok(path) => path,
+            Err(e) if util::is_missing_file_error(&e) => {
+                return Err(util::skip_task_and_restart(
+                    ctx,
+                    "Response A's files aren't available on the site",
+                )
+                .await);
+            }
+            Err(e) => return Err(e),
+        };
 
         ctx.step("unzip Response A").await?;
         util::unzip_and_cleanup(ctx, &zip_path, &dir).await?;

@@ -58,6 +58,25 @@ impl Workflow for HandshakePreOpenMultimango {
                 .await);
         }
 
+        // Already done for THIS Handshake task? Then don't do it again. The
+        // pipeline restarts from workflow 1 after skipping an unwinnable
+        // multimango task, which re-runs this pre-step against the unchanged
+        // Handshake round -- clicking Open Multimango a second time would
+        // reopen the very task that was just skipped.
+        let marker = premm_marker_path(ctx);
+        let already_done = std::fs::read_to_string(&marker)
+            .map(|s| s.trim() == hs_url)
+            .unwrap_or(false);
+        if already_done {
+            ctx.output("Open Multimango already done for this Handshake task -- skipping");
+            let _ = ctx
+                .browser
+                .switch_to_target("multimango.com", "", timeout)
+                .await;
+            let _ = ctx.browser.bring_to_front().await;
+            return Ok(WorkflowOutcome::Completed);
+        }
+
         ctx.step("click Open Multimango (closing the extra tab)").await?;
         let opened = open_multimango_and_close_tab(ctx).await?;
 
