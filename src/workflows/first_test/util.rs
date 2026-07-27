@@ -684,7 +684,7 @@ pub async fn click_and_wait_for_download(
             downloads.display()
         ));
     }
-    let before = list_names(&downloads);
+    let before = list_entries(&downloads);
 
     // The page can take a moment to render (SPA route change, data still
     // loading, etc.), so poll for the click target the same way the other
@@ -716,17 +716,25 @@ pub async fn click_and_wait_for_download(
     let mut next_click_at = tokio::time::Instant::now();
     let downloaded = loop {
         ctx.guard().await?;
-        let names = list_names(&downloads);
-        let mut candidate: Option<std::path::PathBuf> = None;
+        let mut candidate: Option<(std::path::PathBuf, Option<std::time::SystemTime>)> = None;
         let mut in_progress = false;
-        for name in names.difference(&before) {
+        for (name, modified) in list_entries(&downloads) {
             let name_str = name.to_string_lossy();
             if name_str.ends_with(".crdownload") || name_str.ends_with(".tmp") {
                 in_progress = true;
                 continue;
             }
-            candidate = Some(downloads.join(name));
+            let is_ours = match before.get(&name) {
+                None => true,
+                Some(previous) => previous != &modified,
+            };
+            // Several files can qualify (a stale overwrite plus a uniquified
+            // `task-data (1).zip`); the newest is the one this click produced.
+            if is_ours && candidate.as_ref().is_none_or(|(_, best)| modified > *best) {
+                candidate = Some((downloads.join(&name), modified));
+            }
         }
+        let candidate = candidate.map(|(path, _)| path);
         if let Some(path) = candidate {
             // Confirm it's actually finished (stopped growing), not still mid-write.
             let size1 = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -789,15 +797,30 @@ pub async fn click_and_wait_for_download(
     Ok(dest)
 }
 
-fn list_names(dir: &std::path::Path) -> std::collections::HashSet<std::ffi::OsString> {
+/// Every non-dotfile in `dir`, mapped to its last-modified time.
+///
+/// The modification time is load-bearing, not decoration: a download steered
+/// by CDP `Browser.setDownloadBehavior` OVERWRITES a file of the same name
+/// instead of uniquifying it to `task-data (1).zip` the way an ordinary Chrome
+/// download would. Watching for a new *name* therefore never fires on the
+/// second run onward -- the file lands correctly and the wait loop sits there
+/// re-clicking until it times out. Comparing (name, mtime) catches both the
+/// fresh name and the silent overwrite.
+///
+/// Dotfiles are excluded because whatever this scan picks gets MOVED, and a
+/// shell or editor temp file appearing mid-wait must not be mistaken for the
+/// payload.
+fn list_entries(
+    dir: &std::path::Path,
+) -> std::collections::HashMap<std::ffi::OsString, Option<std::time::SystemTime>> {
     std::fs::read_dir(dir)
         .map(|read| {
             read.flatten()
-                .map(|e| e.file_name())
-                // Dotfiles are never the download we asked for, and whatever
-                // this scan picks gets MOVED -- so a shell/editor temp file
-                // appearing mid-wait must not be mistaken for the payload.
-                .filter(|name| !name.to_string_lossy().starts_with('.'))
+                .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                .map(|e| {
+                    let modified = e.metadata().and_then(|m| m.modified()).ok();
+                    (e.file_name(), modified)
+                })
                 .collect()
         })
         .unwrap_or_default()
