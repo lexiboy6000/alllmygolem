@@ -59,13 +59,29 @@ impl Workflow for HandshakePreOpenMultimango {
         }
 
         ctx.step("click Open Multimango (closing the extra tab)").await?;
-        open_multimango_and_close_tab(ctx).await?;
+        let opened = open_multimango_and_close_tab(ctx).await?;
 
-        // Remember that this run URL got the treatment, so workflow 8 skips
-        // its own step 1 this round. Best-effort: a failed write just means
-        // a harmless second open+close later.
-        if let Err(e) = std::fs::write(premm_marker_path(ctx), &hs_url) {
-            ctx.warn(format!("couldn't write the pre-step marker ({e})"));
+        // Only claim this round as handled if the dance ACTUALLY happened.
+        // The helper is best-effort and returns Ok even when the control was
+        // never on screen, so writing the marker unconditionally told
+        // workflow 8 "the pre-step did it" -- step 1 then skipped as well and
+        // the whole task ran without Open Multimango ever being clicked. That
+        // is what broke the second task of a loop, where the freshly
+        // navigated /run page had not rendered the control yet.
+        let marker = premm_marker_path(ctx);
+        if opened {
+            // Best-effort: a failed write just means a harmless second
+            // open+close later.
+            if let Err(e) = std::fs::write(&marker, &hs_url) {
+                ctx.warn(format!("couldn't write the pre-step marker ({e})"));
+            }
+        } else {
+            // Clear any marker left by an earlier round so workflow 8's step
+            // 1 retries the dance instead of skipping it.
+            let _ = std::fs::remove_file(&marker);
+            ctx.output(
+                "Open Multimango wasn't clicked here -- leaving it to workflow 8's step 1",
+            );
         }
 
         // Workflows 1-7 drive the multimango page -- hand control back.

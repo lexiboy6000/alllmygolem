@@ -585,13 +585,22 @@ impl Workflow for HandshakeReviewAndSubmit {
 /// best-effort: the human sometimes handles this by hand -- every outcome
 /// just notes what happened and moves on; this never fails the workflow.
 /// Used by workflow 8's step 1 and by "0. Handshake: open Multimango".
-pub(super) async fn open_multimango_and_close_tab(ctx: &mut WorkflowCtx) -> Result<()> {
+///
+/// Returns whether the Open Multimango control was actually found and
+/// clicked. Callers must not treat "returned Ok" as "the dance happened":
+/// the control is frequently not on screen yet, and the pre-step recording
+/// the round as done in that case is exactly what made workflow 8 skip its
+/// own step 1 and run a whole task without ever clicking it.
+pub(super) async fn open_multimango_and_close_tab(ctx: &mut WorkflowCtx) -> Result<bool> {
     let mm_before = ctx
         .browser
         .list_targets("multimango.com")
         .await
         .unwrap_or_default();
-    match wait_for_coords(ctx, OPEN_MULTIMANGO_JS, Duration::from_secs(8)).await? {
+    // Generous, because the pre-step reaches here moments after Handshake
+    // navigated to a brand-new /run page on the second and later rounds of a
+    // loop -- the old 8s could expire before the control had rendered.
+    match wait_for_coords(ctx, OPEN_MULTIMANGO_JS, Duration::from_secs(25)).await? {
         Some((x, y)) => {
             let (x, y) = util::jittered(ctx, x, y);
             ctx.click_at_cursor(x, y).await?;
@@ -637,15 +646,16 @@ pub(super) async fn open_multimango_and_close_tab(ctx: &mut WorkflowCtx) -> Resu
             ctx.output(note);
             // Handshake may have yielded focus to the popup; come back.
             let _ = ctx.browser.bring_to_front().await;
+            Ok(true)
         }
         None => {
             ctx.output(
                 "no 'Open Multimango' control visible -- skipping (it only shows in \
                  some dialogs/states, or was already handled by hand)",
             );
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Marker recording the Handshake run URL for which the pipeline pre-step

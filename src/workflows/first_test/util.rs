@@ -351,8 +351,28 @@ pub async fn click_submit_if_enabled(ctx: &mut WorkflowCtx) -> Result<bool> {
 /// The mechanism behind [`click_submit_if_enabled`], reusable with any
 /// find-JS returning `{x, y}` for an ENABLED submit control (the review
 /// workflow feeds it the Handshake page's submit button).
+///
+/// The button going away is the only evidence we have that a click landed,
+/// and the page is not always quick to give it: Handshake's "Confirm time"
+/// can take several seconds to process, with the button sitting there the
+/// whole time. This used to wait a flat ~1.5s after each click and check
+/// once, so a slow-but-perfectly-successful confirm read as a miss and the
+/// run stopped on a "click it by hand" prompt. Poll for the disappearance
+/// instead, and only re-click once the button has genuinely outlasted that
+/// wait -- clicking again early is the actual danger here, since it aims a
+/// second press at a page that already accepted the first.
 pub async fn click_submit_with(ctx: &mut WorkflowCtx, find_js: &str) -> Result<bool> {
     const ATTEMPTS: usize = 3;
+    /// How long the page gets to react before a click counts as missed.
+    /// Deliberately generous: the two outcomes here are not symmetric. Waiting
+    /// too long on a click that missed costs seconds, while re-clicking too
+    /// early aims a second submission at a page still chewing on the first,
+    /// and the button stays visible throughout that processing.
+    const SETTLE: Duration = Duration::from_secs(15);
+    /// The final attempt waits longer still: there is nothing after it but a
+    /// prompt that stops the run dead, so patience is cheaper than giving up.
+    const FINAL_SETTLE: Duration = Duration::from_secs(30);
+
     let mut clicked = false;
     for attempt in 1..=ATTEMPTS {
         let v = ctx.eval(find_js).await?;
@@ -375,11 +395,34 @@ pub async fn click_submit_with(ctx: &mut WorkflowCtx, find_js: &str) -> Result<b
             ctx.click_at(x, y).await?;
         }
         clicked = true;
-        // submissions take a moment to go through / navigate
-        ctx.human_pause(900, 1600).await?;
+        let patience = if attempt == ATTEMPTS { FINAL_SETTLE } else { SETTLE };
+        if wait_until_gone(ctx, find_js, patience).await? {
+            return Ok(true);
+        }
     }
-    let v = ctx.eval(find_js).await?;
-    Ok(v.get("x").is_none())
+    Ok(false)
+}
+
+/// Poll `find_js` until it stops finding its target, giving up after
+/// `patience`. `true` means it went away (the click registered).
+///
+/// Stop/Pause-aware via `human_pause`, and the pause comes first so a click
+/// always gets a beat to dispatch before the first look.
+async fn wait_until_gone(
+    ctx: &mut WorkflowCtx,
+    find_js: &str,
+    patience: Duration,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        ctx.human_pause(350, 650).await?;
+        if ctx.eval(find_js).await?.get("x").is_none() {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+    }
 }
 
 const ANSWER_CRITERIA_PROMPT: &str = "You are evaluating two AI-generated responses to a task, \
