@@ -930,6 +930,68 @@ impl WorkflowCtx {
         Ok(())
     }
 
+    /// A small idle wheel scroll -- a person glancing further down the page
+    /// (or back up at something above) and mostly drifting back. Purely
+    /// cosmetic, like [`wander_cursor`](Self::wander_cursor): every real
+    /// click re-finds its target's fresh coordinates and each finder scrolls
+    /// its element back into view first, so a stray scroll can never change
+    /// which control gets clicked. The wheel is dispatched at the virtual
+    /// cursor's last position via CDP, never the OS wheel: after a wander
+    /// the real cursor may be resting over a different window, and this must
+    /// only ever move the task page. Best-effort: a quiet no-op if the wheel
+    /// fails.
+    pub async fn wander_scroll(&mut self) -> Result<()> {
+        self.guard().await?;
+        let (notches, up_first, back) = {
+            let mut rng = rand::rng();
+            (
+                rng.random_range(2..=5),
+                rng.random_bool(0.3),
+                rng.random_bool(0.75),
+            )
+        };
+        let dir: i32 = if up_first { -1 } else { 1 };
+        if !self.scroll_notches(dir * notches).await? {
+            return Ok(());
+        }
+        // a beat "reading" whatever the glance landed on
+        self.human_pause(400, 1400).await?;
+        if back {
+            // return most of the way -- humans don't undo a scroll exactly
+            let back_notches = {
+                let mut rng = rand::rng();
+                notches - rng.random_range(0..=1)
+            };
+            self.scroll_notches(-dir * back_notches).await?;
+        }
+        Ok(())
+    }
+
+    /// `n` wheel notches (positive = down) at the virtual cursor's position,
+    /// one notch at a time with a human inter-notch rhythm. Returns whether
+    /// every notch dispatched; Stop/Pause still propagate as errors.
+    async fn scroll_notches(&mut self, n: i32) -> Result<bool> {
+        // ~110 CSS px per notch, matching a typical wheel click
+        let delta = if n >= 0 { 110.0 } else { -110.0 };
+        for _ in 0..n.abs() {
+            self.guard().await?;
+            if self
+                .browser
+                .mouse_wheel(self.last_mouse.x, self.last_mouse.y, 0.0, delta)
+                .await
+                .is_err()
+            {
+                return Ok(false);
+            }
+            let pause = {
+                let mut rng = rand::rng();
+                humanize::random_pause(40, 140, &self.cfg(), &mut rng)
+            };
+            tokio::time::sleep(pause).await;
+        }
+        Ok(true)
+    }
+
     /// Double-click at viewport coordinates.
     pub async fn double_click_at(&mut self, x: f64, y: f64) -> Result<()> {
         let p = Point::new(x, y);
