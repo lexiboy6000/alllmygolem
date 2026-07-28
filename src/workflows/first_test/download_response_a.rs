@@ -1,7 +1,10 @@
-//! Step 4: download Response A's deliverable zip and unzip it into
-//! task1/responseA. See util::response_zip_url for why this derives the zip
-//! URL from the iframe's src instead of clicking the "Copy link" button
-//! (that button lives inside a cross-origin iframe Golem's JS can't reach).
+//! Step 4: download Response A's deliverables into task1/responseA -- the
+//! all_files.zip on the older layout, or the individual files plus the
+//! model-response text on the newer delivered-files listing (which has no
+//! zip). See util::response_iframe_src for why this reads the iframe's src
+//! instead of clicking the copy-link buttons (they live inside a
+//! cross-origin iframe Golem's JS can't reach), and
+//! util::download_response_into for how the two layouts are told apart.
 
 use crate::prelude::*;
 
@@ -16,7 +19,7 @@ impl Workflow for DownloadResponseA {
     }
 
     fn description(&self) -> &'static str {
-        "Downloads and unzips Response A's deliverable files into task1/responseA."
+        "Downloads Response A's deliverables (zip, or the newer per-file listing plus its model-response text) into task1/responseA."
     }
 
     fn dependencies(&self) -> Vec<&'static str> {
@@ -50,12 +53,13 @@ impl Workflow for DownloadResponseA {
 }
 
 /// The download itself, separated from `run` so every failure -- iframe not
-/// found, curl error, bad zip -- funnels into the skip-and-restart recovery.
+/// found, curl error, bad zip, unusable file listing -- funnels into the
+/// skip-and-restart recovery.
 async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
     let dir = util::current_task_dir(ctx)?.join("responseA");
 
-    ctx.step("find + download Response A zip").await?;
-    let zip_url = util::wait_for_response_zip_url(ctx, "Response A", Duration::from_secs(15))
+    ctx.step("find Response A's iframe").await?;
+    let src = util::wait_for_response_iframe_src(ctx, "Response A", Duration::from_secs(15))
         .await?
         .ok_or_else(|| {
             ctx.halt(
@@ -64,12 +68,7 @@ async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
                  visible.",
             )
         })?;
-    ctx.output(format!("response A zip: {zip_url}"));
-    let zip_path = util::download_into(ctx, &zip_url, &dir, "all_files.zip").await?;
 
-    ctx.step("unzip Response A").await?;
-    util::unzip_and_cleanup(ctx, &zip_path, &dir).await?;
-    ctx.output(format!("unzipped Response A into {}", dir.display()));
-
-    Ok(())
+    ctx.step("download Response A").await?;
+    util::download_response_into(ctx, "Response A", &src, &dir).await
 }
