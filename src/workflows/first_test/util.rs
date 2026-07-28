@@ -80,6 +80,25 @@ pub async fn halt_unless_auto(ctx: &WorkflowCtx, msg: impl Into<String>) -> Gole
     ctx.stop_and_warn(msg).await
 }
 
+/// Bring the controlled tab to the front and wait for it to actually be there.
+///
+/// `click_at_cursor` drives the REAL OS cursor at physical screen pixels, so a
+/// press lands on whichever tab is *visible* -- not on whichever target CDP is
+/// driving. Switching CDP targets returns instantly; the compositor raising and
+/// repainting the window does not (on this Wayland/Hyprland setup it is well
+/// over 100ms). Clicking in that gap sends the press to the previously-visible
+/// page, which looks exactly like "the workflow did nothing".
+pub async fn focus_and_settle(ctx: &mut WorkflowCtx) -> Result<()> {
+    if let Err(e) = ctx.browser.bring_to_front().await {
+        ctx.warn(format!(
+            "couldn't bring the tab to the front ({e}) -- continuing, but a native click may \
+             land on the wrong tab"
+        ));
+    }
+    ctx.human_pause(900, 1500).await?;
+    Ok(())
+}
+
 // ----- step 7: ask Claude, then click its answers in ----------------------
 
 /// One criterion's judgment, as Claude is instructed to write it to the
@@ -204,11 +223,7 @@ pub async fn apply_answers(
 ) -> Result<(usize, Vec<String>)> {
     // The clicks drive the real OS cursor, so the task page has to actually
     // be the visible tab -- a native click lands on whatever is on screen.
-    if let Err(e) = ctx.browser.bring_to_front().await {
-        ctx.warn(format!(
-            "couldn't bring the task tab to the front ({e}) -- continuing anyway"
-        ));
-    }
+    focus_and_settle(ctx).await?;
     let mut applied = 0usize;
     let mut missed: Vec<String> = Vec::new();
     // Long-break pacing: selections left before the next ~2-minute break.
@@ -554,11 +569,7 @@ pub async fn skip_and_restart(
 /// ever appeared, or repeated clicks visibly changed nothing.
 async fn click_skip(ctx: &mut WorkflowCtx) -> Result<bool> {
     // The clicks drive the real OS cursor -- the tab must be visible.
-    if let Err(e) = ctx.browser.bring_to_front().await {
-        ctx.warn(format!(
-            "couldn't bring the task tab to the front ({e}) -- continuing anyway"
-        ));
-    }
+    focus_and_settle(ctx).await?;
     // The SPA may still be rendering; poll briefly for the button.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
