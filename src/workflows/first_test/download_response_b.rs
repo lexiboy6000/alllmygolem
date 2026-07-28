@@ -14,7 +14,7 @@ impl Workflow for DownloadResponseB {
     }
 
     fn description(&self) -> &'static str {
-        "Downloads and unzips Response B's deliverable files into task1/responseB."
+        "Downloads Response B's deliverables (zip, or the newer per-file listing plus its model-response text) into task1/responseB."
     }
 
     fn dependencies(&self) -> Vec<&'static str> {
@@ -41,7 +41,8 @@ impl Workflow for DownloadResponseB {
 }
 
 /// The download itself, separated from `run` so every failure -- iframe not
-/// found, curl error, bad zip -- funnels into the skip-and-restart recovery.
+/// found, curl error, bad zip, unusable file listing -- funnels into the
+/// skip-and-restart recovery.
 async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
     let dir = util::current_task_dir(ctx)?.join("responseB");
 
@@ -49,8 +50,8 @@ async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
     std::fs::create_dir_all(&dir)
         .map_err(|e| GolemError::Io(format!("mkdir {}: {e}", dir.display())))?;
 
-    ctx.step("find + download Response B zip").await?;
-    let zip_url = util::wait_for_response_zip_url(ctx, "Response B", Duration::from_secs(15))
+    ctx.step("find Response B's iframe").await?;
+    let src = util::wait_for_response_iframe_src(ctx, "Response B", Duration::from_secs(15))
         .await?
         .ok_or_else(|| {
             ctx.halt(
@@ -59,12 +60,7 @@ async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
                  visible.",
             )
         })?;
-    ctx.output(format!("response B zip: {zip_url}"));
-    let zip_path = util::download_into(ctx, &zip_url, &dir, "all_files.zip").await?;
 
-    ctx.step("unzip Response B").await?;
-    util::unzip_and_cleanup(ctx, &zip_path, &dir).await?;
-    ctx.output(format!("unzipped Response B into {}", dir.display()));
-
-    Ok(())
+    ctx.step("download Response B").await?;
+    util::download_response_into(ctx, "Response B", &src, &dir).await
 }

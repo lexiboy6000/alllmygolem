@@ -661,7 +661,10 @@ laid out in the current directory:\n\
 - task_data/evaluation_criteria/questions -- the numbered evaluation criteria, one per line \
 (\"1. ...\", \"2. ...\", etc.)\n\
 - responseA/ -- Response A's submitted files (read every file, especially the HTML deliverable)\n\
-- responseB/ -- Response B's submitted files (read every file, especially the HTML deliverable)\n\n\
+- responseB/ -- Response B's submitted files (read every file, especially the HTML deliverable)\n\
+- responseA/model_response.txt and responseB/model_response.txt -- when present, the chat text \
+that response's model wrote alongside its files; it is PART OF that response (not a task input \
+or a deliverable file), so judge it as the response's accompanying message\n\n\
 For EVERY criterion listed in task_data/evaluation_criteria/questions, judge Response A and \
 Response B independently: does that response satisfy the criterion? Use \"Good\" if it does, \
 \"Bad\" if it does not or only partially does.\n\n\
@@ -1202,12 +1205,7 @@ pub async fn download_file_browser_inputs(
     page_url: &str,
     dest_dir: &std::path::Path,
 ) -> Result<usize> {
-    let index_path = download_into(ctx, page_url, dest_dir, ".task_inputs_index.html").await?;
-    let html = std::fs::read_to_string(&index_path)
-        .map_err(|e| GolemError::Io(format!("read {}: {e}", index_path.display())))?;
-    // The listing itself is navigation, not task content -- don't leave it in
-    // task_data/ for the evaluation pass to read as if it were an input file.
-    let _ = std::fs::remove_file(&index_path);
+    let html = fetch_page_html(ctx, page_url, dest_dir, ".task_inputs_index.html").await?;
 
     let origin = url_origin(page_url).ok_or_else(|| {
         GolemError::Other(format!("couldn't parse the file-browser URL: {page_url}"))
@@ -1218,19 +1216,60 @@ pub async fn download_file_browser_inputs(
     // filtering to same-host links anyway, and derive each file's path inside
     // task_data/ from its URL path -- that reproduces the folder tree without
     // parsing the <details> nesting.
+    let files = collect_same_host_files(ctx, &origin, page_url, extract_anchor_hrefs(&html));
+    if files.is_empty() {
+        return Err(GolemError::Other(format!(
+            "the file-browser page at {page_url} listed no downloadable files -- its layout \
+             may have changed"
+        )));
+    }
+
+    ctx.output(format!("the file browser lists {} file(s)", files.len()));
+    download_url_list(ctx, &files, dest_dir).await?;
+    Ok(files.len())
+}
+
+/// Fetch a page's HTML with the same bare-curl mechanism as [`download_into`]
+/// (these hosts 404 on foreign cookies), via a temp file in `work_dir` that is
+/// removed after reading -- NOT via stdout, which `ctx.run` would stream line
+/// by line into the log. The temp file also never stays behind to be read by
+/// the evaluation pass as if it were task/response content.
+async fn fetch_page_html(
+    ctx: &WorkflowCtx,
+    url: &str,
+    work_dir: &std::path::Path,
+    tmp_name: &str,
+) -> Result<String> {
+    let path = download_into(ctx, url, work_dir, tmp_name).await?;
+    let html = std::fs::read_to_string(&path)
+        .map_err(|e| GolemError::Io(format!("read {}: {e}", path.display())))?;
+    let _ = std::fs::remove_file(&path);
+    Ok(html)
+}
+
+/// Resolve `hrefs` against `page_url`, keep only files on `origin`'s own
+/// host, and pair each with its percent-decoded path relative to the host
+/// root (`docs/Q3 report.pdf`). Deduplicates, and warns (rather than fails)
+/// on individual links whose paths can't be used safely on disk.
+fn collect_same_host_files(
+    ctx: &WorkflowCtx,
+    origin: &str,
+    page_url: &str,
+    hrefs: Vec<String>,
+) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut files: Vec<(String, String)> = Vec::new();
-    for href in extract_anchor_hrefs(&html) {
-        let Some(url) = resolve_href(&origin, page_url, &href) else {
+    for href in hrefs {
+        let Some(url) = resolve_href(origin, page_url, &href) else {
             continue;
         };
-        let Some(rel) = url.strip_prefix(&origin) else {
+        let Some(rel) = url.strip_prefix(origin) else {
             continue;
         };
         let rel = rel.trim_start_matches('/');
         let rel = rel.split(['?', '#']).next().unwrap_or(rel);
         if rel.is_empty() {
-            // the listing page itself
+            // the page itself
             continue;
         }
         let mut parts: Vec<String> = Vec::new();
@@ -1251,15 +1290,17 @@ pub async fn download_file_browser_inputs(
             files.push((url, parts.join("/")));
         }
     }
-    if files.is_empty() {
-        return Err(GolemError::Other(format!(
-            "the file-browser page at {page_url} listed no downloadable files -- its layout \
-             may have changed"
-        )));
-    }
+    files
+}
 
-    ctx.output(format!("the file browser lists {} file(s)", files.len()));
-    for (url, rel) in &files {
+/// Download every `(url, relative-path)` pair into `dest_dir`, recreating the
+/// relative paths' directory structure.
+async fn download_url_list(
+    ctx: &WorkflowCtx,
+    files: &[(String, String)],
+    dest_dir: &std::path::Path,
+) -> Result<()> {
+    for (url, rel) in files {
         ctx.guard().await?;
         let full = dest_dir.join(rel);
         let sub_dir = full
@@ -1274,32 +1315,259 @@ pub async fn download_file_browser_inputs(
         download_into(ctx, url, &sub_dir, &name).await?;
         ctx.output(format!("downloaded {rel}"));
     }
-    Ok(files.len())
+    Ok(())
 }
 
-/// Pull the href out of every `<a ...>` tag in `html` (double- or
-/// single-quoted), HTML-entity-decoded. Tolerant by construction: a chunk
-/// without a usable href is skipped, never an error.
+/// Download the named response ("Response A" / "Response B") into `dest_dir`,
+/// handling both response layouts. The response's own page (the iframe `src`)
+/// is peeked at first to learn which one this is:
+///
+/// - **Delivered-files listing** (newer): the page shows a "💬 Model
+///   response" text block plus a "📎 Delivered files" list where every file
+///   has an `open raw ↗` link (`<a class=raw href>`) straight to the file on
+///   the same host. There is NO zip on this layout (`/all_files.zip` 404s,
+///   confirmed live) and its "copy link" button doesn't work -- so each raw
+///   link is downloaded directly, and the model-response text is saved as
+///   `model_response.txt` alongside the files.
+/// - **Anything else** (older): the deliverable itself renders in the iframe
+///   and the archive lives at `<origin>/all_files.zip` -- download + unzip,
+///   exactly as before. A failed peek also lands here (the zip attempt is
+///   the proven path, and its failure funnels into skip-and-restart).
+pub async fn download_response_into(
+    ctx: &mut WorkflowCtx,
+    label: &str,
+    iframe_src: &str,
+    dest_dir: &std::path::Path,
+) -> Result<()> {
+    let origin = url_origin(iframe_src).ok_or_else(|| {
+        GolemError::Other(format!("{label}'s iframe src isn't a usable URL: {iframe_src}"))
+    })?;
+
+    let listing = match fetch_page_html(ctx, iframe_src, dest_dir, ".response_page.html").await {
+        Ok(html) if response_page_is_file_listing(&html) => Some(html),
+        Ok(_) => None,
+        Err(e) => {
+            ctx.warn(format!(
+                "couldn't peek at {label}'s page ({e}) -- assuming the zip layout"
+            ));
+            None
+        }
+    };
+
+    let Some(html) = listing else {
+        let zip_url = format!("{origin}/all_files.zip");
+        ctx.output(format!("{label} zip: {zip_url}"));
+        let zip_path = download_into(ctx, &zip_url, dest_dir, "all_files.zip").await?;
+        unzip_and_cleanup(ctx, &zip_path, dest_dir).await?;
+        ctx.output(format!("unzipped {label} into {}", dest_dir.display()));
+        return Ok(());
+    };
+
+    let files = collect_same_host_files(ctx, &origin, iframe_src, extract_raw_link_hrefs(&html));
+    if files.is_empty() {
+        return Err(GolemError::Other(format!(
+            "{label}'s page looks like a delivered-files listing but no usable file links \
+             were found -- its layout may have changed"
+        )));
+    }
+    ctx.output(format!(
+        "{label} is a delivered-files listing with {} file(s) (no zip on this layout)",
+        files.len()
+    ));
+    download_url_list(ctx, &files, dest_dir).await?;
+
+    // The model's chat text is part of the response -- the evaluation must
+    // see it too, not just the files.
+    match extract_model_response_text(&html) {
+        Some(text) => {
+            let name = if files.iter().any(|(_, rel)| rel == "model_response.txt") {
+                // a delivered file claimed the name; don't clobber it
+                "model_response_page.txt"
+            } else {
+                "model_response.txt"
+            };
+            let path = dest_dir.join(name);
+            std::fs::write(&path, text)
+                .map_err(|e| GolemError::Io(format!("write {}: {e}", path.display())))?;
+            ctx.output(format!("saved the model-response text -> {}", path.display()));
+        }
+        None => ctx.warn(format!(
+            "{label}'s page had no readable model-response text -- saving only the files"
+        )),
+    }
+    Ok(())
+}
+
+/// Whether a response page is the delivered-files listing rather than a
+/// rendered deliverable: it must have at least one `class=raw` file link AND
+/// one of the listing's own headings. A deliverable HTML that happens to use
+/// a `raw` class on some anchor won't also carry those headings.
+fn response_page_is_file_listing(html: &str) -> bool {
+    !extract_raw_link_hrefs(html).is_empty()
+        && (html.contains("Model response") || html.contains("Delivered files"))
+}
+
+/// The delivered-files listing's "💬 Model response" block, flattened to
+/// plain text (tags stripped, entities decoded), or `None` when the block is
+/// missing or empty.
+fn extract_model_response_text(html: &str) -> Option<String> {
+    // The live server emits unquoted attributes (`class=resp`); a
+    // DevTools-saved copy normalizes to double quotes. Match all three forms.
+    let start = [
+        "<details class=\"resp\"",
+        "<details class='resp'",
+        "<details class=resp",
+    ]
+    .iter()
+    .find_map(|p| html.find(p))?;
+    let rest = html.get(start..)?;
+    let block = rest.split("</details>").next().unwrap_or(rest);
+    // drop the "💬 Model response" <summary> header itself
+    let body = block
+        .split_once("</summary>")
+        .map(|(_, b)| b)
+        .unwrap_or(block);
+    let text = strip_html_to_text(body);
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| format!("{trimmed}\n"))
+}
+
+/// Flatten an HTML fragment to readable plain text: list items become
+/// "- " bullets, block-level boundaries become newlines, table cells become
+/// tab-separated, every other tag is dropped, entities are decoded, and runs
+/// of blank lines are collapsed.
+fn strip_html_to_text(fragment: &str) -> String {
+    let mut out = String::with_capacity(fragment.len());
+    let mut rest = fragment;
+    // after a "- " bullet is opened, swallow the source's own leading
+    // whitespace so items don't render as "-  item"
+    let mut swallow_ws = false;
+    while let Some(i) = rest.find('<') {
+        let (text, after) = rest.split_at(i);
+        if swallow_ws {
+            let trimmed = text.trim_start();
+            if !trimmed.is_empty() {
+                swallow_ws = false;
+                out.push_str(trimmed);
+            }
+        } else {
+            out.push_str(text);
+        }
+        let Some(j) = after.find('>') else {
+            rest = "";
+            break;
+        };
+        let (tag, next) = after.split_at(j + 1);
+        let t = tag.to_ascii_lowercase();
+        if t.starts_with("<li") {
+            out.push_str("\n- ");
+            swallow_ws = true;
+        } else if t.starts_with("</td") || t.starts_with("</th") {
+            out.push('\t');
+        } else if t.starts_with("<br")
+            || t.starts_with("<p")
+            || t.starts_with("</p")
+            || t.starts_with("<pre")
+            || t.starts_with("</pre")
+            || t.starts_with("<tr")
+            || t.starts_with("</tr")
+            || t.starts_with("</li")
+            || t.starts_with("</ul")
+            || t.starts_with("</ol")
+            || t.starts_with("</div")
+            || t.starts_with("</table")
+            || t.starts_with("</h")
+        {
+            out.push('\n');
+        }
+        rest = next;
+    }
+    out.push_str(rest);
+    let unescaped = html_unescape(&out);
+    let mut collapsed = String::with_capacity(unescaped.len());
+    let mut newlines = 0u32;
+    for ch in unescaped.chars() {
+        if ch == '\n' {
+            newlines += 1;
+            if newlines > 2 {
+                continue;
+            }
+        } else {
+            newlines = 0;
+        }
+        collapsed.push(ch);
+    }
+    collapsed
+}
+
+/// Pull the href out of every `<a ...>` tag in `html`, HTML-entity-decoded.
+/// Tolerant by construction: a chunk without a usable href is skipped, never
+/// an error.
 fn extract_anchor_hrefs(html: &str) -> Vec<String> {
     let mut out = Vec::new();
     for chunk in html.split("<a ").skip(1) {
         let Some(tag) = chunk.split('>').next() else {
             continue;
         };
-        let raw = tag
-            .split_once("href=\"")
-            .map(|(_, r)| r.split('"').next().unwrap_or(""))
-            .or_else(|| {
-                tag.split_once("href='")
-                    .map(|(_, r)| r.split('\'').next().unwrap_or(""))
-            });
-        if let Some(raw) = raw
-            && !raw.is_empty()
+        if let Some(href) = attr_value(tag, "href")
+            && !href.is_empty()
         {
-            out.push(html_unescape(raw));
+            out.push(href);
         }
     }
     out
+}
+
+/// The hrefs of the delivered-files listing's `open raw ↗` links only --
+/// anchors carrying the `raw` class. The model-response text can contain
+/// ordinary links of its own, so plain [`extract_anchor_hrefs`] would
+/// over-collect on this page.
+fn extract_raw_link_hrefs(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for chunk in html.split("<a ").skip(1) {
+        let Some(tag) = chunk.split('>').next() else {
+            continue;
+        };
+        let is_raw = attr_value(tag, "class")
+            .is_some_and(|c| c.split_whitespace().any(|w| w == "raw"));
+        if !is_raw {
+            continue;
+        }
+        if let Some(href) = attr_value(tag, "href")
+            && !href.is_empty()
+        {
+            out.push(href);
+        }
+    }
+    out
+}
+
+/// A named attribute's value from inside one tag's text, entity-decoded.
+/// Handles all three quoting forms these pages emit: the live server writes
+/// unquoted (`class=raw`) and single-quoted (`href='...'`) attributes, while
+/// a DevTools-saved copy normalizes everything to double quotes.
+fn attr_value(tag: &str, name: &str) -> Option<String> {
+    let pat = format!("{name}=");
+    let mut search = tag;
+    loop {
+        let (before, rest) = search.split_once(&pat)?;
+        // require a word boundary so e.g. `data-href=` never matches `href=`
+        if before.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
+            search = rest;
+            continue;
+        }
+        let value = if let Some(r) = rest.strip_prefix('"') {
+            r.split('"').next().unwrap_or("")
+        } else if let Some(r) = rest.strip_prefix('\'') {
+            r.split('\'').next().unwrap_or("")
+        } else {
+            // an unquoted value runs to the next whitespace (a '>' can't
+            // appear -- `tag` is already truncated at the tag's closing '>');
+            // '/' must NOT terminate it, unquoted URLs are full of them
+            rest.split([' ', '\t', '\n', '\r', '>']).next().unwrap_or("")
+        };
+        return Some(html_unescape(value));
+    }
 }
 
 /// The minimal entity set attribute values on the listing page can contain.
@@ -1463,23 +1731,23 @@ pub async fn task_data_text(ctx: &WorkflowCtx) -> Result<String> {
     Ok(v.as_str().unwrap_or_default().to_string())
 }
 
-/// Derives `<origin-of-the-named-response's-iframe>/all_files.zip` for
-/// `label` ("Response A" or "Response B").
+/// The full `src` URL of the named response's iframe ("Response A" /
+/// "Response B") -- the response's own page on its per-response
+/// `*.multimodal-agentic-generation-preview.mangovibe.net` host. Everything a
+/// response exposes (the copy-link buttons, the all_files.zip, the newer
+/// delivered-files listing) lives on that host, and
+/// [`download_response_into`] decides from the page itself which layout it is.
 ///
-/// Why not click the "Copy link" button directly? It's rendered *inside* that
-/// response's own `<iframe>` document, which is a different origin than the
-/// multimango.com top page (confirmed: the copied URL lives on
-/// `...multimodal-agentic-generation-preview.mangovibe.net`). A parent page's
-/// JS can't read into a cross-origin iframe's DOM -- that's the browser's
-/// same-origin policy, not a Golem limitation. But an `<iframe>` element's
+/// Why not click the "Copy link" / "copy link" buttons directly? They're
+/// rendered *inside* that response's own `<iframe>` document, which is a
+/// different origin than the multimango.com top page. A parent page's JS
+/// can't read into a cross-origin iframe's DOM -- that's the browser's
+/// same-origin policy, not a Golem limitation (and on the delivered-files
+/// layout the copy button doesn't even work). But an `<iframe>` element's
 /// `src` attribute is always readable from the parent (only its *contents*
-/// are protected), and it's served from the exact same host as the zip. So we
-/// read `iframe.src`, take its origin, and append `/all_files.zip` ourselves.
-///
-/// This is a pattern-based guess. If `ctx.download` on the result 404s, the
-/// zip isn't at that exact path for that response and this needs adjusting.
-pub async fn response_zip_url(ctx: &WorkflowCtx, label: &str) -> Result<Option<String>> {
-    let js = FIND_RESPONSE_ZIP_URL_JS.replace("__LABEL__", &js_str(label));
+/// are protected), so the URL is taken from there.
+pub async fn response_iframe_src(ctx: &WorkflowCtx, label: &str) -> Result<Option<String>> {
+    let js = FIND_RESPONSE_IFRAME_SRC_JS.replace("__LABEL__", &js_str(label));
     let v = ctx.eval(&js).await?;
     Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
 }
@@ -1514,8 +1782,9 @@ pub async fn wait_for_task_data_download(
     }
 }
 
-/// Same idea as [`wait_for_task_data_zip_url`], for a response's iframe.
-pub async fn wait_for_response_zip_url(
+/// Same idea as [`wait_for_task_data_download`]'s polling, for a response's
+/// iframe src.
+pub async fn wait_for_response_iframe_src(
     ctx: &WorkflowCtx,
     label: &str,
     timeout: Duration,
@@ -1523,7 +1792,7 @@ pub async fn wait_for_response_zip_url(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         ctx.guard().await?;
-        if let Some(url) = response_zip_url(ctx, label).await? {
+        if let Some(url) = response_iframe_src(ctx, label).await? {
             return Ok(Some(url));
         }
         if tokio::time::Instant::now() >= deadline {
@@ -1746,7 +2015,7 @@ const TASK_DATA_TEXT_JS: &str = r#"(function(){
   return parts.join('\n');
 })()"#;
 
-const FIND_RESPONSE_ZIP_URL_JS: &str = r#"(function(){
+const FIND_RESPONSE_IFRAME_SRC_JS: &str = r#"(function(){
   var LABEL = __LABEL__;
   function findIframe() {
     var iframes = document.querySelectorAll('iframe');
@@ -1771,7 +2040,7 @@ const FIND_RESPONSE_ZIP_URL_JS: &str = r#"(function(){
   try {
     var u = new URL(src, location.href);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
-    return u.origin + '/all_files.zip';
+    return u.href;
   } catch (e) {
     return null;
   }
@@ -1811,6 +2080,58 @@ mod tests {
                 format!("{ORIGIN}/docs/Q3%20report&final.pdf"),
                 format!("{ORIGIN}/notes.txt"),
             ]
+        );
+    }
+
+    /// The delivered-files response layout, with the raw-link markup copied
+    /// verbatim from the LIVE server (unquoted `class=raw`, single-quoted
+    /// href) plus a DevTools-normalized double-quoted variant, and an
+    /// ordinary link inside the model-response text that must NOT be
+    /// collected as a delivered file.
+    #[test]
+    fn delivered_files_listing_parses() {
+        let host = "https://bfdb75b0-362a-5edc-81da-dc7d481b999a.multimodal-agentic-generation-preview.mangovibe.net";
+        let html = format!(
+            r#"<body><div class="tip">Click a header</div><details class=resp open><summary>💬 Model response</summary><div class="frag"><p>Files generated, see <a href="https://example.com/doc">docs</a>:</p><ul><li> <code>Invoice_Paid.pdf</code> — updated invoice</li></ul></div></details><div class="arts"><h2>📎 Delivered files (2)</h2><details><summary>📄 Invoice_Paid.pdf<a class=raw href='{host}/Invoice_Paid.pdf' target=_blank rel=noopener onclick='event.stopPropagation()'>open raw ↗</a><button class="cp">copy link</button></summary></details><details><summary>📄 Invoice_Template2.pdf<a class="raw" href="{host}/Invoice_Template2.pdf" target="_blank" rel="noopener">open raw ↗</a></summary></details></div></body>"#
+        );
+        assert!(response_page_is_file_listing(&html));
+        assert_eq!(
+            extract_raw_link_hrefs(&html),
+            vec![
+                format!("{host}/Invoice_Paid.pdf"),
+                format!("{host}/Invoice_Template2.pdf"),
+            ]
+        );
+        let text = extract_model_response_text(&html).unwrap_or_default();
+        assert!(text.contains("Files generated"));
+        assert!(text.contains("- Invoice_Paid.pdf — updated invoice"));
+        assert!(!text.contains('<'), "tags must be stripped: {text:?}");
+        assert!(!text.contains("Model response"), "summary header must be dropped");
+
+        // an ordinary deliverable HTML page is NOT mistaken for the listing
+        let deliverable = r#"<html><body><h1>Invoice</h1><a href="app.js">app</a></body></html>"#;
+        assert!(!response_page_is_file_listing(deliverable));
+    }
+
+    #[test]
+    fn attr_value_quoting_forms() {
+        assert_eq!(
+            attr_value("class=raw href='https://h/a b.pdf' rel=noopener", "href"),
+            Some("https://h/a b.pdf".to_string())
+        );
+        assert_eq!(
+            attr_value(r#"class="raw" href="https://h/x?a=1&amp;b=2""#, "href"),
+            Some("https://h/x?a=1&b=2".to_string())
+        );
+        assert_eq!(
+            attr_value("href=https://h/plain.pdf target=_blank", "href"),
+            Some("https://h/plain.pdf".to_string())
+        );
+        // word boundary: data-href= must not satisfy href=
+        assert_eq!(attr_value("data-href=nope", "href"), None);
+        assert_eq!(
+            attr_value("data-href=nope href=yes", "href"),
+            Some("yes".to_string())
         );
     }
 
