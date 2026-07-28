@@ -159,6 +159,20 @@ fn main() -> eframe::Result<()> {
         })
         .ok();
 
+    // Attach to the browser without waiting for someone to press Connect.
+    // Turned on by `--connect` or GOLEM_AUTO_CONNECT=1, so a Golem that starts
+    // on a remote desktop is usable the moment its window appears instead of
+    // sitting there disconnected. The channel is unbounded, so this queues
+    // until the supervisor is ready to read it.
+    if std::env::args().any(|a| a == "--connect")
+        || std::env::var("GOLEM_AUTO_CONNECT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    {
+        tracing::info!("auto-connect requested; attaching to the browser at startup");
+        let _ = cmd_tx.send(crate::messages::UiCommand::Connect);
+    }
+
     // Run the GUI on the main thread.
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
