@@ -143,14 +143,68 @@ pub async fn ask_claude_for_answers(ctx: &WorkflowCtx, task_dir: &std::path::Pat
         args.push(effort.as_str());
     }
     let timeout = Duration::from_secs(ctx.settings.claude_timeout_secs.max(60));
-    let out = ctx.run_claude(&claude, &args, Some(task_dir), Some(timeout)).await?;
-    if !out.success() {
-        return Err(GolemError::Other(format!(
-            "claude exited with an error: {}",
-            out.combined().trim()
-        )));
+
+    // Retry, because the failure this guards against is transient and the cost
+    // of not retrying is enormous: an "API Error: Connection closed
+    // mid-response" ends the workflow, which ends the chain, which stops the
+    // whole unattended loop -- after the round already spent a ~1 GB download
+    // and a full judging pass on this task.
+    let answers_path = task_dir.join("claude_answers");
+    // Clear any file from an earlier attempt so a stale one can't be mistaken
+    // for this attempt's output.
+    let _ = std::fs::remove_file(&answers_path);
+
+    // Patient on purpose. Backoff runs 30s/60s/120s/240s, so a blip has ~7.5
+    // minutes to clear -- essentially free, since the round is going to sit on
+    // the 40-minute task timer afterwards regardless.
+    //
+    // Deliberately NOT skip-and-restart on final failure: skipping burns a real
+    // task on the platform, and the thing that makes all five attempts fail is
+    // a sustained outage, which would then burn task after task. Better to stop
+    // the loop and let a human notice.
+    const ATTEMPTS: u32 = 5;
+    let mut last_err = String::new();
+    for attempt in 1..=ATTEMPTS {
+        ctx.guard().await?;
+        match ctx.run_claude(&claude, &args, Some(task_dir), Some(timeout)).await {
+            // A user Stop is a stop, never a retry.
+            Err(GolemError::StoppedByUser) => return Err(GolemError::StoppedByUser),
+            Err(e) => last_err = e.to_string(),
+            Ok(out) => {
+                // The FILE is the success signal, not the exit status. Claude
+                // can drop its connection after having already written a
+                // complete claude_answers (exit non-zero, output fine), and can
+                // exit zero having written nothing usable.
+                if read_claude_answers(&answers_path).is_ok() {
+                    if attempt > 1 {
+                        ctx.output(format!("claude succeeded on attempt {attempt}"));
+                    }
+                    return Ok(());
+                }
+                last_err = if out.success() {
+                    "claude exited cleanly but wrote no usable claude_answers".to_string()
+                } else {
+                    out.combined().trim().to_string()
+                };
+            }
+        }
+        if attempt < ATTEMPTS {
+            let backoff = Duration::from_secs(30u64 << (attempt - 1));
+            ctx.warn(format!(
+                "claude attempt {attempt}/{ATTEMPTS} failed ({last_err}) -- retrying in {}s",
+                backoff.as_secs()
+            ));
+            let until = tokio::time::Instant::now() + backoff;
+            while tokio::time::Instant::now() < until {
+                ctx.guard().await?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            let _ = std::fs::remove_file(&answers_path);
+        }
     }
-    Ok(())
+    Err(GolemError::Other(format!(
+        "claude failed {ATTEMPTS} times running the evaluation; last error: {last_err}"
+    )))
 }
 
 /// Read + parse `claude_answers` written by `ask_claude_for_answers`.
