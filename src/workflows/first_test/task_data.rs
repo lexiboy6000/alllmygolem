@@ -70,7 +70,7 @@ impl Workflow for SaveTaskData {
                             util::TASK_DATA_ZIP_CLICK_JS,
                             &data_dir,
                             "all_files.zip",
-                            Duration::from_secs(30),
+                            Duration::from_secs(90),
                         )
                         .await
                         .map_err(|e| {
@@ -96,7 +96,7 @@ impl Workflow for SaveTaskData {
                     util::TASK_DATA_ZIP_CLICK_JS,
                     &data_dir,
                     "all_files.zip",
-                    Duration::from_secs(30),
+                    Duration::from_secs(90),
                 )
                 .await
                 .map_err(|e| {

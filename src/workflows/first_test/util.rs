@@ -917,7 +917,15 @@ pub async fn click_and_wait_for_download(
     }
 
     const MAX_CLICKS: usize = 3;
+    // `timeout` bounds only the wait for a download to START. Once Chrome is
+    // writing a .crdownload the transfer is judged by progress instead: a big
+    // ZIP on a slow link can take far longer than any fixed deadline, and
+    // failing it while bytes are still arriving is just wrong.
+    const STALL_LIMIT: Duration = Duration::from_secs(180);
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_partial_bytes: u64 = 0;
+    let mut last_progress_at = tokio::time::Instant::now();
+    let mut last_report_at = tokio::time::Instant::now();
     let mut clicks_done = 0usize;
     // First click fires immediately; each later one only after the previous
     // click has had a few seconds to produce a file.
@@ -927,10 +935,14 @@ pub async fn click_and_wait_for_download(
         let names = list_names(&downloads);
         let mut candidate: Option<std::path::PathBuf> = None;
         let mut in_progress = false;
+        let mut partial_bytes: u64 = 0;
         for name in names.difference(&before) {
             let name_str = name.to_string_lossy();
             if name_str.ends_with(".crdownload") || name_str.ends_with(".tmp") {
                 in_progress = true;
+                partial_bytes += std::fs::metadata(downloads.join(name))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 continue;
             }
             candidate = Some(downloads.join(name));
@@ -944,10 +956,33 @@ pub async fn click_and_wait_for_download(
                 break path;
             }
         }
-        if tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if in_progress {
+            // Bytes are arriving: keep waiting as long as the partial file
+            // keeps growing, and only give up once it has been flat for
+            // STALL_LIMIT. The start-up `deadline` no longer applies.
+            if partial_bytes > last_partial_bytes {
+                last_partial_bytes = partial_bytes;
+                last_progress_at = now;
+            }
+            if now.duration_since(last_report_at) >= Duration::from_secs(15) {
+                last_report_at = now;
+                ctx.output(format!(
+                    "downloading... {:.1} MB so far",
+                    partial_bytes as f64 / 1_048_576.0
+                ));
+            }
+            if now.duration_since(last_progress_at) >= STALL_LIMIT {
+                return Err(GolemError::Other(format!(
+                    "a download started but stalled at {:.1} MB -- no progress for {}s",
+                    partial_bytes as f64 / 1_048_576.0,
+                    STALL_LIMIT.as_secs()
+                )));
+            }
+        } else if now >= deadline {
             return Err(GolemError::Other(format!(
-                "clicked the download control {clicks_done} time(s) but no new file \
-                 appeared in {} within {}s",
+                "clicked the download control {clicks_done} time(s) but no download \
+                 started in {} within {}s",
                 downloads.display(),
                 timeout.as_secs()
             )));
@@ -1065,12 +1100,27 @@ pub async fn download_into(
     let dest_str = dest
         .to_str()
         .ok_or_else(|| GolemError::Io(format!("non-UTF8 path: {}", dest.display())))?;
+    // Judge the transfer by PROGRESS, not by elapsed time: a task ZIP can be
+    // tens of MB on a slow link and legitimately take many minutes, and the
+    // old flat 120s cap killed downloads that were streaming along fine.
+    // --speed-time/--speed-limit abort only once throughput sits under 1 KB/s
+    // for a solid minute, which is a genuine stall; the outer timeout is just
+    // a backstop far above any real download.
     let out = ctx
         .run(
             "curl",
-            &["-fsSL", "-o", dest_str, url],
+            &[
+                "-fsSL",
+                "--speed-limit",
+                "1024",
+                "--speed-time",
+                "60",
+                "-o",
+                dest_str,
+                url,
+            ],
             None,
-            Some(Duration::from_secs(120)),
+            Some(Duration::from_secs(1800)),
         )
         .await?;
     if !out.success() {
