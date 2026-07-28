@@ -82,6 +82,18 @@ pub struct Settings {
     /// xhigh/max. Empty = Claude Code's default.
     pub solve_effort: String,
 
+    // --- Task pipeline ---
+    /// Automatic mode for the task pipeline (workflows 1-8 of `first_test`) and
+    /// every subworkflow it pulls in: none of its human gates block. The "GOLEM
+    /// NEEDS YOU" review self-approves, the submit confirm self-answers, and the
+    /// "fix it on the page, then dismiss" repair prompts become warning lines.
+    /// Deliberately scoped to that pipeline -- the feather/complete/solve
+    /// families keep their own prompts regardless of this flag.
+    ///
+    /// With this on, evaluations are submitted to the live platform with no
+    /// human ever seeing them, so it defaults to off.
+    pub auto_mode: bool,
+
     // --- GUI ---
     /// Show the movable always-on-top overlay while a workflow runs. Disable if
     /// it interferes with focus/selection on your compositor (some Wayland setups).
@@ -116,6 +128,9 @@ impl Default for Settings {
             claude_timeout_secs: 900,
             solve_model: "opus".to_string(),
             solve_effort: "high".to_string(),
+            // Off by default: on, nobody reviews an evaluation before it is
+            // submitted for real.
+            auto_mode: false,
             // Opt-in: the overlay is a separate always-on-top window, which on
             // Wayland can steal focus and get flagged "not responding" by the
             // compositor while Golem is on another workspace (the main app is

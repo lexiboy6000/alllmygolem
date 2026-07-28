@@ -30,42 +30,45 @@ impl Workflow for DownloadResponseB {
     }
 
     async fn run(&self, ctx: &mut WorkflowCtx) -> Result<WorkflowOutcome> {
-        let dir = util::current_task_dir(ctx)?.join("responseB");
-
-        ctx.step("create responseB directory").await?;
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| GolemError::Io(format!("mkdir {}: {e}", dir.display())))?;
-
-        ctx.step("find + download Response B zip").await?;
-        let zip_url = util::wait_for_response_zip_url(ctx, "Response B", Duration::from_secs(15))
-            .await?
-            .ok_or_else(|| {
-                ctx.halt(
-                    "couldn't find Response B's iframe (or its src wasn't a usable http(s) URL) \
-                     after waiting 15s. Make sure you're on a loaded task page with Response B \
-                     visible.",
-                )
-            })?;
-        ctx.output(format!("response B zip: {zip_url}"));
-        // See the same spot in `download_response_a.rs`: a 4xx means the
-        // deliverable isn't there and the task is unwinnable, so skip it and
-        // restart; anything else is a transient failure worth surfacing.
-        let zip_path = match util::download_into(ctx, &zip_url, &dir, "all_files.zip").await {
-            Ok(path) => path,
+        match fetch(ctx).await {
+            Ok(()) => Ok(WorkflowOutcome::Completed),
+            // See the same spot in `download_response_a.rs`: a 4xx means the
+            // deliverable isn't there and the task is unwinnable, so skip it
+            // and restart; anything else is a transient failure worth
+            // surfacing rather than throwing a good task away.
             Err(e) if util::is_missing_file_error(&e) => {
-                return Err(util::skip_task_and_restart(
-                    ctx,
-                    "Response B's files aren't available on the site",
-                )
-                .await);
+                util::skip_and_restart(ctx, "Response B", e).await
             }
-            Err(e) => return Err(e),
-        };
-
-        ctx.step("unzip Response B").await?;
-        util::unzip_and_cleanup(ctx, &zip_path, &dir).await?;
-        ctx.output(format!("unzipped Response B into {}", dir.display()));
-
-        Ok(WorkflowOutcome::Completed)
+            Err(e) => Err(e),
+        }
     }
+}
+
+/// The download itself, separated from `run` so every failure -- iframe not
+/// found, curl error, bad zip -- funnels into the skip-and-restart recovery.
+async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
+    let dir = util::current_task_dir(ctx)?.join("responseB");
+
+    ctx.step("create responseB directory").await?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| GolemError::Io(format!("mkdir {}: {e}", dir.display())))?;
+
+    ctx.step("find + download Response B zip").await?;
+    let zip_url = util::wait_for_response_zip_url(ctx, "Response B", Duration::from_secs(15))
+        .await?
+        .ok_or_else(|| {
+            ctx.halt(
+                "couldn't find Response B's iframe (or its src wasn't a usable http(s) URL) \
+                 after waiting 15s. Make sure you're on a loaded task page with Response B \
+                 visible.",
+            )
+        })?;
+    ctx.output(format!("response B zip: {zip_url}"));
+    let zip_path = util::download_into(ctx, &zip_url, &dir, "all_files.zip").await?;
+
+    ctx.step("unzip Response B").await?;
+    util::unzip_and_cleanup(ctx, &zip_path, &dir).await?;
+    ctx.output(format!("unzipped Response B into {}", dir.display()));
+
+    Ok(())
 }

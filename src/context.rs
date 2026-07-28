@@ -181,8 +181,10 @@ impl Default for PromptBus {
 /// It matters because a Wayland client is never told where its own window sits
 /// on screen -- there is no protocol for it -- so `window.screenX`/`screenY`
 /// are a constant 0 and the real OS cursor cannot be aimed at a page element.
-/// enigo can't read the pointer position under Wayland either, so the native
-/// input path is unusable here regardless.
+/// enigo can't read the pointer position under Wayland either, so native moves
+/// fall back to [`WorkflowCtx::last_native_mouse`] for their start point, and
+/// the window position is obtained from the compositor instead -- see
+/// [`compositor_browser_window_pos`].
 fn is_wayland_session() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland"))
@@ -208,10 +210,18 @@ pub struct WorkflowCtx {
     /// It cannot become mappable later in a run, so cache it: without this,
     /// every native-cursor click re-probes and logs the same warning.
     pointer_unmappable: bool,
+    /// Last screen point we drove the REAL OS cursor to. Wayland has no
+    /// protocol for reading the cursor position, so this is the fallback
+    /// start point for native moves when `cursor_pos()` fails.
+    last_native_mouse: Option<Point>,
     step_index: usize,
     http: reqwest::Client,
     /// Sender back into the engine's command queue (see [`queue_chain`](Self::queue_chain)).
     commands: CommandTx,
+    /// The ordered target list of the chain this workflow is running in
+    /// (recorded by the chain runner via [`set_chain_targets`](Self::set_chain_targets)).
+    /// Lets a workflow re-queue its own whole run -- see [`chain_targets`](Self::chain_targets).
+    chain_targets: Vec<String>,
 }
 
 impl WorkflowCtx {
@@ -244,9 +254,11 @@ impl WorkflowCtx {
             inputs,
             last_mouse: Point::ZERO,
             pointer_unmappable: false,
+            last_native_mouse: None,
             step_index: 0,
             http,
             commands,
+            chain_targets: Vec::new(),
         })
     }
 
@@ -469,6 +481,29 @@ impl WorkflowCtx {
     pub fn store_snapshot(&self) -> BTreeMap<String, Value> {
         self.store.clone()
     }
+    /// A copy of every input this run was started with, for re-queueing the
+    /// chain with identical inputs (see [`chain_targets`](Self::chain_targets)).
+    pub fn inputs_snapshot(&self) -> BTreeMap<String, String> {
+        self.inputs.clone()
+    }
+    /// Record the chain's original target list (called by the chain runner
+    /// right after building this context).
+    pub fn set_chain_targets(&mut self, targets: Vec<String>) {
+        self.chain_targets = targets;
+    }
+    /// The ordered target list of the chain this workflow is part of.
+    /// Re-queueing it via [`queue_chain`](Self::queue_chain) restarts the
+    /// whole run from its first dependency (workflow 1, for the task
+    /// pipeline) -- the skip-and-restart recovery in the download workflows
+    /// uses exactly that. Falls back to just this workflow's own name if the
+    /// runner never recorded targets.
+    pub fn chain_targets(&self) -> Vec<String> {
+        if self.chain_targets.is_empty() {
+            vec![self.workflow.clone()]
+        } else {
+            self.chain_targets.clone()
+        }
+    }
     /// Restore store + step index when resuming from a checkpoint.
     pub fn restore(&mut self, state: &RunState) {
         self.store = state.store.clone();
@@ -682,47 +717,60 @@ impl WorkflowCtx {
     /// so callers fall back to the CDP click, which works purely in viewport
     /// coordinates and is unaffected.
     async fn viewport_screen_offset(&self) -> Result<(f64, f64)> {
-        // Check the session first: the frame height DOES measure non-zero on
-        // Wayland once the window is settled (observed: outerHeight-innerHeight
-        // = 87 for the tab strip + URL bar), so the geometry heuristic below
-        // can't be relied on to spot it. `screenX`/`screenY` are still a
-        // constant 0, so the mapping is still wrong -- just less obviously.
-        if is_wayland_session() {
-            return Err(GolemError::Other(
-                "this is a Wayland session, and a Wayland client is never told where its \
-                 own window sits (window.screenX/Y are always 0), so viewport coordinates \
-                 cannot be mapped to screen pixels"
-                    .into(),
-            ));
-        }
+        // NB: a Wayland session is NOT bailed out of here. A Wayland client is
+        // never told where its own window sits, so `screenX`/`screenY` read a
+        // constant 0 -- but rather than give up on native input entirely, we
+        // ask the compositor for the window position below (see
+        // `compositor_browser_window_pos`), which restores real cursor clicks
+        // on Hyprland/Sway. The `positioned` guard still catches the case where
+        // the window reports nothing AND the compositor can't be reached.
         let v = self
             .browser
             .eval(
                 "(function(){ var side = (window.outerWidth - window.innerWidth) / 2; \
                  var chrome = window.outerHeight - window.innerHeight; \
-                 return { sx: window.screenX + side, \
+                 return { wx: window.screenX, wy: window.screenY, \
+                          sx: window.screenX + side, \
                           sy: window.screenY + chrome - side, \
                           positioned: chrome > 0 || window.screenX !== 0 || window.screenY !== 0 }; })()",
             )
             .await?;
-        if v.get("positioned").and_then(Value::as_bool) == Some(false) {
-            return Err(GolemError::Other(
-                "the window reports neither a screen position nor a frame height \
-                 (screenX/Y are 0 and outerHeight == innerHeight) -- a Wayland compositor \
-                 never tells a page where its window is, so viewport coordinates cannot be \
-                 mapped to screen pixels"
-                    .into(),
-            ));
-        }
-        match (
+        let (sx, sy) = match (
             v.get("sx").and_then(Value::as_f64),
             v.get("sy").and_then(Value::as_f64),
         ) {
-            (Some(sx), Some(sy)) => Ok((sx, sy)),
-            _ => Err(GolemError::Other(
-                "couldn't read the window's screen position".into(),
-            )),
+            (Some(sx), Some(sy)) => (sx, sy),
+            _ => {
+                return Err(GolemError::Other(
+                    "couldn't read the window's screen position".into(),
+                ));
+            }
+        };
+        // A native-Wayland browser can't know its own screen position --
+        // `screenX/Y` report 0 -- so `(sx, sy)` is only the viewport's offset
+        // within the window. Add the compositor's idea of where the window is.
+        let screen_pos_unknown = v.get("wx").and_then(Value::as_f64) == Some(0.0)
+            && v.get("wy").and_then(Value::as_f64) == Some(0.0);
+        if screen_pos_unknown && is_wayland_session() {
+            if let Some((wx, wy)) = compositor_browser_window_pos().await {
+                return Ok((sx + wx, sy + wy));
+            }
         }
+        // The compositor couldn't be reached either. If the window reports
+        // neither a screen position nor a frame height, `(sx, sy)` is a
+        // plausible-looking (0, 0) that would aim the real cursor at raw screen
+        // coordinates and click in some other window entirely. Fail instead, so
+        // the caller falls back to CDP clicks (and caches `pointer_unmappable`).
+        if v.get("positioned").and_then(Value::as_bool) == Some(false) {
+            return Err(GolemError::Other(
+                "the window reports neither a screen position nor a frame height \
+                 (screenX/Y are 0 and outerHeight == innerHeight), and the compositor \
+                 could not be asked where the window is -- so viewport coordinates \
+                 cannot be mapped to screen pixels"
+                    .into(),
+            ));
+        }
+        Ok((sx, sy))
     }
 
     /// Like [`click_at`](Self::click_at), but moves the REAL OS cursor to the
@@ -784,9 +832,12 @@ impl WorkflowCtx {
     /// Humanized native-cursor move + click, all in absolute screen pixels,
     /// starting from wherever the real cursor currently is.
     async fn cursor_click_native(&mut self, target: Point) -> Result<()> {
-        let start = {
-            let (cx, cy) = self.input.cursor_pos().await?;
-            Point::new(cx as f64, cy as f64)
+        // Wayland can't report the cursor position; start from wherever we
+        // last drove it (or, on the very first click, skip the approach arc
+        // and jump straight to the target).
+        let start = match self.input.cursor_pos().await {
+            Ok((cx, cy)) => Point::new(cx as f64, cy as f64),
+            Err(_) => self.last_native_mouse.unwrap_or(target),
         };
         let cfg = self.cfg();
         let path = {
@@ -813,7 +864,9 @@ impl WorkflowCtx {
         self.guard().await?;
         self.input.mouse_press(MouseButton::Left).await?;
         tokio::time::sleep(hold).await;
-        self.input.mouse_release(MouseButton::Left).await
+        self.input.mouse_release(MouseButton::Left).await?;
+        self.last_native_mouse = Some(target);
+        Ok(())
     }
 
     /// Idly drift the REAL OS cursor through a few random nearby waypoints
@@ -828,15 +881,21 @@ impl WorkflowCtx {
         if !self.input.is_available() {
             return Ok(());
         }
-        let Ok((cx, cy)) = self.input.cursor_pos().await else {
-            return Ok(());
+        let start = match self.input.cursor_pos().await {
+            Ok((cx, cy)) => Point::new(cx as f64, cy as f64),
+            // Wayland: no way to read the cursor; wander from the last spot
+            // we drove it to, or skip quietly if we haven't moved it yet.
+            Err(_) => match self.last_native_mouse {
+                Some(p) => p,
+                None => return Ok(()),
+            },
         };
         let cfg = self.cfg();
         let hops = {
             let mut rng = rand::rng();
             rng.random_range(1..=3)
         };
-        let mut at = Point::new(cx as f64, cy as f64);
+        let mut at = start;
         for _ in 0..hops {
             let (target, pause) = {
                 let mut rng = rand::rng();
@@ -867,6 +926,7 @@ impl WorkflowCtx {
             at = target;
             tokio::time::sleep(pause).await;
         }
+        self.last_native_mouse = Some(at);
         Ok(())
     }
 
@@ -1394,6 +1454,35 @@ async fn sleep_opt(d: Option<Duration>) {
         Some(d) => tokio::time::sleep(d).await,
         None => std::future::pending::<()>().await,
     }
+}
+
+/// Where the Wayland compositor says the browser window is, in global screen
+/// pixels. Only Hyprland is supported (`hyprctl clients -j`); anywhere else
+/// this returns `None` and the caller keeps the browser-reported offset. When
+/// several browser windows exist, the most recently focused one wins (lowest
+/// `focusHistoryID`) -- native clicks land on the frontmost window anyway.
+async fn compositor_browser_window_pos() -> Option<(f64, f64)> {
+    let out = tokio::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let clients: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let win = clients
+        .as_array()?
+        .iter()
+        .filter(|c| {
+            c.get("mapped").and_then(Value::as_bool).unwrap_or(true)
+                && c.get("class")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.to_ascii_lowercase().contains("chrom"))
+        })
+        .min_by_key(|c| c.get("focusHistoryID").and_then(Value::as_i64).unwrap_or(i64::MAX))?;
+    let at = win.get("at")?.as_array()?;
+    Some((at.first()?.as_f64()?, at.get(1)?.as_f64()?))
 }
 
 /// Strip path separators and other awkward characters from a download filename.

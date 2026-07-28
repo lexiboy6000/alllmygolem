@@ -43,6 +43,7 @@ pub fn register_all(registry: &mut WorkflowRegistry) {
 
     //new!!
   // registry.register(Arc::new(first_test::SayHello));
+registry.register(Arc::new(first_test::OpenMultimango));
 registry.register(Arc::new(first_test::CreateTask1));
 registry.register(Arc::new(first_test::SaveTaskData));
 registry.register(Arc::new(first_test::CreateResponseADir));

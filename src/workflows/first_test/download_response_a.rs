@@ -32,41 +32,44 @@ impl Workflow for DownloadResponseA {
     }
 
     async fn run(&self, ctx: &mut WorkflowCtx) -> Result<WorkflowOutcome> {
-        let dir = util::current_task_dir(ctx)?.join("responseA");
-
-        ctx.step("find + download Response A zip").await?;
-        let zip_url = util::wait_for_response_zip_url(ctx, "Response A", Duration::from_secs(15))
-            .await?
-            .ok_or_else(|| {
-                ctx.halt(
-                    "couldn't find Response A's iframe (or its src wasn't a usable http(s) URL) \
-                     after waiting 15s. Make sure you're on a loaded task page with Response A \
-                     visible.",
-                )
-            })?;
-        ctx.output(format!("response A zip: {zip_url}"));
-        // A 4xx here means the site is serving a link to a deliverable it
-        // doesn't actually have, so the task can never be completed: skip it
-        // and start the pipeline over on the next one. Any other failure
-        // (timeout, DNS, dropped connection) says nothing about whether the
-        // file exists, so it surfaces normally rather than throwing the task
-        // away.
-        let zip_path = match util::download_into(ctx, &zip_url, &dir, "all_files.zip").await {
-            Ok(path) => path,
+        match fetch(ctx).await {
+            Ok(()) => Ok(WorkflowOutcome::Completed),
+            // A 4xx means the site is serving a link to a deliverable it
+            // doesn't actually have, so the task can never be completed: click
+            // the page's Skip button and restart the chain at workflow 1 on the
+            // next task (a user Stop passes through). Any other failure
+            // (timeout, DNS, dropped connection) says nothing about whether the
+            // file exists, so it surfaces normally rather than throwing a
+            // perfectly good task away.
             Err(e) if util::is_missing_file_error(&e) => {
-                return Err(util::skip_task_and_restart(
-                    ctx,
-                    "Response A's files aren't available on the site",
-                )
-                .await);
+                util::skip_and_restart(ctx, "Response A", e).await
             }
-            Err(e) => return Err(e),
-        };
-
-        ctx.step("unzip Response A").await?;
-        util::unzip_and_cleanup(ctx, &zip_path, &dir).await?;
-        ctx.output(format!("unzipped Response A into {}", dir.display()));
-
-        Ok(WorkflowOutcome::Completed)
+            Err(e) => Err(e),
+        }
     }
+}
+
+/// The download itself, separated from `run` so every failure -- iframe not
+/// found, curl error, bad zip -- funnels into the skip-and-restart recovery.
+async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
+    let dir = util::current_task_dir(ctx)?.join("responseA");
+
+    ctx.step("find + download Response A zip").await?;
+    let zip_url = util::wait_for_response_zip_url(ctx, "Response A", Duration::from_secs(15))
+        .await?
+        .ok_or_else(|| {
+            ctx.halt(
+                "couldn't find Response A's iframe (or its src wasn't a usable http(s) URL) \
+                 after waiting 15s. Make sure you're on a loaded task page with Response A \
+                 visible.",
+            )
+        })?;
+    ctx.output(format!("response A zip: {zip_url}"));
+    let zip_path = util::download_into(ctx, &zip_url, &dir, "all_files.zip").await?;
+
+    ctx.step("unzip Response A").await?;
+    util::unzip_and_cleanup(ctx, &zip_path, &dir).await?;
+    ctx.output(format!("unzipped Response A into {}", dir.display()));
+
+    Ok(())
 }

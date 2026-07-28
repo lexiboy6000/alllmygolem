@@ -37,6 +37,49 @@ pub fn jittered(ctx: &WorkflowCtx, x: f64, y: f64) -> (f64, f64) {
     (x + jx, y + jy)
 }
 
+// ----- automatic mode ----------------------------------------------------
+
+/// Whether the pipeline's human gates should self-answer instead of blocking.
+///
+/// Every consultation of `settings.auto_mode` lives in this module and its
+/// callers inside `first_test`, which is what scopes the flag to the task
+/// pipeline: workflows 1-8 and any subworkflow they pull in honour it, while
+/// the feather/complete/solve families keep their own prompts either way.
+pub fn auto_mode(ctx: &WorkflowCtx) -> bool {
+    ctx.settings.auto_mode
+}
+
+/// A [`WorkflowCtx::warn_user`] that never blocks in automatic mode.
+///
+/// These prompts all mean "Golem couldn't drive one control -- fix it on the
+/// page and dismiss this". Automatic mode has nobody to do that, so the
+/// message degrades to a warning line and the run continues to whatever check
+/// would have caught the failure anyway (the `on_new_task` test, the submit
+/// button's own enabled-check, and so on).
+pub async fn warn_user_unless_auto(ctx: &WorkflowCtx, msg: impl Into<String>) -> Result<()> {
+    let msg = msg.into();
+    if auto_mode(ctx) {
+        ctx.warn(format!("automatic mode, not waiting for a human: {msg}"));
+        return Ok(());
+    }
+    ctx.warn_user(msg).await
+}
+
+/// A [`WorkflowCtx::stop_and_warn`] that doesn't wait for an acknowledgement in
+/// automatic mode.
+///
+/// The chain halts either way -- the difference is only whether Golem sits on
+/// an undismissed dialog first. Unattended, that turns a clean stop into a
+/// wedge that holds the browser and the claimed task open, so automatic mode
+/// halts immediately instead.
+pub async fn halt_unless_auto(ctx: &WorkflowCtx, msg: impl Into<String>) -> GolemError {
+    let msg = msg.into();
+    if auto_mode(ctx) {
+        return ctx.halt(msg);
+    }
+    ctx.stop_and_warn(msg).await
+}
+
 // ----- step 7: ask Claude, then click its answers in ----------------------
 
 /// One criterion's judgment, as Claude is instructed to write it to the
@@ -61,8 +104,11 @@ pub struct OverallAnswer {
 }
 
 /// The full `claude_answers` file: per-criterion judgments plus the overall pick.
+/// `criteria` defaults to empty: some tasks have no Evaluation Criteria list
+/// at all and only ask for the overall pick.
 #[derive(Deserialize)]
 pub struct ClaudeAnswers {
+    #[serde(default)]
     pub criteria: Vec<CriterionAnswer>,
     pub overall: OverallAnswer,
 }
@@ -142,9 +188,19 @@ pub fn read_claude_answers(path: &std::path::Path) -> Result<ClaudeAnswers> {
 /// for both responses with human pacing, then make the Overall pick.
 /// Returns `(applied, missed-labels)`. Shared by workflow 7 and the review
 /// workflow's "reviewer asked for changes -> re-apply" path.
+///
+/// `paced` (workflow 7's first application only) additionally inserts a
+/// ~2-minute jittered break after every few selections -- see
+/// [`long_answer_break`]. Pacing is PURELY timing: every answer value still
+/// comes verbatim from `claude_answers`, each label keeps its own verdict
+/// through the click-order shuffle below, and every click re-finds and
+/// verifies its exact target (`click_until_selected`) exactly as before --
+/// so slower never means less accurate. The re-apply paths pass `false`:
+/// they run while a human reviewer waits, or right before submit.
 pub async fn apply_answers(
     ctx: &mut WorkflowCtx,
     answers: &ClaudeAnswers,
+    paced: bool,
 ) -> Result<(usize, Vec<String>)> {
     // The clicks drive the real OS cursor, so the task page has to actually
     // be the visible tab -- a native click lands on whatever is on screen.
@@ -155,6 +211,9 @@ pub async fn apply_answers(
     }
     let mut applied = 0usize;
     let mut missed: Vec<String> = Vec::new();
+    // Long-break pacing: selections left before the next ~2-minute break.
+    // u32::MAX effectively disables it on the unpaced paths.
+    let mut until_break: u32 = if paced { next_batch_size() } else { u32::MAX };
     for (i, a) in answers.criteria.iter().enumerate() {
         // scope the (non-Send) thread rng so it never crosses an await
         let (b_first, reread, hesitate, wander) = {
@@ -167,6 +226,12 @@ pub async fn apply_answers(
             )
         };
         if i > 0 {
+            // The long break fires at row boundaries only -- a person
+            // finishes the row they're reading before stepping away.
+            if until_break == 0 {
+                long_answer_break(ctx).await?;
+                until_break = next_batch_size();
+            }
             // a beat to "read" the next criterion before rating it
             ctx.human_pause(700, 2600).await?;
             if wander {
@@ -194,6 +259,7 @@ pub async fn apply_answers(
                 ctx.human_pause(1200, 3000).await?;
             }
             let ok = click_criterion_button(ctx, a.number, label, want).await?;
+            until_break = until_break.saturating_sub(1);
             if ok {
                 applied += 1;
                 // dwell between individual selections like a person deciding
@@ -202,6 +268,10 @@ pub async fn apply_answers(
                 missed.push(format!("#{} {} -> {}", a.number, label, want));
             }
         }
+    }
+    // the overall pick is the last "answer" -- it can land after a break too
+    if until_break == 0 {
+        long_answer_break(ctx).await?;
     }
     // weighing the overall verdict takes longer than a single row
     ctx.human_pause(1000, 3600).await?;
@@ -219,6 +289,42 @@ pub async fn apply_answers(
         missed.push(format!("overall quality -> {}", answers.overall.winner));
     }
     Ok((applied, missed))
+}
+
+/// How many individual selections to make before the next long break.
+fn next_batch_size() -> u32 {
+    let mut rng = rand::rng();
+    rng.random_range(3..=7)
+}
+
+/// A long "stepped away / reading carefully" break between batches of
+/// selections: near two minutes, jittered (85-155s target), slept in small
+/// humanized chunks -- each chunk is a `human_pause`, so Stop/Pause stay
+/// responsive throughout and the humanize layer adds its own jitter on top
+/// -- with occasional idle cursor drift. Timing only: it never touches which
+/// button gets clicked.
+async fn long_answer_break(ctx: &mut WorkflowCtx) -> Result<()> {
+    let target_ms: u64 = {
+        let mut rng = rand::rng();
+        rng.random_range(85_000..=155_000)
+    };
+    ctx.output(format!(
+        "pacing: taking a ~{}s break before the next batch of answers",
+        target_ms / 1000
+    ));
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(target_ms) {
+        ctx.human_pause(2500, 6000).await?;
+        // scope the (non-Send) thread rng so it never crosses an await
+        let wander = {
+            let mut rng = rand::rng();
+            rng.random_bool(0.12)
+        };
+        if wander {
+            ctx.wander_cursor().await?;
+        }
+    }
+    Ok(())
 }
 
 /// Re-check (without clicking) that every answer still shows as selected on
@@ -425,6 +531,131 @@ async fn wait_until_gone(
     }
 }
 
+/// Recovery shared by steps 4 and 5: when a response's zip can't be found,
+/// downloaded, or unzipped, the task can't be evaluated -- so instead of
+/// stranding the pipeline, click the task page's "Skip" button (bottom of the
+/// page, next to Submit) and queue a fresh run of this chain's original
+/// targets. Dependency resolution makes the queued chain start over at
+/// "1. Create task1 directory", which picks a NEW taskN folder for whatever
+/// task Skip loaded (the aborted task's partial folder is left on disk).
+///
+/// Always returns `Err`: the CURRENT chain must abort either way -- letting
+/// steps 6-8 keep running would rate the freshly-loaded task against the
+/// aborted task's files. The queued chain starts the moment this one
+/// finishes; Stop discards it, so stopping still ends everything. The
+/// `Result<WorkflowOutcome>` return type only exists so `run` can end with
+/// `util::skip_and_restart(...).await`.
+///
+/// If Skip can't be found or clicked, NOTHING is queued (restarting onto the
+/// same stuck task would loop forever) -- the human is warned instead.
+pub async fn skip_and_restart(
+    ctx: &mut WorkflowCtx,
+    label: &str,
+    cause: GolemError,
+) -> Result<WorkflowOutcome> {
+    // A user Stop is a stop, never a skip.
+    if matches!(cause, GolemError::StoppedByUser) {
+        return Err(cause);
+    }
+    ctx.warn(format!(
+        "{label} couldn't be retrieved ({cause}) -- skipping this task and restarting the \
+         chain at workflow 1"
+    ));
+    match click_skip(ctx).await {
+        Ok(true) => {
+            ctx.queue_chain(ctx.chain_targets(), ctx.inputs_snapshot());
+            Err(ctx.halt(format!(
+                "{label} couldn't be retrieved -- the task was skipped and the chain will \
+                 restart at workflow 1 on the next task (the aborted task's folder stays on \
+                 disk). Press Stop to cancel the queued restart."
+            )))
+        }
+        Ok(false) => Err(halt_unless_auto(ctx, format!(
+                "{label} couldn't be retrieved ({cause}), and the Skip button couldn't be \
+                 found/clicked either -- NOT restarting (that would loop on this same task). \
+                 Skip the task by hand, then re-run the pipeline."
+            ))
+            .await),
+        Err(GolemError::StoppedByUser) => Err(GolemError::StoppedByUser),
+        Err(e) => Err(halt_unless_auto(ctx, format!(
+                "{label} couldn't be retrieved ({cause}), and clicking Skip failed too ({e}) \
+                 -- NOT restarting. Skip the task by hand, then re-run the pipeline."
+            ))
+            .await),
+    }
+}
+
+/// Find and click the task page's "Skip" button. Success can't be judged by
+/// the button disappearing alone -- a successful skip loads the NEXT task,
+/// which renders its own Skip button in the same spot -- so the page's task
+/// identity (every iframe src + the task-description text, neither of which
+/// the once-a-second timer re-render touches) is snapshotted first, and a
+/// click counts once that identity changes or the button goes away. When the
+/// identity can't be read at all (badly broken page), exactly ONE cursor
+/// click is made blind rather than risking a second press landing on the
+/// NEXT task's Skip button. Returns `Ok(false)` if no enabled Skip button
+/// ever appeared, or repeated clicks visibly changed nothing.
+async fn click_skip(ctx: &mut WorkflowCtx) -> Result<bool> {
+    // The clicks drive the real OS cursor -- the tab must be visible.
+    if let Err(e) = ctx.browser.bring_to_front().await {
+        ctx.warn(format!(
+            "couldn't bring the task tab to the front ({e}) -- continuing anyway"
+        ));
+    }
+    // The SPA may still be rendering; poll briefly for the button.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        ctx.guard().await?;
+        let v = ctx.eval(FIND_SKIP_JS).await?;
+        if v.get("x").and_then(Value::as_f64).is_some() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        ctx.human_pause(250, 400).await?;
+    }
+    let before = task_identity(ctx).await?;
+
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let v = ctx.eval(FIND_SKIP_JS).await?;
+        let (x, y) = match (
+            v.get("x").and_then(Value::as_f64),
+            v.get("y").and_then(Value::as_f64),
+        ) {
+            (Some(x), Some(y)) => (x, y),
+            // Gone between attempts: the previous click landed and the page
+            // is mid-transition to the next task.
+            _ => return Ok(true),
+        };
+        if attempt > 1 {
+            ctx.output("Skip didn't register -- clicking again at fresh coordinates");
+        }
+        let (x, y) = jittered(ctx, x, y);
+        if attempt < ATTEMPTS {
+            ctx.click_at_cursor(x, y).await?;
+        } else {
+            ctx.click_at(x, y).await?;
+        }
+        // a skip takes a moment to go through / swap in the next task
+        ctx.human_pause(900, 1600).await?;
+        if before.is_empty() {
+            return Ok(true);
+        }
+        if task_identity(ctx).await? != before {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The page's task identity for [`click_skip`]'s change detection.
+async fn task_identity(ctx: &WorkflowCtx) -> Result<String> {
+    let v = ctx.eval(TASK_IDENTITY_JS).await?;
+    Ok(v.as_str().unwrap_or_default().to_string())
+}
+
 const ANSWER_CRITERIA_PROMPT: &str = "You are evaluating two AI-generated responses to a task, \
 laid out in the current directory:\n\
 - task_data/information -- the task description (what was asked for)\n\
@@ -444,8 +675,9 @@ directory (no file extension), in EXACTLY this shape:\n\
 \"one short sentence why\"}, ...], \"overall\": {\"winner\": \"Response A\", \"notes\": \"one \
 short sentence why\"}}\n\
 The \"criteria\" array must have one object per criterion, in the SAME order and using the SAME \
-number as in the questions file. \"overall.winner\" must be EXACTLY one of \"Response A\", \
-\"Response B\", or \"Tie\".\n\n\
+number as in the questions file. If the questions file is EMPTY or missing, this task has no \
+per-criterion ratings: write \"criteria\": [] and judge only the overall pick. \
+\"overall.winner\" must be EXACTLY one of \"Response A\", \"Response B\", or \"Tie\".\n\n\
 Output ONLY that file -- do not print the JSON to stdout, do not add commentary elsewhere. Be \
 strict and specific in your judgment.";
 
@@ -543,21 +775,40 @@ const FIND_SUBMIT_JS: &str = r#"(function(){
   return null;
 })()"#;
 
-/// The multimango page's "Skip" button (bottom of the task), used to abandon
-/// a task whose deliverables the site can't actually serve. Same anchor as
-/// `FIND_SUBMIT_JS`, which identifies Submit by sitting next to this one.
-const SKIP_TASK_JS: &str = r#"(function(){
+/// The task page's enabled "Skip" button (the same one `FIND_SUBMIT_JS`
+/// anchors on to find Submit), used to abandon a task whose deliverables the
+/// site can't actually serve. The LAST visible match wins: if clicking Skip
+/// pops a confirmation dialog with its own "Skip ..." button, that dialog
+/// renders after (on top of) the page's button, so the retry click lands on
+/// the confirmation instead of the covered original.
+const FIND_SKIP_JS: &str = r#"(function(){
   var btns = document.querySelectorAll('button');
+  var best = null;
   for (var i = 0; i < btns.length; i++) {
     var b = btns[i];
     if ((b.textContent || '').trim().indexOf('Skip') === -1) continue;
     if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
-    try { b.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
     var r = b.getBoundingClientRect();
     if (r.width < 1 || r.height < 1) continue;
-    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    best = b;
   }
-  return null;
+  if (!best) return null;
+  try { best.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+  var r = best.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+})()"#;
+
+/// A fingerprint of WHICH task the page is showing: every iframe's src (the
+/// response iframes live on per-response hosts) plus the task-description
+/// prose blocks' text. Both swap wholesale when Skip loads the next task,
+/// and neither is touched by the SPA's once-a-second timer re-render.
+const TASK_IDENTITY_JS: &str = r#"(function(){
+  var parts = [];
+  var ifr = document.querySelectorAll('iframe');
+  for (var i = 0; i < ifr.length; i++) parts.push(ifr[i].getAttribute('src') || '');
+  var prose = document.querySelectorAll('div.prose.prose-sm.max-w-none');
+  for (var j = 0; j < prose.length; j++) parts.push((prose[j].innerText || '').slice(0, 500));
+  return parts.join('|');
 })()"#;
 
 /// Whether `e` is the site saying the file simply is not there -- an HTTP 4xx
@@ -657,7 +908,7 @@ async fn wait_for_skip(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         ctx.guard().await?;
-        let v = ctx.eval(SKIP_TASK_JS).await?;
+        let v = ctx.eval(FIND_SKIP_JS).await?;
         if let (Some(x), Some(y)) = (
             v.get("x").and_then(Value::as_f64),
             v.get("y").and_then(Value::as_f64),
@@ -1219,22 +1470,68 @@ pub async fn evaluation_criteria_text(ctx: &WorkflowCtx) -> Result<Option<String
     Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
 }
 
-/// Poll `evaluation_criteria_text` until it finds rows, or `timeout` elapses.
-pub async fn wait_for_evaluation_criteria_text(
+/// Outcome of looking for the Evaluation Criteria list on the task page.
+pub enum CriteriaLookup {
+    /// The numbered list, one criterion per line ("1. ...", "2. ...").
+    Found(String),
+    /// The page is loaded (its Overall Quality card is rendered) but has no
+    /// Evaluation Criteria section -- some tasks only ask for the overall pick.
+    NoneOnTask,
+    /// Neither the criteria nor the Overall Quality card showed up in time.
+    PageNotReady,
+}
+
+/// Poll for the Evaluation Criteria list until it appears or `timeout`
+/// elapses. Distinguishes "the task genuinely has no criteria" from "the
+/// page hasn't loaded" by watching for the Overall Quality card, which every
+/// task variant has: once that card has been visible with no criteria list
+/// for several consecutive polls (grace for the SPA rendering the list a
+/// beat late), the criteria are ruled absent.
+pub async fn wait_for_evaluation_criteria(
     ctx: &WorkflowCtx,
     timeout: Duration,
-) -> Result<Option<String>> {
+) -> Result<CriteriaLookup> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut loaded_without_criteria = 0u32;
     loop {
         ctx.guard().await?;
         if let Some(text) = evaluation_criteria_text(ctx).await? {
-            return Ok(Some(text));
+            return Ok(CriteriaLookup::Found(text));
+        }
+        if overall_quality_present(ctx).await? {
+            loaded_without_criteria += 1;
+            if loaded_without_criteria >= 4 {
+                return Ok(CriteriaLookup::NoneOnTask);
+            }
+        } else {
+            loaded_without_criteria = 0;
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
+            return Ok(if loaded_without_criteria > 0 {
+                CriteriaLookup::NoneOnTask
+            } else {
+                CriteriaLookup::PageNotReady
+            });
         }
         ctx.human_pause(250, 400).await?;
     }
+}
+
+/// Whether the page's Overall Quality card (an `<h3>Overall Quality</h3>`,
+/// same marker `CLICK_OVERALL_BUTTON_JS` anchors on) is rendered.
+async fn overall_quality_present(ctx: &WorkflowCtx) -> Result<bool> {
+    let v = ctx
+        .eval(
+            r#"(function(){
+  var h3s = document.querySelectorAll('h3');
+  for (var i = 0; i < h3s.length; i++) {
+    if ((h3s[i].textContent || '').trim() === 'Overall Quality') return true;
+  }
+  return false;
+})()"#,
+        )
+        .await?;
+    Ok(v.as_bool().unwrap_or(false))
 }
 
 const EVALUATION_CRITERIA_JS: &str = r#"(function(){
