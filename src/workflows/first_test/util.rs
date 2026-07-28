@@ -1112,7 +1112,14 @@ pub const TASK_DATA_ZIP_CLICK_JS: &str = r#"(function(){
       if (btxt.indexOf('download') !== -1 || btns[j].querySelector('svg.lucide-download')) { t = btns[j]; break; }
     }
   }
-  if (!t && as.length && !box.querySelector('[data-task-data-archive-viewer]')) t = as[0];
+  /* Bare-anchor fallback: skip <strong>-wrapped anchors -- that's the
+     task-inputs file-browser link, which must never be clicked in this tab
+     (navigating away loses the task). */
+  if (!t && !box.querySelector('[data-task-data-archive-viewer]')) {
+    for (var k = 0; k < as.length; k++) {
+      if (!as[k].closest('strong')) { t = as[k]; break; }
+    }
+  }
   if (!t) return null;
   try { t.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
   var r = t.getBoundingClientRect();
@@ -1175,6 +1182,205 @@ pub async fn download_into(
     Ok(dest)
 }
 
+/// Download every file listed on a task's input file-browser page (the
+/// `TaskDataSource::FileBrowserPage` layout) into `dest_dir`, preserving the
+/// browser's folder structure. Returns how many files were downloaded.
+///
+/// A person does this by copying the link and opening it in a NEW tab (the
+/// task tab must never navigate away -- that loses the claimed task). Golem
+/// gets the same result without touching any tab: workflows 1-7 never switch
+/// tabs by design, and the listing page is plain server-rendered HTML on the
+/// same `*.mangovibe.net` host family the zips live on, which `download_into`
+/// already fetches cookie-free with a bare curl. So the listing is curled to
+/// a temp file (NOT stdout -- `ctx.run` streams every stdout line into the
+/// log), its anchors parsed out, and each file fetched the same way. Folder
+/// entries on the page are collapsed `<details>` elements with the file
+/// anchors already present in the HTML, so parsing the source sees every
+/// file without "unfolding" anything.
+pub async fn download_file_browser_inputs(
+    ctx: &WorkflowCtx,
+    page_url: &str,
+    dest_dir: &std::path::Path,
+) -> Result<usize> {
+    let index_path = download_into(ctx, page_url, dest_dir, ".task_inputs_index.html").await?;
+    let html = std::fs::read_to_string(&index_path)
+        .map_err(|e| GolemError::Io(format!("read {}: {e}", index_path.display())))?;
+    // The listing itself is navigation, not task content -- don't leave it in
+    // task_data/ for the evaluation pass to read as if it were an input file.
+    let _ = std::fs::remove_file(&index_path);
+
+    let origin = url_origin(page_url).ok_or_else(|| {
+        GolemError::Other(format!("couldn't parse the file-browser URL: {page_url}"))
+    })?;
+
+    // Every anchor on the page is a file link (folders are <details>/<summary>
+    // with no href; the copy buttons are onclick-only). Keep it that way by
+    // filtering to same-host links anyway, and derive each file's path inside
+    // task_data/ from its URL path -- that reproduces the folder tree without
+    // parsing the <details> nesting.
+    let mut seen = std::collections::HashSet::new();
+    let mut files: Vec<(String, String)> = Vec::new();
+    for href in extract_anchor_hrefs(&html) {
+        let Some(url) = resolve_href(&origin, page_url, &href) else {
+            continue;
+        };
+        let Some(rel) = url.strip_prefix(&origin) else {
+            continue;
+        };
+        let rel = rel.trim_start_matches('/');
+        let rel = rel.split(['?', '#']).next().unwrap_or(rel);
+        if rel.is_empty() {
+            // the listing page itself
+            continue;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut bad = false;
+        for seg in rel.split('/') {
+            let seg = percent_decode(seg);
+            if seg.is_empty() || seg == "." || seg == ".." || seg.contains('/') {
+                bad = true;
+                break;
+            }
+            parts.push(seg);
+        }
+        if bad {
+            ctx.warn(format!("skipping a file link with an unusable path: {url}"));
+            continue;
+        }
+        if seen.insert(url.clone()) {
+            files.push((url, parts.join("/")));
+        }
+    }
+    if files.is_empty() {
+        return Err(GolemError::Other(format!(
+            "the file-browser page at {page_url} listed no downloadable files -- its layout \
+             may have changed"
+        )));
+    }
+
+    ctx.output(format!("the file browser lists {} file(s)", files.len()));
+    for (url, rel) in &files {
+        ctx.guard().await?;
+        let full = dest_dir.join(rel);
+        let sub_dir = full
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| dest_dir.to_path_buf());
+        let name = full
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        download_into(ctx, url, &sub_dir, &name).await?;
+        ctx.output(format!("downloaded {rel}"));
+    }
+    Ok(files.len())
+}
+
+/// Pull the href out of every `<a ...>` tag in `html` (double- or
+/// single-quoted), HTML-entity-decoded. Tolerant by construction: a chunk
+/// without a usable href is skipped, never an error.
+fn extract_anchor_hrefs(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for chunk in html.split("<a ").skip(1) {
+        let Some(tag) = chunk.split('>').next() else {
+            continue;
+        };
+        let raw = tag
+            .split_once("href=\"")
+            .map(|(_, r)| r.split('"').next().unwrap_or(""))
+            .or_else(|| {
+                tag.split_once("href='")
+                    .map(|(_, r)| r.split('\'').next().unwrap_or(""))
+            });
+        if let Some(raw) = raw
+            && !raw.is_empty()
+        {
+            out.push(html_unescape(raw));
+        }
+    }
+    out
+}
+
+/// The minimal entity set attribute values on the listing page can contain.
+/// `&amp;` is decoded LAST so `&amp;lt;` correctly yields a literal `&lt;`.
+fn html_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Percent-decode one URL path segment (`Invoice%20Template.pdf` ->
+/// `Invoice Template.pdf`) so the file on disk gets its real name. Malformed
+/// escapes pass through literally.
+fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'%'
+            && let (Some(&hi), Some(&lo)) = (bytes.get(i + 1), bytes.get(i + 2))
+            && let (Some(h), Some(l)) = (hex(hi), hex(lo))
+        {
+            out.push(h * 16 + l);
+            i += 3;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `https://host` (no trailing slash) from a full URL, or `None` if it
+/// doesn't look like one.
+fn url_origin(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    let rest = url.get(scheme_end + 3..)?;
+    let host_len = rest.find('/').unwrap_or(rest.len());
+    url.get(..scheme_end + 3 + host_len).map(str::to_string)
+}
+
+/// Resolve an anchor's href against the listing page's URL. Non-web schemes
+/// (`javascript:`, `mailto:`, ...) and fragments resolve to `None`.
+fn resolve_href(origin: &str, page_url: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with('#') {
+        return None;
+    }
+    let lower = href.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Some(href.to_string());
+    }
+    if let Some(rest) = href.strip_prefix("//") {
+        let scheme = origin.split("://").next().unwrap_or("https");
+        return Some(format!("{scheme}://{rest}"));
+    }
+    if !lower.starts_with('/') && lower.split(['/', '?', '#']).next().unwrap_or("").contains(':') {
+        return None;
+    }
+    if href.starts_with('/') {
+        return Some(format!("{origin}{href}"));
+    }
+    let base = page_url.split(['?', '#']).next().unwrap_or(page_url);
+    let dir = match base.rfind('/') {
+        Some(i) if i + 1 > origin.len() => base.get(..=i)?.to_string(),
+        _ => format!("{base}/"),
+    };
+    Some(format!("{dir}{href}"))
+}
+
 /// Unzip `zip_path` into `dest_dir` (creating it first) and delete the zip
 /// afterward. The escape-hatch `ctx.run` shells out to the system `unzip`.
 pub async fn unzip_and_cleanup(
@@ -1215,6 +1421,14 @@ pub enum TaskDataSource {
     /// the only way to get the file is to physically click the button and
     /// catch what lands in `~/Downloads`.
     DownloadButton,
+    /// The newest layout: the task prose holds a `<strong><a href>` link
+    /// ("Open the task's input files (file browser)") right under its `<h1>`
+    /// heading, pointing at a separate page that LISTS the input files as
+    /// individual links. Following the link in the task tab would navigate
+    /// the task away and lose it, so the href is read out of the DOM and the
+    /// listing fetched out-of-band instead
+    /// (see [`download_file_browser_inputs`]).
+    FileBrowserPage(String),
 }
 
 /// The Task Data block's direct "Download all task data (ZIP)" link href:
@@ -1233,6 +1447,14 @@ pub async fn task_data_zip_url(ctx: &WorkflowCtx) -> Result<Option<String>> {
 pub async fn task_data_download_button(ctx: &WorkflowCtx) -> Result<bool> {
     let v = ctx.eval(TASK_DATA_DOWNLOAD_BUTTON_JS).await?;
     Ok(v.as_bool().unwrap_or(false))
+}
+
+/// The task-inputs file-browser link's href, when the task uses that layout
+/// (see `TaskDataSource::FileBrowserPage`). The link sits inside a `<strong>`
+/// in the task prose block, right under its `<h1>` heading.
+pub async fn task_data_file_browser_url(ctx: &WorkflowCtx) -> Result<Option<String>> {
+    let v = ctx.eval(TASK_DATA_FILE_BROWSER_URL_JS).await?;
+    Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
 }
 
 /// The Task Data block's full visible text (innerText of its wrapper div).
@@ -1263,11 +1485,12 @@ pub async fn response_zip_url(ctx: &WorkflowCtx, label: &str) -> Result<Option<S
 }
 
 /// Poll every ~250-400ms until the page shows a way to download the Task
-/// Data -- a direct link href, or the archive-viewer's Download button -- or
-/// `timeout` elapses (None: this task has no downloadable data at all). The
-/// page is a client-rendered SPA, so a one-shot check right after navigation
-/// can race the render -- this rides that out instead of failing immediately.
-/// Cancellable via `ctx.guard` (Stop button works).
+/// Data -- a direct link href, the archive-viewer's Download button, or the
+/// task-inputs file-browser link -- or `timeout` elapses (None: this task has
+/// no downloadable data at all). The page is a client-rendered SPA, so a
+/// one-shot check right after navigation can race the render -- this rides
+/// that out instead of failing immediately. Cancellable via `ctx.guard`
+/// (Stop button works).
 pub async fn wait_for_task_data_download(
     ctx: &WorkflowCtx,
     timeout: Duration,
@@ -1280,6 +1503,9 @@ pub async fn wait_for_task_data_download(
         }
         if task_data_download_button(ctx).await? {
             return Ok(Some(TaskDataSource::DownloadButton));
+        }
+        if let Some(url) = task_data_file_browser_url(ctx).await? {
+            return Ok(Some(TaskDataSource::FileBrowserPage(url)));
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);
@@ -1431,7 +1657,13 @@ const TASK_DATA_ZIP_URL_JS: &str = r#"(function(){
     if (/\.zip(\?|$)/i.test(href) || txt.indexOf('download') !== -1) return as[i].href;
   }
   if (box.querySelector('[data-task-data-archive-viewer]')) return null;
-  return as.length ? as[0].href : null;
+  /* Bare-anchor fallback: skip anchors wrapped in <strong> -- that's the
+     task-inputs file-browser link (a page LISTING the files, not a zip),
+     detected separately by TASK_DATA_FILE_BROWSER_URL_JS. */
+  for (var k = 0; k < as.length; k++) {
+    if (!as[k].closest('strong')) return as[k].href;
+  }
+  return null;
 })()"#;
 
 // True when the block holds the newer archive-viewer's `<button>Download`
@@ -1453,6 +1685,38 @@ const TASK_DATA_DOWNLOAD_BUTTON_JS: &str = r#"(function(){
     if (txt.indexOf('download') !== -1 || btns[i].querySelector('svg.lucide-download')) return true;
   }
   return false;
+})()"#;
+
+// The task-inputs file-browser link: an `<a href>` wrapped in a `<strong>`
+// inside the task prose block, right under its `<h1>` heading ("Open the
+// task's input files (file browser)"). Same block-finding as the lookups
+// above. Prefers a link whose text actually says file browser / input files
+// (in case the description prose ever bolds an ordinary link too), falling
+// back to the first strong-wrapped anchor. Returns the ABSOLUTE href -- the
+// link is never clicked (navigating this tab away loses the task).
+const TASK_DATA_FILE_BROWSER_URL_JS: &str = r#"(function(){
+  var all = document.querySelectorAll('div.prose.prose-sm.max-w-none');
+  var box = null;
+  for (var b = 0; b < all.length; b++) {
+    var h = all[b].querySelector('h1,h2,h3');
+    if (all[b].querySelector('[data-task-data-archive-viewer]') ||
+        (h && /task\s*data/i.test(h.textContent || ''))) { box = all[b]; break; }
+  }
+  if (!box && all.length) box = all[0];
+  if (!box) return null;
+  var links = box.querySelectorAll('strong a[href]');
+  var pick = null;
+  for (var i = 0; i < links.length; i++) {
+    var txt = links[i].textContent || '';
+    if (/file\s*browser|input\s*files?|task\s*inputs?/i.test(txt)) { pick = links[i]; break; }
+    if (!pick) pick = links[i];
+  }
+  if (!pick) return null;
+  try {
+    var u = new URL(pick.getAttribute('href') || '', location.href);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.href;
+  } catch (e) { return null; }
 })()"#;
 
 // The block's visible text, minus the archive viewer's file tree when one is
@@ -1512,3 +1776,53 @@ const FIND_RESPONSE_ZIP_URL_JS: &str = r#"(function(){
     return null;
   }
 })()"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ORIGIN: &str =
+        "https://13bd4fc8-ef7c-5ee7-aec1-12e7551eb868.multimodal-agentic-generation-preview.mangovibe.net";
+
+    /// Anchor markup copied verbatim from a real file-browser listing page --
+    /// the live server single-quotes attributes (`href='...'`) while a
+    /// DevTools-saved copy normalizes them to double quotes, so both forms
+    /// are exercised -- plus a nested-folder link, a relative link, and a
+    /// copy <button> (no href) like the real page renders next to every file.
+    #[test]
+    fn listing_hrefs_extract_and_resolve() {
+        let page_url = format!("{ORIGIN}/");
+        let html = format!(
+            r#"<div class="f"><a href='{ORIGIN}/Invoice_Template.pdf' download target='_blank' rel='noopener'>Invoice_Template.pdf</a><button class="cp" onclick="cp('x',this)">📋</button></div>
+<details><summary>docs</summary><div class="ind"><div class="f"><a href="/docs/Q3%20report&amp;final.pdf" download="">Q3 report</a></div></div></details>
+<div class="f"><a href="notes.txt">notes.txt</a></div>
+<a href="javascript:void(0)">nope</a>"#
+        );
+        let origin = url_origin(&page_url).unwrap_or_default();
+        assert_eq!(origin, ORIGIN);
+        let resolved: Vec<String> = extract_anchor_hrefs(&html)
+            .iter()
+            .filter_map(|h| resolve_href(&origin, &page_url, h))
+            .collect();
+        assert_eq!(
+            resolved,
+            vec![
+                format!("{ORIGIN}/Invoice_Template.pdf"),
+                format!("{ORIGIN}/docs/Q3%20report&final.pdf"),
+                format!("{ORIGIN}/notes.txt"),
+            ]
+        );
+    }
+
+    #[test]
+    fn percent_decoding_and_bad_segments() {
+        assert_eq!(percent_decode("Q3%20report.pdf"), "Q3 report.pdf");
+        assert_eq!(percent_decode("plain.txt"), "plain.txt");
+        // malformed escapes pass through untouched
+        assert_eq!(percent_decode("50%25 off %zz"), "50% off %zz");
+        // an encoded traversal decodes to ".." so the caller's check catches it
+        assert_eq!(percent_decode("%2E%2E"), "..");
+        // an encoded slash surfaces for the caller's contains('/') check
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+    }
+}

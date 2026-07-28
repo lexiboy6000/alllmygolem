@@ -1,7 +1,8 @@
 //! Step 2: inside task1, create task_data/, download+unzip the task data
-//! (either the "Download all task data (ZIP)" link or the newer archive
-//! viewer's "Download" button), and save the Task Data block's text as a file
-//! named "information".
+//! (the "Download all task data (ZIP)" link, the newer archive viewer's
+//! "Download" button, or the newest layout's "Open the task's input files
+//! (file browser)" link -- a page listing the input files individually), and
+//! save the Task Data block's text as a file named "information".
 
 use crate::prelude::*;
 
@@ -16,7 +17,7 @@ impl Workflow for SaveTaskData {
     }
 
     fn description(&self) -> &'static str {
-        "Downloads+unzips the Task Data ZIP into task1/task_data and saves the Task Data text to task1/task_data/information."
+        "Downloads the task data (ZIP link, Download button, or file-browser link) into task1/task_data and saves the Task Data text to task1/task_data/information."
     }
 
     fn dependencies(&self) -> Vec<&'static str> {
@@ -121,6 +122,30 @@ impl Workflow for SaveTaskData {
                         zip_path.display()
                     ));
                 }
+            }
+            Some(util::TaskDataSource::FileBrowserPage(url)) => {
+                // Newest layout: the task prose links to a file-browser page
+                // that lists the input files. The link must NOT be followed in
+                // this tab (navigating away loses the claimed task) -- a person
+                // copies it into a new tab; Golem fetches the listing
+                // out-of-band and downloads each listed file into task_data/,
+                // preserving the browser's folder structure.
+                ctx.output(format!("task inputs are behind a file-browser link: {url}"));
+                let count = match util::download_file_browser_inputs(ctx, &url, &data_dir).await {
+                    Ok(count) => count,
+                    Err(GolemError::StoppedByUser) => return Err(GolemError::StoppedByUser),
+                    Err(e) => {
+                        return Err(ctx.halt(format!(
+                            "found the task-inputs file-browser link but couldn't download the \
+                             files it lists: {e}. Make sure you're on a loaded, active task \
+                             page (not the homepage or an expired task)."
+                        )));
+                    }
+                };
+                ctx.output(format!(
+                    "downloaded {count} input file(s) into {}",
+                    data_dir.display()
+                ));
             }
             None => {
                 ctx.output(
