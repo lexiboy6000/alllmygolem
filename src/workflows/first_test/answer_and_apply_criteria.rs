@@ -4,10 +4,10 @@
 //! winner, then click the matching Good/Bad buttons plus the Overall
 //! Quality (Response A / Response B / Tie) button on the live page.
 //!
-//! Deliberately does NOT click Submit on its own -- that's a real,
-//! irreversible submission on an actual task, so this pauses with a confirm
-//! prompt first. Decline it and the ratings stay applied on the page for you
-//! to review/adjust by hand; confirm and it clicks Submit for you.
+//! In the pipeline the chain sets `defer_submit`, so this workflow stops after
+//! applying the ratings and step 8 owns the (real, irreversible) submission.
+//! Run standalone with `defer_submit` cleared, it submits directly -- there is
+//! no confirmation prompt, because the pipeline runs unattended.
 
 use crate::prelude::*;
 
@@ -22,7 +22,7 @@ impl Workflow for AnswerAndApplyCriteria {
     }
 
     fn description(&self) -> &'static str {
-        "Has Claude judge each evaluation criterion for Response A/B from the files in task1, then clicks the matching Good/Bad buttons on the page. Pauses before Submit."
+        "Has Claude judge each evaluation criterion for Response A/B from the files in task1, then clicks the matching Good/Bad buttons on the page. Step 8 submits."
     }
 
     fn dependencies(&self) -> Vec<&'static str> {
@@ -41,10 +41,10 @@ impl Workflow for AnswerAndApplyCriteria {
         let task_dir = util::current_task_dir(ctx)?;
 
         ctx.step("ask Claude to judge each criterion").await?;
-        util::ask_claude_for_answers(ctx, &task_dir, None).await?;
+        util::ask_claude_for_answers(ctx, &task_dir).await?;
         let answers_path = task_dir.join("claude_answers");
         if !answers_path.exists() {
-            return Err(util::halt_unless_auto(ctx, format!(
+            return Err(util::halt_now(ctx, format!(
                     "claude ran but didn't write {}. Check the claude CLI is installed and on \
                      PATH (Settings > Claude path), and that it has permission to write files.",
                     answers_path.display()
@@ -97,36 +97,25 @@ impl Workflow for AnswerAndApplyCriteria {
             ));
         }
 
-        // In the full pipeline the chain carries a `defer_submit` input: the
-        // review workflow (step 8) owns the submission, gated behind a human
-        // sign-off -- so this workflow must NOT touch Submit at all.
+        // In the full pipeline the chain carries a `defer_submit` input: step 8
+        // owns the submission (after waiting out the task timer) -- so this
+        // workflow must NOT touch Submit at all.
         if ctx.input("defer_submit").is_some_and(|v| !v.trim().is_empty()) {
             ctx.output(
-                "submission deferred: the review workflow submits after the human signs off.",
+                "submission deferred: step 8 submits once the task timer is satisfied.",
             );
             return Ok(WorkflowOutcome::Completed);
         }
 
-        ctx.step("confirm submit").await?;
-        let go = if util::auto_mode(ctx) {
-            ctx.warn(format!(
-                "automatic mode: submitting {applied} rating(s) ({} missed) without the \
-                 confirm prompt.",
-                missed.len()
-            ));
-            true
-        } else {
-            ctx.confirm(format!(
-                "Applied {applied} rating(s) ({} missed). Review the page, then confirm to click \
-                 Submit.",
-                missed.len()
-            ))
-            .await?
-        };
-        if !go {
-            ctx.output("stopped before Submit (declined).");
-            return Ok(WorkflowOutcome::Completed);
-        }
+        // No confirm prompt: the pipeline runs unattended, so this submits.
+        // Reached only when `defer_submit` is empty, i.e. this workflow was run
+        // standalone -- in the pipeline step 8 owns the submission and the
+        // early return above fires first.
+        ctx.step("submit").await?;
+        ctx.warn(format!(
+            "submitting {applied} rating(s) ({} missed) with no confirmation prompt",
+            missed.len()
+        ));
         let clicked = util::click_submit_if_enabled(ctx).await?;
         if clicked {
             ctx.output("clicked Submit.");

@@ -39,45 +39,25 @@ pub fn jittered(ctx: &WorkflowCtx, x: f64, y: f64) -> (f64, f64) {
 
 // ----- automatic mode ----------------------------------------------------
 
-/// Whether the pipeline's human gates should self-answer instead of blocking.
+/// Report a "Golem couldn't drive one control" problem WITHOUT blocking.
 ///
-/// Every consultation of `settings.auto_mode` lives in this module and its
-/// callers inside `first_test`, which is what scopes the flag to the task
-/// pipeline: workflows 1-8 and any subworkflow they pull in honour it, while
-/// the feather/complete/solve families keep their own prompts either way.
-pub fn auto_mode(ctx: &WorkflowCtx) -> bool {
-    ctx.settings.auto_mode
-}
-
-/// A [`WorkflowCtx::warn_user`] that never blocks in automatic mode.
-///
-/// These prompts all mean "Golem couldn't drive one control -- fix it on the
-/// page and dismiss this". Automatic mode has nobody to do that, so the
-/// message degrades to a warning line and the run continues to whatever check
+/// These messages all used to mean "fix it on the page and dismiss this".
+/// The pipeline runs unattended now, so there is nobody to do that: the
+/// message becomes a warning line and the run continues to whatever check
 /// would have caught the failure anyway (the `on_new_task` test, the submit
 /// button's own enabled-check, and so on).
-pub async fn warn_user_unless_auto(ctx: &WorkflowCtx, msg: impl Into<String>) -> Result<()> {
-    let msg = msg.into();
-    if auto_mode(ctx) {
-        ctx.warn(format!("automatic mode, not waiting for a human: {msg}"));
-        return Ok(());
-    }
-    ctx.warn_user(msg).await
+pub async fn warn_no_block(ctx: &WorkflowCtx, msg: impl Into<String>) -> Result<()> {
+    ctx.warn(format!("not waiting for a human: {}", msg.into()));
+    Ok(())
 }
 
-/// A [`WorkflowCtx::stop_and_warn`] that doesn't wait for an acknowledgement in
-/// automatic mode.
+/// Halt the chain immediately, without waiting for an acknowledgement.
 ///
 /// The chain halts either way -- the difference is only whether Golem sits on
-/// an undismissed dialog first. Unattended, that turns a clean stop into a
-/// wedge that holds the browser and the claimed task open, so automatic mode
-/// halts immediately instead.
-pub async fn halt_unless_auto(ctx: &WorkflowCtx, msg: impl Into<String>) -> GolemError {
-    let msg = msg.into();
-    if auto_mode(ctx) {
-        return ctx.halt(msg);
-    }
-    ctx.stop_and_warn(msg).await
+/// an undismissed dialog first. Unattended that turns a clean stop into a
+/// wedge holding the browser and the claimed task open, so it never waits.
+pub async fn halt_now(ctx: &WorkflowCtx, msg: impl Into<String>) -> GolemError {
+    ctx.halt(msg)
 }
 
 /// Bring the controlled tab to the front and wait for it to actually be there.
@@ -137,15 +117,7 @@ pub struct ClaudeAnswers {
 /// `task_dir/claude_answers`. Reuses the same launcher settings as the Solve
 /// pipeline (Settings > Claude path / model / effort / timeout) -- this isn't
 /// a "solve" workflow, but those settings are general-purpose, not solve-only.
-///
-/// `reviewer_feedback`, when given, is a human reviewer's note on what to fix
-/// or reconsider: it is appended to the grading prompt and Claude is told to
-/// revise the existing `claude_answers` accordingly.
-pub async fn ask_claude_for_answers(
-    ctx: &WorkflowCtx,
-    task_dir: &std::path::Path,
-    reviewer_feedback: Option<&str>,
-) -> Result<()> {
+pub async fn ask_claude_for_answers(ctx: &WorkflowCtx, task_dir: &std::path::Path) -> Result<()> {
     let claude = if ctx.settings.claude_path.trim().is_empty() {
         "claude".to_string()
     } else {
@@ -153,16 +125,7 @@ pub async fn ask_claude_for_answers(
     };
     let model = ctx.settings.solve_model.clone();
     let effort = ctx.settings.solve_effort.clone();
-    let prompt: String = match reviewer_feedback {
-        Some(fb) => format!(
-            "{ANSWER_CRITERIA_PROMPT}\n\nIMPORTANT -- a human reviewer looked at the answers you \
-             previously wrote to claude_answers and asks for a revision:\n\n\"{fb}\"\n\nRe-read \
-             whatever is needed to address this, then REWRITE claude_answers completely (same \
-             JSON shape). Keep judgments the reviewer didn't question unless re-reading changes \
-             your mind."
-        ),
-        None => ANSWER_CRITERIA_PROMPT.to_string(),
-    };
+    let prompt: String = ANSWER_CRITERIA_PROMPT.to_string();
     let mut args: Vec<&str> = vec![
         "-p",
         prompt.as_str(),
@@ -542,14 +505,14 @@ pub async fn skip_and_restart(
                  disk). Press Stop to cancel the queued restart."
             )))
         }
-        Ok(false) => Err(halt_unless_auto(ctx, format!(
+        Ok(false) => Err(halt_now(ctx, format!(
                 "{label} couldn't be retrieved ({cause}), and the Skip button couldn't be \
                  found/clicked either -- NOT restarting (that would loop on this same task). \
                  Skip the task by hand, then re-run the pipeline."
             ))
             .await),
         Err(GolemError::StoppedByUser) => Err(GolemError::StoppedByUser),
-        Err(e) => Err(halt_unless_auto(ctx, format!(
+        Err(e) => Err(halt_now(ctx, format!(
                 "{label} couldn't be retrieved ({cause}), and clicking Skip failed too ({e}) \
                  -- NOT restarting. Skip the task by hand, then re-run the pipeline."
             ))

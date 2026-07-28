@@ -1,12 +1,12 @@
-//! Step 8: the human-supervised submission leg of the full task pipeline.
+//! Step 8: the unattended submission leg of the full task pipeline.
 //!
 //! Runs after steps 1-7 (its dependency chain) have downloaded the task,
 //! judged it with Claude, and clicked the answers into the multimango page --
 //! with the chain's `defer_submit` input set, step 7 leaves Submit untouched.
 //! This workflow then:
 //!
-//! 1. switches to the Handshake task tab (`ai.joinhandshake.com/.../task/<uuid>/run`),
-//!    -- the "Open Multimango" busywork now leads the chain as workflow 0,
+//! 1. switches to the Handshake task tab (`ai.joinhandshake.com/.../task/<uuid>/run`)
+//!    -- the "Open Multimango" busywork leads the chain as workflow 0,
 //! 2. walks the page's chat-style wizard in this order: "Continue" if shown,
 //!    the arena task type (derived from the multimango tab's URL) sent with
 //!    the up-arrow button, any follow-up "Continue" popup, "Continue task",
@@ -16,41 +16,29 @@
 //!    is skipped rather than answered twice, and every step is skipped cleanly
 //!    on a re-run. An older page variant used aria-pressed toggle buttons;
 //!    both layouts are handled,
-//! 4. raises the "GOLEM NEEDS YOU" prompt and BLOCKS until the human reviewer
-//!    either signs off, sends feedback to Claude (re-judge + re-apply, then
-//!    ask again), or aborts -- UNLESS Settings > Task pipeline > automatic
-//!    mode is on, in which case the gate self-approves (see below),
-//! 5. only after sign-off: waits for the Handshake task timer to reach the
-//!    expected handle time (~35-40 min), re-verifies the answers are still on
-//!    the page, and submits on multimango,
-//! 6. back on Handshake: "Submit task", then "Confirm time", then "Next task",
-//! 7. queues the next pipeline round, which restarts at workflow 0.
+//! 3. waits for the Handshake task timer to reach 40 minutes +/- 3 of jitter.
+//!    Already past it (the common case when Claude's judging ran long) means
+//!    no wait at all -- it proceeds straight through,
+//! 4. re-verifies the answers are still on the page, then submits on multimango,
+//! 5. back on Handshake: "Submit task", then "Confirm time", then "Next task",
+//! 6. queues the next pipeline round, which restarts at workflow 0.
 //!
-//! SAFEGUARDS -- nothing can submit before the review loop returns `Approved`:
+//! THERE IS NO HUMAN GATE. The old "GOLEM NEEDS YOU" review prompt was removed
+//! by request so the pipeline runs continuously without intervention: Claude's
+//! evaluation is submitted for real with nobody having read it. What still
+//! stands between the answers and the submit:
 //! - step 7 never touches Submit when `defer_submit` is set (the pipeline
-//!   always sets it);
-//! - every submit call in this file lives AFTER the review loop returns
-//!   `Approved`; feedback and abort paths loop or bail out before them;
+//!   always sets it), so submission happens here and only here;
+//! - the timer wait above, which keeps handle times plausible;
 //! - the answers are re-verified against the live page right before the
 //!   multimango submit (the platform can swap the open task under us);
 //! - Stop discards the queued next round, so stopping ends the whole loop.
-//!
-//! AUTOMATIC MODE weakens exactly one of those: `Approved` starts coming from
-//! the flag instead of a person, so evaluations are submitted for real with
-//! nobody having read them. Every other safeguard still holds -- the answers
-//! are still re-verified against the live page, and Stop still ends the loop.
 
 use crate::prelude::*;
 
 use super::util;
 
 pub struct HandshakeReviewAndSubmit;
-
-/// What the reviewer chose in the "GOLEM NEEDS YOU" prompt.
-enum Review {
-    Approved,
-    Aborted,
-}
 
 #[async_trait]
 impl Workflow for HandshakeReviewAndSubmit {
@@ -59,8 +47,8 @@ impl Workflow for HandshakeReviewAndSubmit {
     }
 
     fn description(&self) -> &'static str {
-        "Full pipeline leg: Handshake busywork, human review gate (nothing submits before \
-         sign-off), timed multimango + Handshake submission, then queues the next round."
+        "Full pipeline leg: Handshake wizard, waits out the task timer (40 min +/- 3), then \
+         submits on multimango + Handshake and queues the next round. No human gate."
     }
 
     fn dependencies(&self) -> Vec<&'static str> {
@@ -74,13 +62,13 @@ impl Workflow for HandshakeReviewAndSubmit {
             // Submit to this workflow. Clear it only to run step 7 standalone.
             InputSpec::optional(
                 "defer_submit",
-                "Leave non-empty so step 7 defers submission to the review gate",
+                "Leave non-empty so step 7 defers submission to this workflow",
                 "yes",
             ),
             InputSpec::optional(
                 "target_minutes",
-                "Timer minutes to reach before submitting (35-40)",
-                "35",
+                "Timer minutes to reach before submitting (+/- 3 min jitter)",
+                "40",
             ),
             InputSpec::optional(
                 "loop_pipeline",
@@ -113,7 +101,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         ctx.output(format!("arena task type: {arena_id}"));
         let hs_tabs = ctx.browser.list_targets("ai.joinhandshake.com").await?;
         if hs_tabs.is_empty() {
-            return Err(util::halt_unless_auto(
+            return Err(util::halt_now(
                 ctx,
                 "no Handshake tab found -- open ai.joinhandshake.com's task page (the \
                  .../task/<uuid>/run URL) in a tab next to multimango, then re-run.",
@@ -133,7 +121,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         util::focus_and_settle(ctx).await?;
         let hs_url = ctx.browser.current_url().await.unwrap_or_default();
         if !(hs_url.contains("/task/") && hs_url.contains("/run")) {
-            return Err(util::halt_unless_auto(
+            return Err(util::halt_now(
                 ctx,
                 format!(
                     "the Handshake tab is at {hs_url}, not a task run page \
@@ -166,7 +154,7 @@ impl Workflow for HandshakeReviewAndSubmit {
             dump_buttons(ctx).await;
             // Hand it to the human instead of halting: they select + send it
             // on the page, dismiss the message, and the pipeline continues.
-            util::warn_user_unless_auto(
+            util::warn_no_block(
                 ctx,
                 format!(
                     "Couldn't find/select the '{arena_id}' task-type option on the \
@@ -204,7 +192,7 @@ impl Workflow for HandshakeReviewAndSubmit {
             ctx.output("confirmed 'I submitted my time on Multimango'");
         } else {
             dump_buttons(ctx).await;
-            util::warn_user_unless_auto(
+            util::warn_no_block(
                 ctx,
                 "Couldn't click the 'I submitted my time on Multimango' option on the \
                  Handshake page (the visible buttons were just logged). Click and send \
@@ -213,35 +201,16 @@ impl Workflow for HandshakeReviewAndSubmit {
             .await?;
         }
 
-        // ---- THE HUMAN GATE ---------------------------------------------
-        // No submit of any kind happens until this loop returns Approved.
-        ctx.step("GOLEM NEEDS YOU -- human review").await?;
-        match review_loop(ctx, &task_dir).await? {
-            Review::Aborted => {
-                // Leave everything as-is (answers applied, nothing submitted)
-                // and put the controlled page back on multimango for whatever
-                // the human does next.
-                let _ = ctx
-                    .browser
-                    .switch_to_target("multimango.com", "", timeout)
-                    .await;
-                return Err(ctx.halt(
-                    "review aborted by the human reviewer -- NOTHING was submitted. \
-                     The applied answers are still on the multimango page.",
-                ));
-            }
-            Review::Approved => {
-                ctx.output("human sign-off received");
-            }
-        }
-
         // ---- wait out the task timer ------------------------------------
-        ctx.step("wait for the Handshake task timer (~35-40 min)").await?;
+        // This is the only thing standing between Claude's answers and a real
+        // submission now -- the human review gate is gone by request, so the
+        // pipeline runs unattended end to end.
+        ctx.step("wait for the Handshake task timer (40 min +/- 3)").await?;
         let target_minutes: u64 = ctx
             .input("target_minutes")
             .and_then(|v| v.trim().parse().ok())
             .filter(|m| (1..=120).contains(m))
-            .unwrap_or(35);
+            .unwrap_or(40);
         wait_for_timer(ctx, timeout, target_minutes).await?;
 
         // ---- submit the evaluation on multimango ------------------------
@@ -269,7 +238,7 @@ impl Workflow for HandshakeReviewAndSubmit {
             wrong = util::verify_answers_applied(ctx, &answers).await?;
         }
         if !wrong.is_empty() {
-            return Err(util::halt_unless_auto(
+            return Err(util::halt_now(
                 ctx,
                 format!(
                     "even after re-applying, these answers aren't selected: {} -- the open \
@@ -281,7 +250,7 @@ impl Workflow for HandshakeReviewAndSubmit {
             .await);
         }
         if !util::click_submit_if_enabled(ctx).await? {
-            return Err(util::halt_unless_auto(
+            return Err(util::halt_now(
                 ctx,
                 "the multimango Submit button wasn't found or never enabled -- \
                  submit by hand, then continue on the Handshake side manually.",
@@ -303,7 +272,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         // "I submitted my time on Multimango" was already answered before the
         // review gate -- all that's left here is the final submit.
         if !util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await? {
-            return Err(util::halt_unless_auto(
+            return Err(util::halt_now(
                 ctx,
                 "the Handshake Submit button wasn't found or never enabled (is the \
                  task-type still selected?). Submit by hand.",
@@ -320,7 +289,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         ctx.step("go to the next task").await?;
         let prev_run_url = hs_url;
         if !click_button_by_text(ctx, "next task", "Next task", Duration::from_secs(30)).await? {
-            util::warn_user_unless_auto(
+            util::warn_no_block(
                 ctx,
                 "couldn't find a 'Next task' button after submitting. Click it yourself \
                  (or claim the next task), then dismiss this message.",
@@ -402,94 +371,6 @@ impl Workflow for HandshakeReviewAndSubmit {
 // review loop
 // ---------------------------------------------------------------------------
 
-/// The "GOLEM NEEDS YOU" gate. Loops until the reviewer approves or aborts;
-/// the feedback branch re-runs Claude with the reviewer's note, re-applies
-/// the (new) answers on multimango, and asks again.
-async fn review_loop(ctx: &mut WorkflowCtx, task_dir: &std::path::Path) -> Result<Review> {
-    let timeout = Duration::from_millis(ctx.settings.default_wait_timeout_ms);
-    // Automatic mode: nobody is going to look, so approve what Claude wrote and
-    // let the caller submit it. The answers are already applied and verified on
-    // the page at this point; this skips only the human's sign-off.
-    if util::auto_mode(ctx) {
-        ctx.warn(
-            "automatic mode: skipping the GOLEM NEEDS YOU review -- submitting Claude's \
-             evaluation with nobody having checked it.",
-        );
-        return Ok(Review::Approved);
-    }
-    loop {
-        ctx.guard().await?;
-        let choice = ctx
-            .choose(
-                "GOLEM NEEDS YOU\n\nReview the evaluation applied on the multimango tab \
-                 (answers + overall pick). NOTHING has been submitted yet.\n\nThe task \
-                 timer keeps running during review.",
-                vec![
-                    "OK -- everything is right, submit it".to_string(),
-                    "Ask Claude to fix something (give feedback)".to_string(),
-                    "Abort -- leave everything unsubmitted".to_string(),
-                ],
-            )
-            .await;
-        match choice {
-            Ok(0) => return Ok(Review::Approved),
-            Ok(1) => {
-                let feedback = match ctx
-                    .prompt_text(
-                        "What should Claude fix or reconsider? (be specific: which \
-                         criterion / which response / what's wrong)",
-                        "",
-                    )
-                    .await
-                {
-                    Ok(text) if !text.trim().is_empty() => text,
-                    _ => {
-                        ctx.output("no feedback entered -- back to the review prompt");
-                        continue;
-                    }
-                };
-                // Re-judge with the reviewer's note, then re-apply on the
-                // multimango tab (the applier brings it to the front).
-                if !ctx
-                    .browser
-                    .switch_to_target("multimango.com", "", timeout)
-                    .await?
-                {
-                    ctx.warn("couldn't switch to the multimango tab -- try again");
-                    continue;
-                }
-                ctx.output("asking Claude to revise the evaluation with your feedback...");
-                if let Err(e) = util::ask_claude_for_answers(ctx, task_dir, Some(&feedback)).await
-                {
-                    ctx.warn(format!("claude failed to revise ({e}) -- review again"));
-                    continue;
-                }
-                match util::read_claude_answers(&task_dir.join("claude_answers")) {
-                    Ok(answers) => {
-                        let (applied, missed) = util::apply_answers(ctx, &answers, false).await?;
-                        ctx.output(format!(
-                            "re-applied {applied} button(s){}",
-                            if missed.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" ({} missed: {})", missed.len(), missed.join(", "))
-                            }
-                        ));
-                    }
-                    Err(e) => {
-                        ctx.warn(format!("couldn't parse the revised answers ({e})"));
-                    }
-                }
-                // Back to the top: the reviewer looks again.
-            }
-            Ok(_) => return Ok(Review::Aborted),
-            // Prompt dismissed/cancelled (or Stop): treat as abort -- never
-            // fall through toward the submit path on an unclear answer.
-            Err(GolemError::StoppedByUser) => return Err(GolemError::StoppedByUser),
-            Err(_) => return Ok(Review::Aborted),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // timer
@@ -512,14 +393,16 @@ async fn wait_for_timer(
     {
         return Err(ctx.halt("couldn't switch to the Handshake tab to read the timer"));
     }
-    // Jitter the target inside the 35-40 window so rounds don't all land on
-    // the exact same handle time.
-    let jitter = (std::time::SystemTime::now()
+    // Jitter the target +/- 3 minutes around `target_minutes` so rounds don't
+    // all land on the exact same handle time. Signed, unlike the old version
+    // which only ever added and then clamped -- that made 40 an absolute
+    // ceiling rather than the midpoint it's meant to be.
+    let raw = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_millis() as u64)
-        .unwrap_or(0))
-        % 180;
-    let target_secs = (target_minutes * 60 + jitter).min(40 * 60);
+        .unwrap_or(0);
+    let jitter = (raw % 361) as i64 - 180; // -180..=180 seconds
+    let target_secs = ((target_minutes * 60) as i64 + jitter).max(60) as u64;
 
     let mut last_report: Option<u64> = None;
     loop {
@@ -529,32 +412,21 @@ async fn wait_for_timer(
         let running = v.get("running").and_then(Value::as_bool).unwrap_or(true);
         match secs {
             None => {
-                // Can't read it -- hand the judgment to the human rather than
-                // submitting at an implausible handle time.
-                if util::auto_mode(ctx) {
-                    // Nobody to watch it, and submitting now would post an
-                    // implausible handle time. Wait the target out by wall
-                    // clock instead: the real task timer started before this
-                    // point, so this over-waits, which is the safe direction
-                    // to be wrong in.
-                    ctx.warn(format!(
-                        "automatic mode: can't read the task timer, so waiting the full \
-                         {target_minutes} min by wall clock before submitting (this \
-                         over-waits -- the task timer started earlier)."
-                    ));
-                    let until = tokio::time::Instant::now() + Duration::from_secs(target_secs);
-                    while tokio::time::Instant::now() < until {
-                        ctx.guard().await?;
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                    return Ok(());
+                // Can't read it, and there is nobody to watch it instead.
+                // Submitting now would post an implausible handle time, so wait
+                // the target out by wall clock: the real task timer started
+                // before this point, so this over-waits, which is the safe
+                // direction to be wrong in.
+                ctx.warn(format!(
+                    "can't read the task timer, so waiting the full {target_minutes} min by \
+                     wall clock before submitting (this over-waits -- the task timer started \
+                     earlier)."
+                ));
+                let until = tokio::time::Instant::now() + Duration::from_secs(target_secs);
+                while tokio::time::Instant::now() < until {
+                    ctx.guard().await?;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-                ctx.warn_user(format!(
-                    "Couldn't read the task timer on the Handshake page. Watch it \
-                     yourself and dismiss this message once it shows at least \
-                     {target_minutes} minutes -- submission continues after that.",
-                ))
-                .await?;
                 return Ok(());
             }
             Some(s) if s >= target_secs => {
