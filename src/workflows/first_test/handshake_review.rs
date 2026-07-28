@@ -24,6 +24,10 @@
 //! 5. "Submit task", then "Confirm time", then "Next task",
 //! 6. queues the next pipeline round, which restarts at workflow 0.
 //!
+//! Every hop between controls goes through [`between_clicks`]: a jittered
+//! pause plus occasional idle cursor drift, so the pointer never bee-lines
+//! from one button straight to the next.
+//!
 //! THERE IS NO HUMAN GATE. The old "GOLEM NEEDS YOU" review prompt was removed
 //! by request so the pipeline runs continuously without intervention: Claude's
 //! evaluation is submitted for real with nobody having read it. What still
@@ -34,6 +38,8 @@
 //! - the answers are re-verified against the live page right before the
 //!   multimango submit (the platform can swap the open task under us);
 //! - Stop discards the queued next round, so stopping ends the whole loop.
+
+use rand::RngExt;
 
 use crate::prelude::*;
 
@@ -149,6 +155,7 @@ impl Workflow for HandshakeReviewAndSubmit {
 
         // ---- select the arena task type ---------------------------------
         ctx.step("select the task type on Handshake").await?;
+        between_clicks(ctx).await?;
         if answer_wizard_step(ctx, &regex_escape(&arena_id)).await? {
             ctx.output(format!("selected task type: {arena_id}"));
         } else {
@@ -167,6 +174,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         }
 
         // a confirmation popup with its own Continue may follow the selection
+        between_clicks(ctx).await?;
         match wait_for_coords(ctx, CONTINUE_STEP_JS, Duration::from_secs(8)).await? {
             Some((x, y)) => {
                 let (x, y) = util::jittered(ctx, x, y);
@@ -180,6 +188,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         // A miss is fine: the control is also absent when it has already been
         // pressed by hand, which is the same state we want to end up in.
         ctx.step("click Continue task").await?;
+        between_clicks(ctx).await?;
         click_button_by_text(ctx, "^continue task$", "Continue task", Duration::from_secs(10))
             .await?;
 
@@ -189,6 +198,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         // `answer_wizard_step` no-ops when the bubble is already sent, so a
         // hand-clicked step is skipped rather than double-answered.
         ctx.step("answer 'I submitted my time on Multimango'").await?;
+        between_clicks(ctx).await?;
         if answer_wizard_step(ctx, "i submitted my (task|time) on multimango").await? {
             ctx.output("confirmed 'I submitted my time on Multimango'");
         } else {
@@ -247,6 +257,7 @@ impl Workflow for HandshakeReviewAndSubmit {
             )
             .await);
         }
+        between_clicks(ctx).await?;
         if !util::click_submit_if_enabled(ctx).await? {
             return Err(util::halt_now(
                 ctx,
@@ -278,6 +289,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         wait_for_timer(ctx, timeout, target_minutes).await?;
         // "I submitted my time on Multimango" was already answered earlier in
         // the wizard -- all that's left here is the final submit.
+        between_clicks(ctx).await?;
         if !util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await? {
             return Err(util::halt_now(
                 ctx,
@@ -290,11 +302,13 @@ impl Workflow for HandshakeReviewAndSubmit {
 
         // Handshake asks to confirm the handle time before releasing the task.
         ctx.step("confirm the time").await?;
+        between_clicks(ctx).await?;
         click_button_by_text(ctx, "confirm.*time", "Confirm time", Duration::from_secs(15)).await?;
 
         // ---- move to the next task + queue the next round ---------------
         ctx.step("go to the next task").await?;
         let prev_run_url = hs_url;
+        between_clicks(ctx).await?;
         if !click_button_by_text(ctx, "next task", "Next task", Duration::from_secs(30)).await? {
             util::warn_no_block(
                 ctx,
@@ -490,6 +504,23 @@ async fn wait_for_timer(
 // small helpers + page finders
 // ---------------------------------------------------------------------------
 
+/// A short human beat between one workflow-8 control and the next: a
+/// jittered pause, with occasional idle cursor drift (moves only, no clicks)
+/// so the pointer doesn't bee-line from button to button. Timing only -- it
+/// never touches what gets clicked.
+async fn between_clicks(ctx: &mut WorkflowCtx) -> Result<()> {
+    // scope the (non-Send) thread rng so it never crosses an await
+    let wander = {
+        let mut rng = rand::rng();
+        rng.random_bool(0.35)
+    };
+    ctx.human_pause(500, 2000).await?;
+    if wander {
+        ctx.wander_cursor().await?;
+    }
+    Ok(())
+}
+
 /// A round-counting input (`tasks` / `tasks_done`) as a plain count. Blank,
 /// missing and unparseable all mean 0, which the caller reads as "unlimited"
 /// -- a typo in the box must never silently cut the run short.
@@ -619,6 +650,14 @@ async fn answer_wizard_step(ctx: &mut WorkflowCtx, pattern: &str) -> Result<bool
         let (x, y) = util::jittered(ctx, x, y);
         ctx.click_at_cursor(x, y).await?;
         ctx.human_pause(400, 900).await?;
+        // occasional idle drift between picking the option and hitting send
+        let wander = {
+            let mut rng = rand::rng();
+            rng.random_bool(0.2)
+        };
+        if wander {
+            ctx.wander_cursor().await?;
+        }
         // The chat layout needs the choice sent with the up-arrow button;
         // the toggle layout has no such button and registers on the click.
         if let Some((sx, sy)) = wait_for_coords(ctx, WIZARD_SEND_JS, Duration::from_secs(4)).await?
