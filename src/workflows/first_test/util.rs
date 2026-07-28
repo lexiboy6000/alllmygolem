@@ -248,13 +248,14 @@ pub async fn apply_answers(
     let mut until_break: u32 = if paced { next_batch_size() } else { u32::MAX };
     for (i, a) in answers.criteria.iter().enumerate() {
         // scope the (non-Send) thread rng so it never crosses an await
-        let (b_first, reread, hesitate, wander) = {
+        let (b_first, reread, hesitate, wander, glance) = {
             let mut rng = rand::rng();
             (
                 rng.random_bool(0.5),
                 rng.random_bool(0.2),
                 rng.random_bool(0.15),
                 rng.random_bool(0.35),
+                rng.random_bool(0.2),
             )
         };
         if i > 0 {
@@ -269,6 +270,12 @@ pub async fn apply_answers(
             if wander {
                 // idle mouse drift while "reading" -- moves only, no clicks
                 ctx.wander_cursor().await?;
+            }
+            if glance {
+                // a quick wheel glance up/down the page -- safe, because
+                // every click re-finds fresh coordinates and scrolls its own
+                // target back into view before pressing
+                ctx.wander_scroll().await?;
             }
             if reread {
                 // sometimes a person goes back and re-reads the rubric line
@@ -307,12 +314,15 @@ pub async fn apply_answers(
     }
     // weighing the overall verdict takes longer than a single row
     ctx.human_pause(1000, 3600).await?;
-    let wander = {
+    let (wander, glance) = {
         let mut rng = rand::rng();
-        rng.random_bool(0.35)
+        (rng.random_bool(0.35), rng.random_bool(0.15))
     };
     if wander {
         ctx.wander_cursor().await?;
+    }
+    if glance {
+        ctx.wander_scroll().await?;
     }
     if click_overall_button(ctx, &answers.overall.winner).await? {
         applied += 1;
@@ -348,12 +358,15 @@ async fn long_answer_break(ctx: &mut WorkflowCtx) -> Result<()> {
     while start.elapsed() < Duration::from_millis(target_ms) {
         ctx.human_pause(2500, 6000).await?;
         // scope the (non-Send) thread rng so it never crosses an await
-        let wander = {
+        let (wander, glance) = {
             let mut rng = rand::rng();
-            rng.random_bool(0.12)
+            (rng.random_bool(0.12), rng.random_bool(0.08))
         };
         if wander {
             ctx.wander_cursor().await?;
+        }
+        if glance {
+            ctx.wander_scroll().await?;
         }
     }
     Ok(())
