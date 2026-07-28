@@ -20,6 +20,16 @@ impl Workflow for CreateTask1 {
         "Creates a new task folder: auto-increments task1, task2, task3, ... (blank task_dir field), or an exact name if you type one."
     }
 
+    /// Workflow 0 does the Handshake busywork and leaves the multimango task
+    /// tab controlled, which everything downstream reads from -- so it has to
+    /// lead every chain, and depending on it here is what puts it there (the
+    /// engine resolves 0 -> 1 -> ... -> 8 from workflow 8 alone).
+    fn dependencies(&self) -> Vec<&'static str> {
+        vec!["0. Open Multimango (Handshake busywork)"]
+    }
+
+    /// This step itself is pure filesystem work, but its dependency drives the
+    /// browser, so the chain as a whole still needs Chrome connected.
     fn requires_browser(&self) -> bool {
         false
     }

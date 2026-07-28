@@ -1,6 +1,10 @@
 //! Step 6: create task1/task_data/evaluation_criteria and save the
 //! Evaluation Criteria questions (the numbered "1. ...", "2. ..." list under
 //! `div.divide-y.divide-border`) to a readable text file inside it.
+//!
+//! Some tasks have no Evaluation Criteria section at all and only ask for
+//! the Overall Quality pick -- for those the questions file is written EMPTY,
+//! which tells step 7 (and its Claude prompt) to judge overall quality only.
 
 use crate::prelude::*;
 
@@ -38,25 +42,32 @@ impl Workflow for SaveEvaluationCriteria {
             .map_err(|e| GolemError::Io(format!("mkdir {}: {e}", dir.display())))?;
 
         ctx.step("read evaluation criteria").await?;
-        let text = util::wait_for_evaluation_criteria_text(ctx, Duration::from_secs(15))
-            .await?
-            .ok_or_else(|| {
-                ctx.halt(
-                    "couldn't find the Evaluation Criteria list on the page after waiting 15s \
-                     (looked for a header span 'Evaluation Criteria' followed by a \
-                     div.divide-y.divide-border list). Make sure you're on a loaded task page \
-                     with the criteria visible.",
-                )
-            })?;
-
         let path = dir.join("questions");
-        std::fs::write(&path, &text)
-            .map_err(|e| GolemError::Io(format!("write {}: {e}", path.display())))?;
-        ctx.output(format!(
-            "saved {} criteria -> {}",
-            text.lines().count(),
-            path.display()
-        ));
+        match util::wait_for_evaluation_criteria(ctx, Duration::from_secs(15)).await? {
+            util::CriteriaLookup::Found(text) => {
+                std::fs::write(&path, &text)
+                    .map_err(|e| GolemError::Io(format!("write {}: {e}", path.display())))?;
+                ctx.output(format!(
+                    "saved {} criteria -> {}",
+                    text.lines().count(),
+                    path.display()
+                ));
+            }
+            util::CriteriaLookup::NoneOnTask => {
+                std::fs::write(&path, "")
+                    .map_err(|e| GolemError::Io(format!("write {}: {e}", path.display())))?;
+                ctx.output(
+                    "this task has no Evaluation Criteria -- only the Overall Quality pick is \
+                     required (wrote an empty questions file)",
+                );
+            }
+            util::CriteriaLookup::PageNotReady => {
+                return Err(ctx.halt(
+                    "couldn't find the Evaluation Criteria list (or the Overall Quality card) \
+                     on the page after waiting 15s. Make sure you're on a loaded task page.",
+                ));
+            }
+        }
 
         Ok(WorkflowOutcome::Completed)
     }

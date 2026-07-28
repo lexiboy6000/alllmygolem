@@ -1,4 +1,5 @@
 mod util;
+mod open_multimango;
 mod create_task1;
 mod task_data;
 mod create_response_a_dir;
@@ -8,6 +9,7 @@ mod save_evaluation_criteria;
 mod answer_and_apply_criteria;
 mod handshake_review;
 
+pub use open_multimango::OpenMultimango;
 pub use create_task1::CreateTask1;
 pub use task_data::SaveTaskData;
 pub use create_response_a_dir::CreateResponseADir;

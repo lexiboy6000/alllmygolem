@@ -146,10 +146,15 @@ fn worker_main(rx: std::sync::mpsc::Receiver<InputCmd>, init_tx: &std::sync::mps
             None
         }
     };
+    let scale = wayland_coordinate_scale();
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             InputCmd::MoveAbs { x, y, reply } => {
+                let (x, y) = (
+                    (f64::from(x) * scale).round() as i32,
+                    (f64::from(y) * scale).round() as i32,
+                );
                 let res = match enigo.as_mut() {
                     Some(e) => e.move_mouse(x, y, Coordinate::Abs).map_err(map_enigo_err),
                     None => Err(unavailable()),
@@ -209,6 +214,45 @@ fn do_scroll(enigo: &mut Enigo, dx: i32, dy: i32) -> Result<()> {
         enigo.scroll(dy, Axis::Vertical).map_err(map_enigo_err)?;
     }
     Ok(())
+}
+
+/// Factor to convert the logical screen coordinates the rest of the app works
+/// in into the coordinates enigo's Wayland virtual-pointer expects.
+///
+/// enigo expresses absolute positions as a fraction of the output's PHYSICAL
+/// mode size, but the compositor maps that fraction onto the output's LOGICAL
+/// size — so on a scaled monitor (e.g. 1.5x HiDPI) every move lands short by
+/// the scale factor unless we pre-multiply. Verified empirically on Hyprland:
+/// asking for (600,450) on a 1.5x monitor put the cursor at (400,300).
+///
+/// Only Hyprland is queried (`hyprctl monitors -j`, focused monitor); on X11
+/// sessions or other compositors this returns 1.0 (no adjustment).
+fn wayland_coordinate_scale() -> f64 {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return 1.0;
+    }
+    let Ok(out) = std::process::Command::new("hyprctl")
+        .args(["monitors", "-j"])
+        .output()
+    else {
+        return 1.0;
+    };
+    if !out.status.success() {
+        return 1.0;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        return 1.0;
+    };
+    let Some(monitors) = v.as_array() else {
+        return 1.0;
+    };
+    monitors
+        .iter()
+        .find(|m| m.get("focused").and_then(serde_json::Value::as_bool) == Some(true))
+        .or_else(|| monitors.first())
+        .and_then(|m| m.get("scale").and_then(serde_json::Value::as_f64))
+        .filter(|s| *s > 0.0)
+        .unwrap_or(1.0)
 }
 
 /// Error returned for every command when enigo could not initialize.

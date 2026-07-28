@@ -44,8 +44,7 @@ impl Workflow for AnswerAndApplyCriteria {
         util::ask_claude_for_answers(ctx, &task_dir, None).await?;
         let answers_path = task_dir.join("claude_answers");
         if !answers_path.exists() {
-            return Err(ctx
-                .stop_and_warn(format!(
+            return Err(util::halt_unless_auto(ctx, format!(
                     "claude ran but didn't write {}. Check the claude CLI is installed and on \
                      PATH (Settings > Claude path), and that it has permission to write files.",
                     answers_path.display()
@@ -53,16 +52,49 @@ impl Workflow for AnswerAndApplyCriteria {
                 .await);
         }
         let answers = util::read_claude_answers(&answers_path)?;
-        ctx.output(format!(
-            "got {} criterion answer(s) + an overall pick from claude",
-            answers.criteria.len()
-        ));
+        if answers.criteria.is_empty() {
+            ctx.output("no evaluation criteria on this task -- claude judged overall quality only");
+        } else {
+            ctx.output(format!(
+                "got {} criterion answer(s) + an overall pick from claude",
+                answers.criteria.len()
+            ));
+        }
 
         ctx.step("apply answers on the page").await?;
-        let (applied, missed) = util::apply_answers(ctx, &answers).await?;
+        // Paced: a ~2-minute jittered break after every few selections. The
+        // pacing is timing-only -- the values clicked still come verbatim
+        // from claude_answers, and each click verifies itself.
+        let (applied, missed) = util::apply_answers(ctx, &answers, true).await?;
         ctx.output(format!("clicked {applied} button(s)"));
         if !missed.is_empty() {
             ctx.warn(format!("couldn't find/click: {}", missed.join(", ")));
+        }
+
+        // The long breaks give the SPA extra chances to re-render and drop a
+        // selection, so re-check every answer against the live page and fix
+        // anything that got lost. The fix-up re-apply is unpaced and cheap:
+        // click_until_selected sees already-selected buttons and skips them,
+        // so only the lost ones get clicked again.
+        ctx.step("verify the applied answers").await?;
+        let mut wrong = util::verify_answers_applied(ctx, &answers).await?;
+        if !wrong.is_empty() {
+            ctx.warn(format!(
+                "{} answer(s) didn't stick ({}) -- re-applying them",
+                wrong.len(),
+                wrong.join(", ")
+            ));
+            let _ = util::apply_answers(ctx, &answers, false).await?;
+            wrong = util::verify_answers_applied(ctx, &answers).await?;
+        }
+        if wrong.is_empty() {
+            ctx.output("verified: every answer on the page matches claude_answers");
+        } else {
+            ctx.warn(format!(
+                "still not selected after re-applying: {} -- check the page before \
+                 submitting",
+                wrong.join(", ")
+            ));
         }
 
         // In the full pipeline the chain carries a `defer_submit` input: the
@@ -76,13 +108,21 @@ impl Workflow for AnswerAndApplyCriteria {
         }
 
         ctx.step("confirm submit").await?;
-        let go = ctx
-            .confirm(format!(
+        let go = if util::auto_mode(ctx) {
+            ctx.warn(format!(
+                "automatic mode: submitting {applied} rating(s) ({} missed) without the \
+                 confirm prompt.",
+                missed.len()
+            ));
+            true
+        } else {
+            ctx.confirm(format!(
                 "Applied {applied} rating(s) ({} missed). Review the page, then confirm to click \
                  Submit.",
                 missed.len()
             ))
-            .await?;
+            .await?
+        };
         if !go {
             ctx.output("stopped before Submit (declined).");
             return Ok(WorkflowOutcome::Completed);

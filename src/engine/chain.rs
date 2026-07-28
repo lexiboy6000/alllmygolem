@@ -208,6 +208,10 @@ async fn run_inner(
             }
         };
 
+        // Let the workflow see (and re-queue) the chain it is part of -- the
+        // download workflows' skip-and-restart recovery uses this.
+        ctx.set_chain_targets(targets.to_vec());
+
         // v1 resume semantics: the workflow re-runs from its first step, but its
         // store + step index are pre-populated from the checkpoint so any data it
         // already extracted is available. (We do not skip steps.)

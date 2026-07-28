@@ -8,16 +8,25 @@
 //! 1. switches to the Handshake task tab (`ai.joinhandshake.com/.../task/<uuid>/run`),
 //! 2. clicks "Open Multimango" if it's shown (Handshake busywork; the extra
 //!    multimango tab it opens is closed again -- we already drive one),
-//! 3. selects the arena task type (derived from the multimango tab's URL),
+//! 3. walks the page's chat-style wizard: a "Continue" step if shown, then
+//!    the arena task type (derived from the multimango tab's URL) answered
+//!    with the wizard's up-arrow send button, then any follow-up "Continue"
+//!    popup. The wizard renders sent answers as right-aligned bubbles
+//!    (`items-end` containers), which is how "already answered" is detected --
+//!    every wizard step is skipped cleanly on a re-run. An older page variant
+//!    used aria-pressed toggle buttons; both layouts are handled,
 //! 4. raises the "GOLEM NEEDS YOU" prompt and BLOCKS until the human reviewer
 //!    either signs off, sends feedback to Claude (re-judge + re-apply, then
-//!    ask again), or aborts,
+//!    ask again), or aborts -- UNLESS Settings > Task pipeline > automatic
+//!    mode is on, in which case the gate self-approves (see below),
 //! 5. only after sign-off: waits for the Handshake task timer to reach the
 //!    expected handle time (~35-40 min), re-verifies the answers are still on
-//!    the page, submits on multimango, then submits on Handshake,
+//!    the page, submits on multimango, then back on Handshake answers the
+//!    wizard's "I submitted my task on Multimango" step and clicks the final
+//!    "Submit task" button,
 //! 6. clicks "Continue task" and queues the next pipeline round.
 //!
-//! SAFEGUARDS -- nothing can submit before the human sign-off:
+//! SAFEGUARDS -- nothing can submit before the review loop returns `Approved`:
 //! - step 7 never touches Submit when `defer_submit` is set (the pipeline
 //!   always sets it);
 //! - every submit call in this file lives AFTER the review loop returns
@@ -25,6 +34,11 @@
 //! - the answers are re-verified against the live page right before the
 //!   multimango submit (the platform can swap the open task under us);
 //! - Stop discards the queued next round, so stopping ends the whole loop.
+//!
+//! AUTOMATIC MODE weakens exactly one of those: `Approved` starts coming from
+//! the flag instead of a person, so evaluations are submitted for real with
+//! nobody having read them. Every other safeguard still holds -- the answers
+//! are still re-verified against the live page, and Stop still ends the loop.
 
 use crate::prelude::*;
 
@@ -73,6 +87,11 @@ impl Workflow for HandshakeReviewAndSubmit {
                 "Non-empty = queue the next round after Continue task",
                 "yes",
             ),
+            InputSpec::optional(
+                "tasks",
+                "How many tasks to run in total (blank or 0 = unlimited)",
+                "0",
+            ),
         ]
     }
 
@@ -94,12 +113,12 @@ impl Workflow for HandshakeReviewAndSubmit {
         ctx.output(format!("arena task type: {arena_id}"));
         let hs_tabs = ctx.browser.list_targets("ai.joinhandshake.com").await?;
         if hs_tabs.is_empty() {
-            return Err(ctx
-                .stop_and_warn(
-                    "no Handshake tab found -- open ai.joinhandshake.com's task page (the \
-                     .../task/<uuid>/run URL) in a tab next to multimango, then re-run.",
-                )
-                .await);
+            return Err(util::halt_unless_auto(
+                ctx,
+                "no Handshake tab found -- open ai.joinhandshake.com's task page (the \
+                 .../task/<uuid>/run URL) in a tab next to multimango, then re-run.",
+            )
+            .await);
         }
 
         // ---- switch to the Handshake task page --------------------------
@@ -114,13 +133,15 @@ impl Workflow for HandshakeReviewAndSubmit {
         let _ = ctx.browser.bring_to_front().await;
         let hs_url = ctx.browser.current_url().await.unwrap_or_default();
         if !(hs_url.contains("/task/") && hs_url.contains("/run")) {
-            return Err(ctx
-                .stop_and_warn(format!(
+            return Err(util::halt_unless_auto(
+                ctx,
+                format!(
                     "the Handshake tab is at {hs_url}, not a task run page \
                      (.../annotations/fellow/task/<uuid>/run). Claim/open the task there, \
                      then re-run this workflow."
-                ))
-                .await);
+                ),
+            )
+            .await);
         }
 
         // ---- Handshake busywork: Open Multimango ------------------------
@@ -164,20 +185,45 @@ impl Workflow for HandshakeReviewAndSubmit {
             }
         }
 
+        // ---- wizard: a Continue step may gate the task-type question ----
+        ctx.step("advance the wizard (Continue, if shown)").await?;
+        match wait_for_coords(ctx, CONTINUE_STEP_JS, Duration::from_secs(6)).await? {
+            Some((x, y)) => {
+                let (x, y) = util::jittered(ctx, x, y);
+                ctx.click_at_cursor(x, y).await?;
+                ctx.output("clicked Continue");
+            }
+            None => ctx.output("no Continue to click -- moving on"),
+        }
+
         // ---- select the arena task type ---------------------------------
         ctx.step("select the task type on Handshake").await?;
-        let select_js = ARENA_SELECT_JS.replace("__ARENA__", &js_str(&arena_id));
-        if !util::click_until_selected(ctx, &select_js).await? {
+        if answer_wizard_step(ctx, &regex_escape(&arena_id)).await? {
+            ctx.output(format!("selected task type: {arena_id}"));
+        } else {
             dump_buttons(ctx).await;
-            return Err(ctx
-                .stop_and_warn(format!(
-                    "couldn't find/select the '{arena_id}' task-type button on the \
+            // Hand it to the human instead of halting: they select + send it
+            // on the page, dismiss the message, and the pipeline continues.
+            util::warn_user_unless_auto(
+                ctx,
+                format!(
+                    "Couldn't find/select the '{arena_id}' task-type option on the \
                      Handshake page (the visible buttons were just logged). Select it \
-                     by hand and re-run, or fix the finder."
-                ))
-                .await);
+                     and send it by hand, then dismiss this message to continue."
+                ),
+            )
+            .await?;
         }
-        ctx.output(format!("selected task type: {arena_id}"));
+
+        // a confirmation popup with its own Continue may follow the selection
+        match wait_for_coords(ctx, CONTINUE_STEP_JS, Duration::from_secs(8)).await? {
+            Some((x, y)) => {
+                let (x, y) = util::jittered(ctx, x, y);
+                ctx.click_at_cursor(x, y).await?;
+                ctx.output("clicked Continue on the follow-up popup");
+            }
+            None => {}
+        }
 
         // ---- THE HUMAN GATE ---------------------------------------------
         // No submit of any kind happens until this loop returns Approved.
@@ -231,26 +277,28 @@ impl Workflow for HandshakeReviewAndSubmit {
                  re-applying once",
                 wrong.len()
             ));
-            let _ = util::apply_answers(ctx, &answers).await?;
+            let _ = util::apply_answers(ctx, &answers, false).await?;
             wrong = util::verify_answers_applied(ctx, &answers).await?;
         }
         if !wrong.is_empty() {
-            return Err(ctx
-                .stop_and_warn(format!(
+            return Err(util::halt_unless_auto(
+                ctx,
+                format!(
                     "even after re-applying, these answers aren't selected: {} -- the open \
                      multimango task probably CHANGED since the review. NOT submitting; \
                      check the page.",
                     wrong.join(", ")
-                ))
-                .await);
+                ),
+            )
+            .await);
         }
         if !util::click_submit_if_enabled(ctx).await? {
-            return Err(ctx
-                .stop_and_warn(
-                    "the multimango Submit button wasn't found or never enabled -- \
-                     submit by hand, then continue on the Handshake side manually.",
-                )
-                .await);
+            return Err(util::halt_unless_auto(
+                ctx,
+                "the multimango Submit button wasn't found or never enabled -- \
+                 submit by hand, then continue on the Handshake side manually.",
+            )
+            .await);
         }
         ctx.output("multimango evaluation submitted");
 
@@ -264,13 +312,27 @@ impl Workflow for HandshakeReviewAndSubmit {
             return Err(ctx.halt("couldn't switch back to the Handshake tab"));
         }
         let _ = ctx.browser.bring_to_front().await;
+        // The wizard wants confirmation the multimango side is done before
+        // the final submit ("I submitted my task on Multimango" + send).
+        if answer_wizard_step(ctx, "i submitted my (task|time) on multimango").await? {
+            ctx.output("confirmed 'I submitted my task on Multimango'");
+        } else {
+            dump_buttons(ctx).await;
+            util::warn_user_unless_auto(
+                ctx,
+                "Couldn't click the 'I submitted my task on Multimango' option on the \
+                 Handshake page (the visible buttons were just logged). Click and send \
+                 it by hand, then dismiss this message to continue.",
+            )
+            .await?;
+        }
         if !util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await? {
-            return Err(ctx
-                .stop_and_warn(
-                    "the Handshake Submit button wasn't found or never enabled (is the \
-                     task-type still selected?). Submit by hand.",
-                )
-                .await);
+            return Err(util::halt_unless_auto(
+                ctx,
+                "the Handshake Submit button wasn't found or never enabled (is the \
+                 task-type still selected?). Submit by hand.",
+            )
+            .await);
         }
         ctx.output("Handshake task submitted");
 
@@ -283,7 +345,8 @@ impl Workflow for HandshakeReviewAndSubmit {
                 ctx.click_at_cursor(x, y).await?;
             }
             None => {
-                ctx.warn_user(
+                util::warn_user_unless_auto(
+                    ctx,
                     "couldn't find a 'Continue task' button after submitting. Click it \
                      yourself (or claim the next task), then dismiss this message.",
                 )
@@ -313,7 +376,14 @@ impl Workflow for HandshakeReviewAndSubmit {
         let loop_pipeline = ctx
             .input("loop_pipeline")
             .is_some_and(|v| !v.trim().is_empty());
-        if on_new_task && loop_pipeline {
+        // How many tasks the user asked for, and how many rounds have finished
+        // (this one included). `tasks` is the user-facing total and rides along
+        // unchanged; `tasks_done` is bookkeeping this workflow queues to itself.
+        // 0/blank/unparseable = unlimited, which is the historical behaviour.
+        let tasks_total = parse_count(ctx.input("tasks"));
+        let tasks_done = parse_count(ctx.input("tasks_done")).saturating_add(1);
+        let budget_left = tasks_total == 0 || tasks_done < tasks_total;
+        if on_new_task && loop_pipeline && budget_left {
             let mut inputs = std::collections::BTreeMap::new();
             // task_dir stays empty so step 1 auto-creates the next taskN.
             inputs.insert("defer_submit".to_string(), "yes".to_string());
@@ -322,11 +392,25 @@ impl Workflow for HandshakeReviewAndSubmit {
                 target_minutes.to_string(),
             );
             inputs.insert("loop_pipeline".to_string(), "yes".to_string());
+            inputs.insert("tasks".to_string(), tasks_total.to_string());
+            inputs.insert("tasks_done".to_string(), tasks_done.to_string());
             ctx.queue_chain(vec![self.name().to_string()], inputs);
-            ctx.output(
-                "next pipeline round queued -- it starts as soon as this chain finishes \
-                 (press Stop to end the loop).",
-            );
+            if tasks_total == 0 {
+                ctx.output(format!(
+                    "task {tasks_done} done -- next round queued (unlimited; press Stop to \
+                     end the loop)."
+                ));
+            } else {
+                ctx.output(format!(
+                    "task {tasks_done} of {tasks_total} done -- next round queued (press Stop \
+                     to end the loop early)."
+                ));
+            }
+        } else if on_new_task && loop_pipeline && !budget_left {
+            ctx.output(format!(
+                "ran all {tasks_total} requested task(s) -- not queueing another round. \
+                 Raise 'How many tasks to run' (or set it to 0) to keep going."
+            ));
         } else if !on_new_task {
             ctx.warn(
                 "Handshake didn't move to a new task run page -- not queueing another \
@@ -349,6 +433,16 @@ impl Workflow for HandshakeReviewAndSubmit {
 /// the (new) answers on multimango, and asks again.
 async fn review_loop(ctx: &mut WorkflowCtx, task_dir: &std::path::Path) -> Result<Review> {
     let timeout = Duration::from_millis(ctx.settings.default_wait_timeout_ms);
+    // Automatic mode: nobody is going to look, so approve what Claude wrote and
+    // let the caller submit it. The answers are already applied and verified on
+    // the page at this point; this skips only the human's sign-off.
+    if util::auto_mode(ctx) {
+        ctx.warn(
+            "automatic mode: skipping the GOLEM NEEDS YOU review -- submitting Claude's \
+             evaluation with nobody having checked it.",
+        );
+        return Ok(Review::Approved);
+    }
     loop {
         ctx.guard().await?;
         let choice = ctx
@@ -398,7 +492,7 @@ async fn review_loop(ctx: &mut WorkflowCtx, task_dir: &std::path::Path) -> Resul
                 }
                 match util::read_claude_answers(&task_dir.join("claude_answers")) {
                     Ok(answers) => {
-                        let (applied, missed) = util::apply_answers(ctx, &answers).await?;
+                        let (applied, missed) = util::apply_answers(ctx, &answers, false).await?;
                         ctx.output(format!(
                             "re-applied {applied} button(s){}",
                             if missed.is_empty() {
@@ -463,6 +557,24 @@ async fn wait_for_timer(
             None => {
                 // Can't read it -- hand the judgment to the human rather than
                 // submitting at an implausible handle time.
+                if util::auto_mode(ctx) {
+                    // Nobody to watch it, and submitting now would post an
+                    // implausible handle time. Wait the target out by wall
+                    // clock instead: the real task timer started before this
+                    // point, so this over-waits, which is the safe direction
+                    // to be wrong in.
+                    ctx.warn(format!(
+                        "automatic mode: can't read the task timer, so waiting the full \
+                         {target_minutes} min by wall clock before submitting (this \
+                         over-waits -- the task timer started earlier)."
+                    ));
+                    let until = tokio::time::Instant::now() + Duration::from_secs(target_secs);
+                    while tokio::time::Instant::now() < until {
+                        ctx.guard().await?;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    return Ok(());
+                }
                 ctx.warn_user(format!(
                     "Couldn't read the task timer on the Handshake page. Watch it \
                      yourself and dismiss this message once it shows at least \
@@ -512,6 +624,16 @@ async fn wait_for_timer(
 // small helpers + page finders
 // ---------------------------------------------------------------------------
 
+/// A round-counting input (`tasks` / `tasks_done`) as a plain count. Blank,
+/// missing and unparseable all mean 0, which the caller reads as "unlimited"
+/// -- a typo in the box must never silently cut the run short.
+fn parse_count(raw: Option<&str>) -> u32 {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 /// `https://www.multimango.com/tasks/<arena-id>` -> `<arena-id>`.
 fn arena_id_from_url(url: &str) -> Option<String> {
     let rest = url.split("multimango.com/tasks/").nth(1)?;
@@ -529,7 +651,7 @@ fn js_str(s: &str) -> String {
 
 /// Poll `find_js` (an IIFE returning `{x, y}` or null) until it yields
 /// coordinates or `timeout` passes.
-async fn wait_for_coords(
+pub(super) async fn wait_for_coords(
     ctx: &mut WorkflowCtx,
     find_js: &str,
     timeout: Duration,
@@ -551,6 +673,77 @@ async fn wait_for_coords(
     }
 }
 
+/// Escape a literal string for embedding in a JS regex source.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\^$.|?*+()[]{}".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Answer one step of Handshake's chat-style wizard: the option whose text
+/// matches `pattern` (a case-insensitive JS regex matched against the whole
+/// trimmed text) is clicked, then sent with the wizard's up-arrow button if
+/// one appears, and the answer is confirmed by its sent bubble showing up in
+/// the user-side (`items-end`) column. If the answer bubble is already there
+/// (step answered on a previous run, or by hand), this does nothing and
+/// reports success. The older toggle-button layout (selection state in
+/// `aria-pressed`) is handled by the same finder. Returns `false` if the
+/// option never appeared or the answer never registered.
+async fn answer_wizard_step(ctx: &mut WorkflowCtx, pattern: &str) -> Result<bool> {
+    let find_js = WIZARD_ANSWER_JS.replace("__PATTERN__", &js_str(pattern));
+    // The step (or its already-sent bubble) may render late.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        ctx.guard().await?;
+        let v = ctx.eval(&find_js).await?;
+        if v.get("x").and_then(Value::as_f64).is_some() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        ctx.human_pause(300, 600).await?;
+    }
+    for _attempt in 0..2 {
+        let v = ctx.eval(&find_js).await?;
+        let (Some(x), Some(y)) = (
+            v.get("x").and_then(Value::as_f64),
+            v.get("y").and_then(Value::as_f64),
+        ) else {
+            return Ok(false);
+        };
+        if v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(true);
+        }
+        let (x, y) = util::jittered(ctx, x, y);
+        ctx.click_at_cursor(x, y).await?;
+        ctx.human_pause(400, 900).await?;
+        // The chat layout needs the choice sent with the up-arrow button;
+        // the toggle layout has no such button and registers on the click.
+        if let Some((sx, sy)) = wait_for_coords(ctx, WIZARD_SEND_JS, Duration::from_secs(4)).await?
+        {
+            let (sx, sy) = util::jittered(ctx, sx, sy);
+            ctx.click_at_cursor(sx, sy).await?;
+        }
+        let confirm_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < confirm_deadline {
+            ctx.guard().await?;
+            let v = ctx.eval(&find_js).await?;
+            if v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
+                return Ok(true);
+            }
+            ctx.human_pause(400, 700).await?;
+        }
+    }
+    let v = ctx.eval(&find_js).await?;
+    Ok(v.get("selected").and_then(Value::as_bool).unwrap_or(false))
+}
+
 /// Log the visible buttons on the page -- called when a finder misses so the
 /// mismatch is debuggable from the output pane alone.
 async fn dump_buttons(ctx: &mut WorkflowCtx) {
@@ -563,7 +756,7 @@ async fn dump_buttons(ctx: &mut WorkflowCtx) {
 
 /// A visible "Open Multimango" button/link (shows in Handshake's task guide /
 /// return-reminder dialogs).
-const OPEN_MULTIMANGO_JS: &str = r#"(function(){
+pub(super) const OPEN_MULTIMANGO_JS: &str = r#"(function(){
   var els = document.querySelectorAll('button, a, [role="button"]');
   for (var i = 0; i < els.length; i++) {
     if ((els[i].textContent || '').trim().toLowerCase() !== 'open multimango') continue;
@@ -575,33 +768,98 @@ const OPEN_MULTIMANGO_JS: &str = r#"(function(){
   return null;
 })()"#;
 
-/// The task-type button whose exact text is the arena id. Selection state is
-/// `aria-pressed` (verified in the saved page: toggle buttons under
-/// "Please select the task type you're working on").
-const ARENA_SELECT_JS: &str = r#"(function(){
-  var WANT = __ARENA__;
+/// One wizard step's answer control, matched by `__PATTERN__` (a JS regex
+/// source tested case-insensitively against the whole trimmed text).
+/// Handles both page layouts:
+/// - toggle buttons (older variant): selection state is `aria-pressed`;
+/// - chat wizard (current variant, inspected live 2026-07-27): options are
+///   plain styled `<div>` chips, and a SENT answer shows as a bubble inside
+///   the user-side column (a `[class*="items-end"]` container) -- that bubble
+///   is the `selected` signal. The LAST match in document order wins, which
+///   is both the innermost element and the newest wizard step.
+const WIZARD_ANSWER_JS: &str = r#"(function(){
+  var RE = new RegExp('^(?:' + __PATTERN__ + ')$', 'i');
+  function pt(e, sel) {
+    try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+    var r = e.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return null;
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2, selected: sel };
+  }
+  function vis(e) { var r = e.getBoundingClientRect(); return r.width >= 1 && r.height >= 1; }
   var btns = document.querySelectorAll('button');
   for (var i = 0; i < btns.length; i++) {
-    if ((btns[i].textContent || '').trim() !== WANT) continue;
-    try { btns[i].scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
-    var r = btns[i].getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) return null;
-    return { x: r.left + r.width / 2, y: r.top + r.height / 2,
-             selected: btns[i].getAttribute('aria-pressed') === 'true' };
+    if (!btns[i].hasAttribute('aria-pressed')) continue;
+    if (!RE.test((btns[i].textContent || '').trim())) continue;
+    if (!vis(btns[i])) continue;
+    return pt(btns[i], btns[i].getAttribute('aria-pressed') === 'true');
   }
+  var all = document.querySelectorAll('div, span, button, [role="button"], a');
+  var answered = null, option = null;
+  for (var j = 0; j < all.length; j++) {
+    var el = all[j];
+    if (!RE.test((el.textContent || '').trim())) continue;
+    if (!vis(el)) continue;
+    if (el.closest('[class*="items-end"]')) answered = el; else option = el;
+  }
+  if (answered) return pt(answered, true);
+  if (option) return pt(option, false);
   return null;
 })()"#;
 
-/// Handshake's enabled submit: `button[type=submit]` labelled/reading
-/// "Submit" that isn't disabled (it stays disabled until a task type is
-/// selected).
+/// The chat wizard's send button (the up-arrow, lower right of the input
+/// area): an enabled button with an arrow-up icon or a send/submit
+/// aria-label. Bottom-most match wins.
+const WIZARD_SEND_JS: &str = r#"(function(){
+  var btns = document.querySelectorAll('button');
+  var best = null, bestTop = -1;
+  for (var i = 0; i < btns.length; i++) {
+    var b = btns[i];
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+    var al = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+    var arrow = b.querySelector('svg[class*="arrow-up"]');
+    if (!arrow && al !== 'send' && al !== 'send message' && al !== 'submit') continue;
+    var r = b.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    if (r.top > bestTop) { bestTop = r.top; best = b; }
+  }
+  if (!best) return null;
+  try { best.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+  var r = best.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+})()"#;
+
+/// A pending "Continue" control in the wizard or a popup: button, link, or
+/// chat option chip -- but never an already-sent answer bubble (user-side
+/// `items-end` column). Last match in document order = the newest step.
+const CONTINUE_STEP_JS: &str = r#"(function(){
+  var els = document.querySelectorAll('button, [role="button"], a, div');
+  var best = null;
+  for (var i = 0; i < els.length; i++) {
+    var el = els[i];
+    var t = (el.textContent || '').trim().toLowerCase();
+    if (t !== 'continue' && t !== 'continue to task') continue;
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+    if (el.closest('[class*="items-end"]')) continue;
+    var r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    best = el;
+  }
+  if (!best) return null;
+  try { best.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+  var r = best.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+})()"#;
+
+/// Handshake's final submit: an enabled button reading "Submit task" (the
+/// big bottom button on the live page, `type="button"`) or plain "Submit"
+/// (older variant, `type="submit"`).
 const HANDSHAKE_SUBMIT_JS: &str = r#"(function(){
-  var btns = document.querySelectorAll('button[type="submit"]');
+  var btns = document.querySelectorAll('button');
   for (var i = 0; i < btns.length; i++) {
     var b = btns[i];
     var al = (b.getAttribute('aria-label') || '').trim().toLowerCase();
     var txt = (b.textContent || '').trim().toLowerCase();
-    if (al !== 'submit' && txt !== 'submit') continue;
+    if (al !== 'submit' && txt !== 'submit' && txt !== 'submit task') continue;
     if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
     try { b.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
     var r = b.getBoundingClientRect();
