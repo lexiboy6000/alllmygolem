@@ -744,23 +744,6 @@ impl GolemApp {
         });
 
         ui.separator();
-        ui.heading("Task pipeline");
-        ui.checkbox(&mut s.auto_mode, "automatic mode (no human gates)")
-            .on_hover_text(
-                "Runs the task pipeline (workflows 1-8) and its subworkflows without stopping \
-                 for a human: the GOLEM NEEDS YOU review self-approves, the submit confirm \
-                 self-answers, and page-repair prompts become warnings. Evaluations are then \
-                 submitted for real with nobody reviewing them. Other workflow families are \
-                 unaffected.",
-            );
-        if s.auto_mode {
-            ui.colored_label(
-                egui::Color32::from_rgb(220, 140, 60),
-                "⚠ evaluations submit unreviewed",
-            );
-        }
-
-        ui.separator();
         ui.heading("Solve (Docker + Claude Code)");
         ui.horizontal(|ui| {
             ui.label("claude path");

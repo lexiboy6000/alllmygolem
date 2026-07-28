@@ -67,7 +67,7 @@ impl Workflow for OpenMultimango {
             .switch_to_target("ai.joinhandshake.com", "", timeout)
             .await?
         {
-            return Err(util::halt_unless_auto(
+            return Err(util::halt_now(
                 ctx,
                 "no Handshake tab to click 'Open Multimango' in -- open the task run page \
                  (ai.joinhandshake.com/.../task/<uuid>/run) in a tab next to multimango, \
@@ -156,7 +156,7 @@ impl Workflow for OpenMultimango {
                 .switch_to_target("multimango.com", "", timeout)
                 .await?
             {
-                return Err(util::halt_unless_auto(
+                return Err(util::halt_now(
                     ctx,
                     "no multimango tab at all after the Open Multimango step -- workflows \
                      1-7 read the task from that tab, so open the arena task page and re-run.",
