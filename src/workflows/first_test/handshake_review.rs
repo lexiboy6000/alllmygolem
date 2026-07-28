@@ -410,6 +410,16 @@ async fn wait_for_timer(
     switch_timeout: Duration,
     target_minutes: u64,
 ) -> Result<()> {
+    // `0` means "submit as soon as the answers are in" -- honour it literally.
+    // Without this the jitter floor below (`.max(60)`) and the unreadable-timer
+    // fallback would both still hold the run back, which is exactly the
+    // silent-wait bug a zero target is meant to opt out of. The caller has
+    // already switched to and settled the Handshake tab, so returning here
+    // skips only the waiting, not any setup the submit depends on.
+    if target_minutes == 0 {
+        ctx.output("target_minutes is 0 -- not waiting for the task timer");
+        return Ok(());
+    }
     if !ctx
         .browser
         .switch_to_target("ai.joinhandshake.com", "", switch_timeout)

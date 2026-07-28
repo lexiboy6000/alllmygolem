@@ -174,7 +174,6 @@ impl Default for PromptBus {
     }
 }
 
-/// Everything passed to `Workflow::run`.
 /// Whether this process is running under a Wayland compositor. Golem and the
 /// browser it drives share a session, so the answer applies to both.
 ///
@@ -190,6 +189,7 @@ fn is_wayland_session() -> bool {
         || std::env::var("XDG_SESSION_TYPE").is_ok_and(|t| t.eq_ignore_ascii_case("wayland"))
 }
 
+/// Everything passed to `Workflow::run`.
 pub struct WorkflowCtx {
     /// Raw browser/CDP backend — escape hatch for anything not wrapped below.
     pub browser: Arc<dyn BrowserBackend>,
