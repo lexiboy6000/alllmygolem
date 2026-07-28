@@ -713,6 +713,25 @@ Response B independently: does that response satisfy the criterion? Use \"Good\"
 \"Bad\" if it does not or only partially does.\n\n\
 Separately, also give an OVERALL pick: which response, taken as a whole, better fulfills the \
 task requirements -- \"Response A\", \"Response B\", or \"Tie\" if they're genuinely equal.\n\n\
+Judging rules (these mirror the platform's official annotator guidelines):\n\
+- Rate every criterion independently for each response. Never let one criterion's outcome \
+bleed into another, and never assume a criterion passes because a related one did (a chart \
+being present says nothing about filters, interactivity, or completeness).\n\
+- Judge from the actual files: open and read EVERY file in both responses before rating \
+anything. Never rate from file names, from the first file alone, or from what \
+model_response.txt CLAIMS was delivered -- verify claims against the files themselves.\n\
+- If a response is completely broken (no deliverable, empty output, or files that clearly \
+cannot render/run), mark ALL of its criteria \"Bad\" and it must lose the overall pick.\n\
+- Weigh criteria roughly equally, unless one is clearly more central to the task.\n\
+- For the overall pick, working functionality and content completeness outweigh visual \
+polish: a response that delivers what was asked beats a prettier one that doesn't.\n\
+- Keep the overall pick consistent with your per-criterion ratings. Preferring the response \
+that clearly lost on the criteria is an error -- if something important the criteria don't \
+capture drives your pick, say so explicitly in the overall notes.\n\
+- Use \"Tie\" sparingly: only when the responses are genuinely equal. If one is even \
+slightly better, pick it.\n\
+- When there are no criteria, judge the overall pick on: instruction following, visual \
+quality, content completeness, and usability.\n\n\
 Write your answer as a JSON OBJECT to a file named exactly `claude_answers` in the CURRENT \
 directory (no file extension), in EXACTLY this shape:\n\
 {\"criteria\": [{\"number\": 1, \"response_a\": \"Good\", \"response_b\": \"Bad\", \"notes\": \
