@@ -1345,12 +1345,13 @@ pub async fn download_into(
     let dest_str = dest
         .to_str()
         .ok_or_else(|| GolemError::Io(format!("non-UTF8 path: {}", dest.display())))?;
-    // Judge the transfer by PROGRESS, not by elapsed time: a task ZIP can be
-    // tens of MB on a slow link and legitimately take many minutes, and the
-    // old flat 120s cap killed downloads that were streaming along fine.
-    // --speed-time/--speed-limit abort only once throughput sits under 1 KB/s
-    // for a solid minute, which is a genuine stall; the outer timeout is just
-    // a backstop far above any real download.
+    // Judge the transfer by PROGRESS, not by elapsed time. These ZIPs run to
+    // ~1 GB (a real one landed at 1,016,824,007 bytes), so the old flat 120s
+    // cap killed downloads that were streaming along perfectly well -- at a
+    // realistic 1 MB/s that file needs ~17 minutes. --speed-time/--speed-limit
+    // abort only once throughput sits under 1 KB/s for a solid minute, which
+    // is a genuine stall; the outer timeout is a backstop sized so even a slow
+    // link finishes a gigabyte well inside it.
     let out = ctx
         .run(
             "curl",
@@ -1365,7 +1366,7 @@ pub async fn download_into(
                 url,
             ],
             None,
-            Some(Duration::from_secs(1800)),
+            Some(Duration::from_secs(7200)),
         )
         .await?;
     if !out.success() {
