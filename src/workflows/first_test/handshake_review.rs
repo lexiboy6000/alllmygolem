@@ -16,11 +16,12 @@
 //!    is skipped rather than answered twice, and every step is skipped cleanly
 //!    on a re-run. An older page variant used aria-pressed toggle buttons;
 //!    both layouts are handled,
-//! 3. waits for the Handshake task timer to reach 40 minutes +/- 3 of jitter.
-//!    Already past it (the common case when Claude's judging ran long) means
-//!    no wait at all -- it proceeds straight through,
-//! 4. re-verifies the answers are still on the page, then submits on multimango,
-//! 5. back on Handshake: "Submit task", then "Confirm time", then "Next task",
+//! 3. re-verifies the answers are still on the page, then submits on multimango,
+//! 4. back on Handshake: waits for the task timer to reach 40 minutes +/- 3 of
+//!    jitter RIGHT before the final "Submit task" click. A timer already
+//!    at/past 40 when it gets there (the common case when Claude's judging
+//!    ran long) means no wait at all -- it clicks straight through,
+//! 5. "Submit task", then "Confirm time", then "Next task",
 //! 6. queues the next pipeline round, which restarts at workflow 0.
 //!
 //! THERE IS NO HUMAN GATE. The old "GOLEM NEEDS YOU" review prompt was removed
@@ -201,17 +202,14 @@ impl Workflow for HandshakeReviewAndSubmit {
             .await?;
         }
 
-        // ---- wait out the task timer ------------------------------------
-        // This is the only thing standing between Claude's answers and a real
-        // submission now -- the human review gate is gone by request, so the
-        // pipeline runs unattended end to end.
-        ctx.step("wait for the Handshake task timer (40 min +/- 3)").await?;
+        // The timer wait happens later, right before the Handshake "Submit
+        // task" click -- only the target is resolved here (it also rides
+        // along into the next queued round).
         let target_minutes: u64 = ctx
             .input("target_minutes")
             .and_then(|v| v.trim().parse().ok())
             .filter(|m| (1..=120).contains(m))
             .unwrap_or(40);
-        wait_for_timer(ctx, timeout, target_minutes).await?;
 
         // ---- submit the evaluation on multimango ------------------------
         ctx.step("submit the evaluation on multimango").await?;
@@ -269,8 +267,17 @@ impl Workflow for HandshakeReviewAndSubmit {
             return Err(ctx.halt("couldn't switch back to the Handshake tab"));
         }
         util::focus_and_settle(ctx).await?;
-        // "I submitted my time on Multimango" was already answered before the
-        // review gate -- all that's left here is the final submit.
+        // ---- wait out the task timer ------------------------------------
+        // The last thing before the real submission: hold the "Submit task"
+        // click until the page timer reads the target (40 min +/- 3 of
+        // jitter). A timer already at/past 40 submits immediately -- no
+        // jitter is waited out on top. This is the only thing standing
+        // between Claude's answers and a real submission -- the human review
+        // gate is gone by request, so the pipeline runs unattended.
+        ctx.step("wait for the Handshake task timer (40 min +/- 3)").await?;
+        wait_for_timer(ctx, timeout, target_minutes).await?;
+        // "I submitted my time on Multimango" was already answered earlier in
+        // the wizard -- all that's left here is the final submit.
         if !util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await? {
             return Err(util::halt_now(
                 ctx,
@@ -377,10 +384,13 @@ impl Workflow for HandshakeReviewAndSubmit {
 // ---------------------------------------------------------------------------
 
 /// Read the Handshake task timer and wait until it reaches `target_minutes`
-/// (+ up to ~3 min of jitter, capped at 40). If the timer is paused, resume
-/// it first; if it can't be read at all, fall back to asking the human to
-/// watch it. The project expects handle times near the human average -- the
-/// timer only exists so tasks aren't claimed implausibly fast.
+/// +/- up to 3 min of jitter. A FIRST reading already at/past the plain
+/// (un-jittered) target returns immediately: positive jitter only stretches
+/// a wait that is happening anyway, it never delays a round that arrives
+/// late. If the timer is paused, resume it first; if it can't be read at
+/// all, wait the target out by wall clock. The project expects handle times
+/// near the human average -- the timer only exists so tasks aren't claimed
+/// implausibly fast.
 async fn wait_for_timer(
     ctx: &mut WorkflowCtx,
     switch_timeout: Duration,
@@ -403,6 +413,10 @@ async fn wait_for_timer(
         .unwrap_or(0);
     let jitter = (raw % 361) as i64 - 180; // -180..=180 seconds
     let target_secs = ((target_minutes * 60) as i64 + jitter).max(60) as u64;
+    // A first reading at/past the un-jittered target submits immediately, so
+    // a round arriving past 40 min never waits out a positive jitter on top.
+    let base_secs = target_minutes * 60;
+    let mut first_read = true;
 
     let mut last_report: Option<u64> = None;
     loop {
@@ -410,6 +424,12 @@ async fn wait_for_timer(
         let v = ctx.eval(TIMER_READ_JS).await?;
         let secs = v.get("secs").and_then(Value::as_u64);
         let running = v.get("running").and_then(Value::as_bool).unwrap_or(true);
+        let gate = if first_read {
+            target_secs.min(base_secs)
+        } else {
+            target_secs
+        };
+        first_read = false;
         match secs {
             None => {
                 // Can't read it, and there is nobody to watch it instead.
@@ -429,7 +449,7 @@ async fn wait_for_timer(
                 }
                 return Ok(());
             }
-            Some(s) if s >= target_secs => {
+            Some(s) if s >= gate => {
                 ctx.output(format!(
                     "timer at {}:{:02} -- proceeding to submit",
                     s / 60,
