@@ -71,7 +71,8 @@ impl Workflow for OpenMultimango {
             )
             .await);
         }
-        let _ = ctx.browser.bring_to_front().await;
+        // MUST settle before the native click below -- see focus_and_settle.
+        util::focus_and_settle(ctx).await?;
 
         // ---- press the button -------------------------------------------
         // It lives in Handshake's modal "Timer paused" dialog and is a plain
@@ -79,21 +80,55 @@ impl Workflow for OpenMultimango {
         // sign-in tab, or nothing at all) isn't knowable up front. Press it for
         // Handshake's benefit and let the tab cleanup below sort out the result
         // -- don't try to predict which tab appears, or when.
+        // The button sits in a modal dialog that the press dismisses, so the
+        // button DISAPPEARING is the proof the press actually reached the
+        // Handshake page. Without that check a click swallowed by the wrong
+        // tab is indistinguishable from success. Re-clicking is safe: any
+        // surplus tabs are cleaned up below.
         ctx.step("click Open Multimango").await?;
-        match wait_for_coords(ctx, OPEN_MULTIMANGO_JS, Duration::from_secs(8)).await? {
-            Some((x, y)) => {
-                let (x, y) = util::jittered(ctx, x, y);
-                ctx.click_at_cursor(x, y).await?;
-                ctx.output("clicked Open Multimango");
-                // Give a tab it may spawn time to register before the cleanup.
-                ctx.human_pause(2500, 4000).await?;
+        let mut pressed = false;
+        for attempt in 0..3 {
+            let find_timeout = if attempt == 0 { 8 } else { 3 };
+            let Some((x, y)) =
+                wait_for_coords(ctx, OPEN_MULTIMANGO_JS, Duration::from_secs(find_timeout)).await?
+            else {
+                if attempt == 0 {
+                    ctx.output(
+                        "no 'Open Multimango' control visible -- skipping (already pressed, or \
+                         this page state doesn't show the Timer paused dialog)",
+                    );
+                } else {
+                    // Gone after a click: that IS the success signal.
+                    pressed = true;
+                }
+                break;
+            };
+            let (jx, jy) = util::jittered(ctx, x, y);
+            ctx.click_at_cursor(jx, jy).await?;
+            ctx.human_pause(1200, 1800).await?;
+            if wait_for_coords(ctx, OPEN_MULTIMANGO_JS, Duration::from_secs(2))
+                .await?
+                .is_none()
+            {
+                pressed = true;
+                break;
             }
-            None => {
-                ctx.output(
-                    "no 'Open Multimango' control visible -- skipping (already pressed, or \
-                     this page state doesn't show the Timer paused dialog)",
-                );
-            }
+            ctx.warn(format!(
+                "Open Multimango is still on screen after click {} -- the press probably \
+                 landed on another tab; re-focusing and retrying",
+                attempt + 1
+            ));
+            util::focus_and_settle(ctx).await?;
+        }
+        if pressed {
+            ctx.output("clicked Open Multimango (its dialog went away)");
+            // Give a tab it may spawn time to register before the cleanup.
+            ctx.human_pause(2500, 4000).await?;
+        } else {
+            ctx.warn(
+                "couldn't get Open Multimango to respond -- continuing to the tab cleanup; \
+                 press it by hand if Handshake still expects it",
+            );
         }
 
         // ---- settle on ONE multimango tab: the task page ----------------
@@ -139,7 +174,7 @@ impl Workflow for OpenMultimango {
             )),
         }
 
-        let _ = ctx.browser.bring_to_front().await;
+        util::focus_and_settle(ctx).await?;
         let url = ctx.browser.current_url().await.unwrap_or_default();
         ctx.output(format!("controlling the multimango tab: {url}"));
         if !url.contains("multimango.com/tasks/") {

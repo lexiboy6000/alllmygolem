@@ -130,7 +130,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         {
             return Err(ctx.halt("couldn't switch to the Handshake tab"));
         }
-        let _ = ctx.browser.bring_to_front().await;
+        util::focus_and_settle(ctx).await?;
         let hs_url = ctx.browser.current_url().await.unwrap_or_default();
         if !(hs_url.contains("/task/") && hs_url.contains("/run")) {
             return Err(util::halt_unless_auto(
@@ -253,7 +253,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         {
             return Err(ctx.halt("couldn't switch back to the multimango tab"));
         }
-        let _ = ctx.browser.bring_to_front().await;
+        util::focus_and_settle(ctx).await?;
         // Safeguard: the platform can swap the open task while we were in
         // review -- submitting then would rate a DIFFERENT task. Verify every
         // approved answer is still selected; re-apply once if not.
@@ -299,7 +299,7 @@ impl Workflow for HandshakeReviewAndSubmit {
         {
             return Err(ctx.halt("couldn't switch back to the Handshake tab"));
         }
-        let _ = ctx.browser.bring_to_front().await;
+        util::focus_and_settle(ctx).await?;
         // "I submitted my time on Multimango" was already answered before the
         // review gate -- all that's left here is the final submit.
         if !util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await? {
