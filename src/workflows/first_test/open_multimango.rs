@@ -12,13 +12,17 @@
 //! they just drive whatever tab is controlled. Workflow 1 depends on this one,
 //! so every chain (including the next round queued by workflow 8) starts here.
 //!
-//! The button lives in Handshake's modal "Timer paused" dialog and is a plain
-//! `<button type="button">` with no href, so what it opens -- an arena task
-//! tab, a `multimango.com/sign-in` tab, or nothing visible at all -- can't be
-//! predicted. Rather than watch for a specific new tab id (which misses when
-//! the tab arrives late or at an unexpected URL), this settles the tab set
-//! afterwards: prefer a tab already on `/tasks/<id>`, then close every OTHER
-//! multimango tab. Cold start and duplicate-tab both fall out of that.
+//! Handshake shows the control in two shapes and only one exists at a time: a
+//! `<button>Open Multimango</button>` in the modal "Timer paused" dialog, or
+//! the inline `<a target="_blank">Multimango</a>` links in the task's
+//! "⚠️ Important" list (the normal state). Both open a tab pointing at
+//! `multimango.com/sign-in?email={multimango_credentials}` -- an unsubstituted
+//! template -- so the tab is a throwaway and gets closed again.
+//!
+//! The tab set is settled afterwards rather than by tracking one tab id:
+//! prefer a tab already on `/tasks/<id>`, then close every OTHER multimango
+//! tab. Cold start, the throwaway sign-in tab, and a previous round's leftover
+//! all fall out of that one rule.
 //!
 //! Everything here is skip-safe -- no "Open Multimango" control visible (the
 //! user already pressed it, or this state doesn't show one) means the step is
@@ -80,54 +84,55 @@ impl Workflow for OpenMultimango {
         // sign-in tab, or nothing at all) isn't knowable up front. Press it for
         // Handshake's benefit and let the tab cleanup below sort out the result
         // -- don't try to predict which tab appears, or when.
-        // The button sits in a modal dialog that the press dismisses, so the
-        // button DISAPPEARING is the proof the press actually reached the
-        // Handshake page. Without that check a click swallowed by the wrong
-        // tab is indistinguishable from success. Re-clicking is safe: any
-        // surplus tabs are cleaned up below.
-        ctx.step("click Open Multimango").await?;
-        let mut pressed = false;
+        // A NEW multimango tab appearing is the proof the press landed. That
+        // works for both control shapes (the modal button and the inline
+        // target="_blank" link), and unlike checking whether the control went
+        // away it doesn't assume the click dismisses anything -- an anchor
+        // stays right where it is. Without this check, a press swallowed by
+        // the wrong tab is indistinguishable from success. Re-clicking is safe:
+        // every surplus tab is closed by the cleanup below.
+        ctx.step("click through to Multimango (opens a tab)").await?;
+        let mut opened = false;
         for attempt in 0..3 {
             let find_timeout = if attempt == 0 { 8 } else { 3 };
             let Some((x, y)) =
                 wait_for_coords(ctx, OPEN_MULTIMANGO_JS, Duration::from_secs(find_timeout)).await?
             else {
-                if attempt == 0 {
-                    ctx.output(
-                        "no 'Open Multimango' control visible -- skipping (already pressed, or \
-                         this page state doesn't show the Timer paused dialog)",
-                    );
-                } else {
-                    // Gone after a click: that IS the success signal.
-                    pressed = true;
-                }
+                ctx.output(
+                    "no Multimango button or link visible on the Handshake page -- skipping",
+                );
                 break;
             };
             let (jx, jy) = util::jittered(ctx, x, y);
             ctx.click_at_cursor(jx, jy).await?;
-            ctx.human_pause(1200, 1800).await?;
-            if wait_for_coords(ctx, OPEN_MULTIMANGO_JS, Duration::from_secs(2))
-                .await?
-                .is_none()
-            {
-                pressed = true;
+
+            // Watch for the tab rather than guessing at a fixed sleep.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while tokio::time::Instant::now() < deadline {
+                ctx.guard().await?;
+                let now = ctx.browser.list_targets("multimango.com").await?;
+                if now.iter().any(|id| !mm_before.contains(id)) {
+                    opened = true;
+                    break;
+                }
+                ctx.human_pause(400, 700).await?;
+            }
+            if opened {
                 break;
             }
             ctx.warn(format!(
-                "Open Multimango is still on screen after click {} -- the press probably \
-                 landed on another tab; re-focusing and retrying",
+                "no new multimango tab after click {} -- the press probably landed on another \
+                 tab; re-focusing and retrying",
                 attempt + 1
             ));
             util::focus_and_settle(ctx).await?;
         }
-        if pressed {
-            ctx.output("clicked Open Multimango (its dialog went away)");
-            // Give a tab it may spawn time to register before the cleanup.
-            ctx.human_pause(2500, 4000).await?;
+        if opened {
+            ctx.output("Multimango opened in a new tab -- it gets closed below");
         } else {
             ctx.warn(
-                "couldn't get Open Multimango to respond -- continuing to the tab cleanup; \
-                 press it by hand if Handshake still expects it",
+                "never saw a new multimango tab open -- continuing to the tab cleanup anyway; \
+                 click through to Multimango by hand if Handshake still expects it",
             );
         }
 

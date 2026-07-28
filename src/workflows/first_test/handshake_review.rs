@@ -785,16 +785,40 @@ const BUTTON_BY_TEXT_JS: &str = r#"(function(){
   return { x: br.left + br.width / 2, y: br.top + br.height / 2 };
 })()"#;
 
+/// The control that opens Multimango in a NEW tab. Handshake shows it in two
+/// different shapes depending on page state, and only one exists at a time:
+///
+/// - an explicit `<button>Open Multimango</button>`, which lives in the modal
+///   "Timer paused" dialog (see `Downloads/Handshake AI.html`);
+/// - the inline `<a target="_blank">Multimango</a>` links in the task's
+///   "⚠️ Important" instruction list, which is all that's present in the normal
+///   task state (see `Downloads/HEREIS.html`) -- their href is
+///   `multimango.com/sign-in?email={multimango_credentials}`, an unsubstituted
+///   template, so the tab they open is a throwaway.
+///
+/// The button wins when both are on screen: it's the purpose-built control,
+/// while the links are prose. Either way the click opens a tab that workflow 0
+/// closes again.
 pub(super) const OPEN_MULTIMANGO_JS: &str = r#"(function(){
   var els = document.querySelectorAll('button, a, [role="button"]');
+  var button = null, link = null;
   for (var i = 0; i < els.length; i++) {
-    if ((els[i].textContent || '').trim().toLowerCase() !== 'open multimango') continue;
-    try { els[i].scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
-    var r = els[i].getBoundingClientRect();
+    var el = els[i];
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+    var r = el.getBoundingClientRect();
     if (r.width < 1 || r.height < 1) continue;
-    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    if ((el.textContent || '').trim().toLowerCase() === 'open multimango') { button = el; break; }
+    if (!link && (el.getAttribute('href') || '').toLowerCase().indexOf('multimango.com') !== -1) {
+      link = el;
+    }
   }
-  return null;
+  var best = button || link;
+  if (!best) return null;
+  try { best.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+  var br = best.getBoundingClientRect();
+  if (br.width < 1 || br.height < 1) return null;
+  return { x: br.left + br.width / 2, y: br.top + br.height / 2,
+           kind: button ? 'button' : 'link' };
 })()"#;
 
 /// One wizard step's answer control, matched by `__PATTERN__` (a JS regex
