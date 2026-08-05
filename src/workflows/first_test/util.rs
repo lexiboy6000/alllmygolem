@@ -465,7 +465,21 @@ pub async fn click_until_selected(ctx: &mut WorkflowCtx, find_js: &str) -> Resul
             v.get("y").and_then(Value::as_f64),
         ) {
             (Some(x), Some(y)) => (x, y),
-            _ => return Ok(false),
+            // The control isn't on the page at all, so there is nothing to
+            // click and no coordinates to retry -- the CDP fallback below
+            // can't help, since it only ever re-aims a click that missed.
+            // Said plainly, because "not found" and "clicked but it didn't
+            // take" have completely different causes and the summary line
+            // upstream reads the same for both.
+            _ => {
+                if attempt == 1 {
+                    ctx.output(
+                        "control not found on the page -- nothing to click (this is a selector \
+                         mismatch, not a missed click)",
+                    );
+                }
+                return Ok(false);
+            }
         };
         if v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
             return Ok(true);
@@ -774,22 +788,30 @@ const CLICK_CRITERION_BUTTON_BODY: &str = r#"
     var num = kids[0] ? (kids[0].textContent || '').trim() : '';
     if (num !== NUM) continue;
 
-    var allDivs = row.querySelectorAll('div');
-    for (var g = 0; g < allDivs.length; g++) {
-      var grp = allDivs[g];
-      var kids2 = grp.children;
-      if (kids2.length < 3) continue;
-      if (kids2[0].tagName !== 'SPAN') continue;
-      if ((kids2[0].textContent || '').trim() !== RESP) continue;
-      for (var b = 1; b < kids2.length; b++) {
-        if (kids2[b].tagName === 'BUTTON' && (kids2[b].textContent || '').trim() === WANT) {
-          var e = kids2[b];
-          try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
-          var r = e.getBoundingClientRect();
-          if (r.width < 1 || r.height < 1) return null;
-          return { x: r.left + r.width / 2, y: r.top + r.height / 2,
-                   selected: ((e.className || '').toString().indexOf('bg-background') === -1) };
-        }
+    /* A response's label and its Good/Bad pair sit together, but the shape
+       differs by layout: older rows are one flat group
+       (<span>Response A</span><button>Good</button><button>Bad</button>),
+       while the drawer nests them (<div>Response A</div> plus a separate grid
+       holding the buttons). Anchoring on the label and searching its container
+       covers both, where matching a fixed child count and tag name -- three
+       children starting with a SPAN -- silently matched neither in the drawer. */
+    var OTHER = (RESP === 'Response A') ? 'Response B' : 'Response A';
+    var labels = row.querySelectorAll('span,div');
+    for (var g = 0; g < labels.length; g++) {
+      if ((labels[g].textContent || '').trim() !== RESP) continue;
+      var scope = labels[g].parentElement;
+      if (!scope) continue;
+      /* Never search a container holding BOTH responses -- their buttons read
+         the same, so the wrong response would get the rating. */
+      if ((scope.textContent || '').indexOf(OTHER) !== -1) continue;
+      var btns = scope.querySelectorAll('button');
+      for (var b = 0; b < btns.length; b++) {
+        var e = btns[b];
+        if ((e.textContent || '').trim() !== WANT) continue;
+        try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+        var r = e.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) return null;
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2, selected: isSelected(e) };
       }
     }
     return null;
@@ -824,12 +846,7 @@ const CLICK_OVERALL_BUTTON_BODY: &str = r#"
       try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
       var r = e.getBoundingClientRect();
       if (r.width < 1 || r.height < 1) return null;
-      /* Unlike the criterion buttons, the Overall buttons' CLASSES never
-         change -- the pick is rendered via an inline style: selected gets a
-         background-color (solid comparison color for A/B, muted fill for
-         Tie), unselected has border/text colors only (verified live). */
-      return { x: r.left + r.width / 2, y: r.top + r.height / 2,
-               selected: ((e.getAttribute('style') || '').indexOf('background-color') !== -1) };
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2, selected: isSelected(e) };
     }
   }
   return null;
@@ -2403,6 +2420,19 @@ async fn overall_quality_present(ctx: &WorkflowCtx) -> Result<bool> {
 // match -- and requiring a `.divide-y` list under that header keeps the rail's
 // label from being mistaken for the criteria card itself.
 const FIND_CRITERIA_ROOT_FN: &str = r#"
+/* Whether a rating button is the chosen one. Two idioms are in play and both
+   have to be honoured, because reading selection wrongly is not a cosmetic
+   bug: click_until_selected re-clicks a button it believes didn't take, so a
+   false negative presses an already-correct choice again (which can toggle it
+   back off) and then reports a perfectly good rating as missed.
+     - class-driven (criterion Good/Bad, and the drawer's overall pick): the
+       neutral `bg-background` is swapped for a filled colour when chosen.
+     - style-driven (the older inline overall card): classes never change and
+       the pick shows up as an inline background-color. */
+function isSelected(e){
+  if ((e.getAttribute('style') || '').indexOf('background-color') !== -1) return true;
+  return (e.className || '').toString().indexOf('bg-background') === -1;
+}
 function onScreen(e){
   if (!e || e.getAttribute('aria-hidden') === 'true') return false;
   var r = e.getBoundingClientRect();
