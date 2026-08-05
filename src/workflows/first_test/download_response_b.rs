@@ -1,6 +1,6 @@
 //! Step 5: same as step 4, but for Response B -- including clicking over to
-//! its tab on the newest arena layout. Also creates task1/responseB itself (no
-//! separate directory-creation step was needed for it).
+//! its tab on the newest arena layout. task1/responseB is created by
+//! util::capture_response (no separate directory-creation step was needed).
 
 use crate::prelude::*;
 
@@ -15,7 +15,7 @@ impl Workflow for DownloadResponseB {
     }
 
     fn description(&self) -> &'static str {
-        "Downloads Response B's deliverables (zip, or the newer per-file listing plus its model-response text) into task1/responseB."
+        "Saves Response B into task1/responseB: the inline response page when the task embeds it, otherwise its zip or per-file listing plus the model-response text."
     }
 
     fn dependencies(&self) -> Vec<&'static str> {
@@ -51,24 +51,10 @@ impl Workflow for DownloadResponseB {
 async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
     let dir = util::current_task_dir(ctx)?.join("responseB");
 
-    ctx.step("create responseB directory").await?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| GolemError::Io(format!("mkdir {}: {e}", dir.display())))?;
-
     ctx.step("open the Response B tab").await?;
     util::activate_response_tab(ctx, "Response B").await?;
 
-    ctx.step("find Response B's iframe").await?;
-    let src = util::wait_for_response_iframe_src(ctx, "Response B", Duration::from_secs(15))
-        .await?
-        .ok_or_else(|| {
-            ctx.halt(
-                "couldn't find Response B's iframe (or its src wasn't a usable http(s) URL) \
-                 after waiting 15s. Make sure you're on a loaded task page with Response B \
-                 visible.",
-            )
-        })?;
-
-    ctx.step("download Response B").await?;
-    util::download_response_into(ctx, "Response B", &src, &dir).await
+    // capture_response creates responseB itself, so no separate mkdir step.
+    ctx.step("capture Response B").await?;
+    util::capture_response(ctx, "Response B", &dir).await
 }

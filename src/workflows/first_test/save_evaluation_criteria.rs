@@ -49,9 +49,28 @@ impl Workflow for SaveEvaluationCriteria {
         // On the newest arena layout the criteria live in a slide-over panel
         // that starts collapsed to a rail on the right -- nothing inside it is
         // in the DOM until its icon is clicked. Older layouts render the list
-        // inline and this is a no-op.
+        // inline, where this reports "open" immediately with nothing clicked.
+        //
+        // Retried, because this step can begin while the SPA is still
+        // painting: a single look that finds neither the panel nor its rail
+        // would otherwise leave the panel shut, and the criteria wait below
+        // does not open it, so the step would sit out its whole timeout and
+        // halt on a page that was merely a beat late.
         ctx.step("open the evaluation criteria panel").await?;
-        util::ensure_criteria_panel_open(ctx).await?;
+        let mut panel_ready = false;
+        for _ in 0..5 {
+            if util::ensure_criteria_panel_open(ctx).await? {
+                panel_ready = true;
+                break;
+            }
+            ctx.human_pause(400, 900).await?;
+        }
+        if !panel_ready {
+            ctx.warn(
+                "couldn't open the evaluation criteria panel -- looking for the criteria on the \
+                 page as-is",
+            );
+        }
 
         ctx.step("read evaluation criteria").await?;
         let path = dir.join("questions");

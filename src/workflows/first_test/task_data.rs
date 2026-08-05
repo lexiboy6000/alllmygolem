@@ -6,8 +6,9 @@
 //!
 //! The newest arena layout has no downloadable task data at all: the task is
 //! stated as prose in the "User request" card, and that sentence IS the task
-//! data. `util::task_data_text` reads it from there and the download step
-//! finds nothing to fetch, which is a skip rather than a failure.
+//! data. `util::task_data_text` reads it from there, and the download step
+//! recognises a rendered brief holding no link and no button as "nothing to
+//! fetch" and returns at once instead of sitting out its whole timeout.
 
 use crate::prelude::*;
 

@@ -1,16 +1,23 @@
-//! Step 4: download Response A's deliverables into task1/responseA -- the
-//! all_files.zip on the older layout, the individual files plus the
-//! model-response text on the delivered-files listing (which has no zip), or
-//! the rendered page itself on the newest arena layout, where the response is
-//! an app shown in a tab and there is nothing to unpack. See
-//! util::response_iframe_src for why this reads the iframe's src instead of
-//! clicking the copy-link buttons (they live inside a cross-origin iframe
-//! Golem's JS can't reach), and util::download_response_into for how the
-//! layouts are told apart.
+//! Step 4: capture Response A into task1/responseA. What that means depends on
+//! how the page carries the response (util::capture_response tells them apart):
+//!
+//! - newest arena layout: the response is INLINE, written into its iframe's
+//!   `srcdoc` attribute. Nothing is downloaded -- there is no per-response
+//!   host, no zip and no file listing -- the document is read straight off the
+//!   parent's DOM and saved as response.html.
+//! - hosted layouts: the iframe's `src` points at the response's own host, and
+//!   util::download_response_into sorts out the all_files.zip, the
+//!   delivered-files listing (individual files plus the model-response text),
+//!   or a plain rendered page.
+//!
+//! See util::response_srcdoc / util::response_iframe_src for why both are read
+//! as attributes rather than by reaching into the iframe: on the hosted layout
+//! it is cross-origin, and on the inline layout it is sandboxed without
+//! allow-same-origin, so its document is unreachable either way.
 //!
 //! On the newest layout the two responses share one pane behind a tab strip,
 //! so the Response A tab is clicked first -- that is how a person brings it on
-//! screen, and it makes sure the iframe has actually loaded.
+//! screen, and it makes sure the iframe has actually rendered.
 
 use crate::prelude::*;
 
@@ -25,7 +32,7 @@ impl Workflow for DownloadResponseA {
     }
 
     fn description(&self) -> &'static str {
-        "Downloads Response A's deliverables (zip, or the newer per-file listing plus its model-response text) into task1/responseA."
+        "Saves Response A into task1/responseA: the inline response page when the task embeds it, otherwise its zip or per-file listing plus the model-response text."
     }
 
     fn dependencies(&self) -> Vec<&'static str> {
@@ -67,17 +74,6 @@ async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
     ctx.step("open the Response A tab").await?;
     util::activate_response_tab(ctx, "Response A").await?;
 
-    ctx.step("find Response A's iframe").await?;
-    let src = util::wait_for_response_iframe_src(ctx, "Response A", Duration::from_secs(15))
-        .await?
-        .ok_or_else(|| {
-            ctx.halt(
-                "couldn't find Response A's iframe (or its src wasn't a usable http(s) URL) \
-                 after waiting 15s. Make sure you're on a loaded task page with Response A \
-                 visible.",
-            )
-        })?;
-
-    ctx.step("download Response A").await?;
-    util::download_response_into(ctx, "Response A", &src, &dir).await
+    ctx.step("capture Response A").await?;
+    util::capture_response(ctx, "Response A", &dir).await
 }

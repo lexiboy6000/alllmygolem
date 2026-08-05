@@ -908,7 +908,13 @@ const FIND_SKIP_JS: &str = r#"(function(){
 const TASK_IDENTITY_JS: &str = r#"(function(){
   var parts = [];
   var ifr = document.querySelectorAll('iframe');
-  for (var i = 0; i < ifr.length; i++) parts.push(ifr[i].getAttribute('src') || '');
+  for (var i = 0; i < ifr.length; i++) {
+    /* Hosted layouts differ by src; the inline layout has no src at all, so
+       fingerprint those by their srcdoc instead (length + head, to keep this
+       cheap on responses that run to kilobytes). */
+    var doc = ifr[i].getAttribute('srcdoc') || '';
+    parts.push((ifr[i].getAttribute('src') || '') + '#' + doc.length + ':' + doc.slice(0, 120));
+  }
   var prose = document.querySelectorAll('div.prose.prose-sm.max-w-none');
   for (var j = 0; j < prose.length; j++) parts.push((prose[j].innerText || '').slice(0, 500));
   return parts.join('|');
@@ -2081,6 +2087,98 @@ pub async fn response_iframe_src(ctx: &WorkflowCtx, label: &str) -> Result<Optio
     Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
 }
 
+/// The named response's inlined HTML, when the task page embeds each response
+/// as a `srcdoc` iframe instead of pointing at a per-response host.
+///
+/// On this layout there is genuinely nothing to download: no per-response
+/// origin, no `all_files.zip`, no delivered-files listing. The response's whole
+/// document is written into the iframe element's `srcdoc` attribute, which is
+/// ordinary parent-page DOM and reads straight out. (Its *contents* still
+/// can't be reached through `contentDocument` -- the iframe is sandboxed
+/// WITHOUT `allow-same-origin`, so it gets an opaque origin -- but an
+/// attribute on the element itself was never subject to that.)
+pub async fn response_srcdoc(ctx: &WorkflowCtx, label: &str) -> Result<Option<String>> {
+    let js = FIND_RESPONSE_SRCDOC_JS.replace("__LABEL__", &js_str(label));
+    let v = ctx.eval(&js).await?;
+    Ok(v.as_str()
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty()))
+}
+
+/// Where a response's content actually lives, which differs by layout.
+pub enum ResponseSource {
+    /// The response is inlined in the page as a `srcdoc` iframe -- the HTML
+    /// itself, already in hand, with nothing to fetch.
+    Inline(String),
+    /// The response is served from its own host; the iframe's `src` is the
+    /// page to start from (zip, delivered-files listing, or the page itself).
+    Url(String),
+}
+
+/// Poll until the named response's content can be located, either inlined as
+/// `srcdoc` or as a fetchable `src`. Same SPA-render race as the other waits,
+/// so it rides out a slow first paint rather than failing instantly.
+pub async fn wait_for_response_source(
+    ctx: &WorkflowCtx,
+    label: &str,
+    timeout: Duration,
+) -> Result<Option<ResponseSource>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        ctx.guard().await?;
+        if let Some(html) = response_srcdoc(ctx, label).await? {
+            return Ok(Some(ResponseSource::Inline(html)));
+        }
+        if let Some(url) = response_iframe_src(ctx, label).await? {
+            return Ok(Some(ResponseSource::Url(url)));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        ctx.human_pause(250, 400).await?;
+    }
+}
+
+/// Save the named response into `dir`, whichever way the page exposes it.
+///
+/// The inline (`srcdoc`) layout writes the response document straight to
+/// `response.html` -- that IS the deliverable, and nothing is downloaded. The
+/// hosted layout hands off to [`download_response_into`], which sorts out the
+/// zip / delivered-files / rendered-page cases from the page itself.
+pub async fn capture_response(
+    ctx: &mut WorkflowCtx,
+    label: &str,
+    dir: &std::path::Path,
+) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| GolemError::Io(format!("mkdir {}: {e}", dir.display())))?;
+
+    let source = wait_for_response_source(ctx, label, Duration::from_secs(15))
+        .await?
+        .ok_or_else(|| {
+            ctx.halt(format!(
+                "couldn't find {label}'s iframe after waiting 15s -- it had neither inline \
+                 srcdoc content nor a usable http(s) src. Make sure you're on a loaded task \
+                 page with {label} present."
+            ))
+        })?;
+
+    match source {
+        ResponseSource::Inline(html) => {
+            let path = dir.join("response.html");
+            std::fs::write(&path, &html)
+                .map_err(|e| GolemError::Io(format!("write {}: {e}", path.display())))?;
+            ctx.output(format!(
+                "{label} is inlined in the page ({} bytes) -- nothing to download; saved -> {}",
+                html.len(),
+                path.display()
+            ));
+            Ok(())
+        }
+        ResponseSource::Url(src) => download_response_into(ctx, label, &src, dir).await,
+    }
+}
+
 /// Bring the named response ("Response A" / "Response B") on screen on the
 /// newest arena layout, where the two responses share one pane behind a tab
 /// strip (`[role=tab]` "Response A" / "Response B" over
@@ -2104,8 +2202,8 @@ pub async fn activate_response_tab(ctx: &mut WorkflowCtx, label: &str) -> Result
         ctx.human_pause(600, 1400).await?;
     } else {
         ctx.warn(format!(
-            "couldn't select the {label} tab -- reading its panel anyway (the iframe src is \
-             readable while the panel is hidden)"
+            "couldn't select the {label} tab -- reading its panel anyway (both the srcdoc and \
+             the src are readable while the panel is hidden)"
         ));
     }
     Ok(())
@@ -2134,6 +2232,12 @@ pub async fn wait_for_task_data_download(
         if let Some(url) = task_data_file_browser_url(ctx).await? {
             return Ok(Some(TaskDataSource::FileBrowserPage(url)));
         }
+        // A rendered "User request" brief with no link and no button in it has
+        // nothing to download and never will -- don't sit out the full timeout
+        // on every task just to conclude that.
+        if task_data_has_no_download(ctx).await? {
+            return Ok(None);
+        }
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);
         }
@@ -2141,24 +2245,12 @@ pub async fn wait_for_task_data_download(
     }
 }
 
-/// Same idea as [`wait_for_task_data_download`]'s polling, for a response's
-/// iframe src.
-pub async fn wait_for_response_iframe_src(
-    ctx: &WorkflowCtx,
-    label: &str,
-    timeout: Duration,
-) -> Result<Option<String>> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        ctx.guard().await?;
-        if let Some(url) = response_iframe_src(ctx, label).await? {
-            return Ok(Some(url));
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(None);
-        }
-        ctx.human_pause(250, 400).await?;
-    }
+/// Whether the page is the inline-brief layout, already rendered, with no
+/// download control of any kind -- i.e. this task has no downloadable data.
+/// Requires non-empty text so a not-yet-rendered block isn't mistaken for one.
+pub async fn task_data_has_no_download(ctx: &WorkflowCtx) -> Result<bool> {
+    let v = ctx.eval(&task_block_js(TASK_DATA_NO_DOWNLOAD_BODY)).await?;
+    Ok(v.as_bool().unwrap_or(false))
 }
 
 /// The Evaluation Criteria list, one line per criterion ("1. <text>",
@@ -2485,6 +2577,20 @@ const TASK_DATA_FILE_BROWSER_URL_BODY: &str = r#"
   } catch (e) { return null; }
 "#;
 
+// True only for a rendered request brief holding no anchor and no button --
+// the layout where the task is stated as prose and there is nothing to fetch.
+// Anything else (any control at all, or an empty/unrendered block) returns
+// false so the caller keeps polling.
+const TASK_DATA_NO_DOWNLOAD_BODY: &str = r#"
+  var found = findTaskBlock();
+  if (!found || !found.brief) return false;
+  var box = found.box;
+  if (!(box.innerText || box.textContent || '').trim()) return false;
+  if (box.querySelector('a[href]')) return false;
+  if (box.querySelector('button')) return false;
+  return true;
+"#;
+
 // The block's visible text, minus the archive viewer's file tree when one is
 // present -- that subtree is just a listing of the files the download itself
 // contains ("Input Data Files ... input_0.jpg 26.3 KB ..."), noise in the
@@ -2505,6 +2611,20 @@ const TASK_DATA_TEXT_BODY: &str = r#"
   }
   return parts.join('\n');
 "#;
+
+// A response inlined into the page as a `srcdoc` iframe. Read as an attribute
+// off the parent's own DOM, so the iframe's opaque sandbox origin is no
+// obstacle -- see `response_srcdoc`.
+const FIND_RESPONSE_SRCDOC_JS: &str = r#"(function(){
+  var LABEL = __LABEL__;
+  var iframes = document.querySelectorAll('iframe');
+  for (var i = 0; i < iframes.length; i++) {
+    if ((iframes[i].getAttribute('title') || '') !== LABEL) continue;
+    var doc = iframes[i].getAttribute('srcdoc');
+    if (doc && doc.trim()) return doc;
+  }
+  return null;
+})()"#;
 
 // The tab that reveals a response on the newest arena layout. `selected` reads
 // the tab's own `aria-selected`, so `click_until_selected` verifies the switch
