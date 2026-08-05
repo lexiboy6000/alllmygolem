@@ -156,9 +156,41 @@ impl Workflow for HandshakeReviewAndSubmit {
         // ---- select the arena task type ---------------------------------
         ctx.step("select the task type on Handshake").await?;
         between_clicks(ctx).await?;
-        if answer_wizard_step(ctx, &regex_escape(&arena_id)).await? {
+        // Try the multimango slug verbatim first -- when both sides agree,
+        // which is the common case, this is the whole story.
+        let mut selected = answer_wizard_step(ctx, &regex_escape(&arena_id)).await?;
+        if selected {
             ctx.output(format!("selected task type: {arena_id}"));
         } else {
+            // They didn't agree. Handshake labels the same job with a
+            // different id group often enough that failing here would stall
+            // the unattended loop, so decide from what is actually on offer.
+            let options = wizard_option_texts(ctx).await?;
+            match pick_task_type_option(&arena_id, &options) {
+                Some(pick) => {
+                    if !pick.exact {
+                        ctx.warn(format!(
+                            "the multimango task is '{arena_id}' but Handshake offers '{}' -- \
+                             taking it as the same task type",
+                            pick.text
+                        ));
+                    }
+                    selected = answer_wizard_step(ctx, &regex_escape(&pick.text)).await?;
+                    if selected {
+                        ctx.output(format!("selected task type: {}", pick.text));
+                    }
+                }
+                None => ctx.warn(format!(
+                    "no task-type option matches '{arena_id}'; offered: {}",
+                    if options.is_empty() {
+                        "(none found)".to_string()
+                    } else {
+                        options.join(", ")
+                    }
+                )),
+            }
+        }
+        if !selected {
             dump_buttons(ctx).await;
             // Hand it to the human instead of halting: they select + send it
             // on the page, dismiss the message, and the pipeline continues.
@@ -613,6 +645,86 @@ pub(super) async fn wait_for_coords(
 }
 
 /// Escape a literal string for embedding in a JS regex source.
+/// The task-type options the wizard is currently offering. An unreadable or
+/// unparseable result is reported as "none on offer" rather than failing the
+/// step: the caller's next move either way is to hand over to a human.
+async fn wizard_option_texts(ctx: &WorkflowCtx) -> Result<Vec<String>> {
+    let v = ctx.eval(WIZARD_OPTIONS_JS).await?;
+    Ok(v.as_str()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default())
+}
+
+/// The stable part of an arena task slug, with the platform's leading id
+/// groups dropped.
+///
+/// Handshake's option and multimango's URL name the same job, but not always
+/// with the same number of id groups in front:
+/// `vs-1781035041-260608-multimodal-agent-arena` and
+/// `vs-1785279484-multimodal-agent-arena-review` both reduce to the part that
+/// actually says what the task IS. The trailing words are kept, because
+/// `...-arena` and `...-arena-review` are genuinely different task types and
+/// must never be treated as interchangeable.
+fn arena_core(slug: &str) -> String {
+    let mut rest = slug.trim().to_ascii_lowercase();
+    if let Some(r) = rest.strip_prefix("vs-") {
+        rest = r.to_string();
+    }
+    // Drop leading all-digit groups ("1781035041-", "260608-", ...).
+    while let Some((head, tail)) = rest.split_once('-') {
+        if head.is_empty() || !head.chars().all(|c| c.is_ascii_digit()) {
+            break;
+        }
+        rest = tail.to_string();
+    }
+    rest
+}
+
+/// Which Handshake task-type option corresponds to `arena_id` (the slug taken
+/// from the multimango URL), given the options actually on offer.
+///
+/// The exact-match path is the common one. The fallbacks exist because the two
+/// sides' ids drift: matching on [`arena_core`] absorbs a differing id group
+/// while still keeping `-review` distinct from plain `-arena`. Anything less
+/// certain than that returns `None` so a human picks -- choosing the wrong
+/// option here misreports which work was done, which is worse than pausing.
+fn pick_task_type_option(arena_id: &str, options: &[String]) -> Option<TaskTypePick> {
+    let want = arena_id.trim().to_ascii_lowercase();
+    if let Some(o) = options.iter().find(|o| o.trim().to_ascii_lowercase() == want) {
+        return Some(TaskTypePick { text: o.clone(), exact: true });
+    }
+
+    let core = arena_core(arena_id);
+    if !core.is_empty() {
+        let mut same_core = options.iter().filter(|o| arena_core(o) == core);
+        if let Some(first) = same_core.next()
+            && same_core.next().is_none()
+        {
+            return Some(TaskTypePick { text: first.clone(), exact: false });
+        }
+    }
+
+    // Last resort: exactly one option is an arena task at all. The ids on both
+    // sides have already failed to line up, but with a single candidate there
+    // is nothing else it could be. Reported as inexact so the log says so.
+    let mut arena_ish = options
+        .iter()
+        .filter(|o| o.to_ascii_lowercase().contains("agent-arena"));
+    if let Some(first) = arena_ish.next()
+        && arena_ish.next().is_none()
+    {
+        return Some(TaskTypePick { text: first.clone(), exact: false });
+    }
+    None
+}
+
+/// A chosen task-type option, and whether it matched the multimango slug
+/// outright (`exact`) or had to be inferred.
+struct TaskTypePick {
+    text: String,
+    exact: bool,
+}
+
 fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -901,6 +1013,47 @@ const TIMER_READ_JS: &str = r#"(function(){
 })()"#;
 
 /// Every visible button's text, for diagnostics when a finder misses.
+// The task-type options the wizard is currently offering, as a JSON array of
+// their texts.
+//
+// Scans the same element set as `WIZARD_ANSWER_JS`, because the options are
+// NOT buttons on the current page -- they are plain `<div>`s under a "select
+// the task type" prompt (an older variant used aria-pressed toggles). Only
+// slug-shaped candidates are kept, so the wizard's ordinary chrome (Continue,
+// Send, nav) can't be mistaken for a task type, and already-sent bubbles (the
+// right-aligned `items-end` column) are skipped: those are answers, not
+// choices. Wrapper elements are skipped in favour of the innermost element
+// carrying the text, so one option is reported once rather than once per
+// ancestor.
+const WIZARD_OPTIONS_JS: &str = r#"(function(){
+  var out = [];
+  var seen = {};
+  var els = document.querySelectorAll('div, span, button, [role="button"], a');
+  for (var i = 0; i < els.length; i++) {
+    var e = els[i];
+    if (e.closest('[class*="items-end"]')) continue;
+    var t = (e.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 120) continue;
+    if (!/^vs-/i.test(t) && !/agent-arena/i.test(t)) continue;
+    var r = e.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    if (seen[t]) continue;
+    /* Take only the element the text actually sits in. Any ancestor also
+       "contains" it -- including ones that lump both options together, or
+       pair the prompt with an already-sent answer -- and those read as
+       options that do not exist. */
+    var kids = e.querySelectorAll('*');
+    var wrapper = false;
+    for (var k = 0; k < kids.length; k++) {
+      if ((kids[k].textContent || '').trim()) { wrapper = true; break; }
+    }
+    if (wrapper) continue;
+    seen[t] = 1;
+    out.push(t);
+  }
+  return JSON.stringify(out);
+})()"#;
+
 const DUMP_BUTTONS_JS: &str = r#"(function(){
   var btns = document.querySelectorAll('button, [role="button"]');
   var out = [];
@@ -912,3 +1065,77 @@ const DUMP_BUTTONS_JS: &str = r#"(function(){
   }
   return out.join(' | ');
 })()"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both slug shapes seen in the wild, taken from real saved pages: the
+    /// older task carries two id groups, the newer review task one.
+    const OLD: &str = "vs-1781035041-260608-multimodal-agent-arena";
+    const NEW: &str = "vs-1785279484-multimodal-agent-arena-review";
+
+    #[test]
+    fn arena_id_comes_from_the_task_url() {
+        assert_eq!(
+            arena_id_from_url(&format!("https://www.multimango.com/tasks/{NEW}")).as_deref(),
+            Some(NEW)
+        );
+        // query strings and trailing paths are not part of the id
+        assert_eq!(
+            arena_id_from_url(&format!("https://www.multimango.com/tasks/{OLD}?x=1")).as_deref(),
+            Some(OLD)
+        );
+        assert_eq!(arena_id_from_url("https://www.multimango.com/"), None);
+    }
+
+    #[test]
+    fn core_drops_leading_id_groups_but_keeps_the_name() {
+        assert_eq!(arena_core(OLD), "multimodal-agent-arena");
+        assert_eq!(arena_core(NEW), "multimodal-agent-arena-review");
+        // however many id groups the platform prefixes, the name survives
+        assert_eq!(arena_core("vs-1-2-3-multimodal-agent-arena"), "multimodal-agent-arena");
+    }
+
+    #[test]
+    fn exact_option_wins() {
+        let opts = vec![OLD.to_string(), NEW.to_string()];
+        let pick = pick_task_type_option(NEW, &opts).expect("exact match");
+        assert_eq!(pick.text, NEW);
+        assert!(pick.exact);
+    }
+
+    #[test]
+    fn a_differing_id_group_still_matches_the_same_task_type() {
+        // same job, different id on the Handshake side
+        let opts = vec!["vs-999-260608-multimodal-agent-arena-review".to_string()];
+        let pick = pick_task_type_option(NEW, &opts).expect("core match");
+        assert_eq!(pick.text, opts[0]);
+        assert!(!pick.exact, "an inferred match must not report as exact");
+    }
+
+    #[test]
+    fn review_and_plain_arena_are_never_interchanged() {
+        // Only these two on offer, neither sharing NEW's core: the sole-arena
+        // fallback must not fire either, because there are two candidates.
+        let opts = vec![OLD.to_string(), "vs-5-multimodal-agent-arena".to_string()];
+        assert!(
+            pick_task_type_option(NEW, &opts).is_none(),
+            "must not guess between two different arena task types"
+        );
+    }
+
+    #[test]
+    fn a_single_arena_option_is_taken_when_ids_dont_line_up() {
+        let opts = vec!["Continue".to_string(), OLD.to_string()];
+        let pick = pick_task_type_option(NEW, &opts).expect("sole arena option");
+        assert_eq!(pick.text, OLD);
+        assert!(!pick.exact);
+    }
+
+    #[test]
+    fn nothing_arena_shaped_means_no_pick() {
+        let opts = vec!["Continue".to_string(), "Submit task".to_string()];
+        assert!(pick_task_type_option(NEW, &opts).is_none());
+    }
+}
