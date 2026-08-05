@@ -1,5 +1,6 @@
-//! Step 5: same as step 4, but for Response B. Also creates task1/responseB
-//! itself (no separate directory-creation step was needed for it).
+//! Step 5: same as step 4, but for Response B -- including clicking over to
+//! its tab on the newest arena layout. Also creates task1/responseB itself (no
+//! separate directory-creation step was needed for it).
 
 use crate::prelude::*;
 
@@ -53,6 +54,9 @@ async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
     ctx.step("create responseB directory").await?;
     std::fs::create_dir_all(&dir)
         .map_err(|e| GolemError::Io(format!("mkdir {}: {e}", dir.display())))?;
+
+    ctx.step("open the Response B tab").await?;
+    util::activate_response_tab(ctx, "Response B").await?;
 
     ctx.step("find Response B's iframe").await?;
     let src = util::wait_for_response_iframe_src(ctx, "Response B", Duration::from_secs(15))

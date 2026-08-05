@@ -261,8 +261,10 @@ impl Workflow for HandshakeReviewAndSubmit {
         if !util::click_submit_if_enabled(ctx).await? {
             return Err(util::halt_now(
                 ctx,
-                "the multimango Submit button wasn't found or never enabled -- \
-                 submit by hand, then continue on the Handshake side manually.",
+                "the multimango submit control wasn't found or never enabled (\"Save & \
+                 Continue\" inside the evaluation-criteria panel on the newest layout, or \
+                 Submit next to Skip on older ones) -- submit by hand, then continue on the \
+                 Handshake side manually.",
             )
             .await);
         }

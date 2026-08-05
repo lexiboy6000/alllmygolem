@@ -241,6 +241,9 @@ pub async fn apply_answers(
     // The clicks drive the real OS cursor, so the task page has to actually
     // be the visible tab -- a native click lands on whatever is on screen.
     focus_and_settle(ctx).await?;
+    // On the newest arena layout every rating control is inside the slide-over
+    // panel, so there is nothing to click until it is open.
+    ensure_criteria_panel_open(ctx).await?;
     let mut applied = 0usize;
     let mut missed: Vec<String> = Vec::new();
     // Long-break pacing: selections left before the next ~2-minute break.
@@ -380,13 +383,16 @@ pub async fn verify_answers_applied(
     ctx: &mut WorkflowCtx,
     answers: &ClaudeAnswers,
 ) -> Result<Vec<String>> {
+    // The selections are only readable while the rating panel is open -- a
+    // closed one would report every answer as missing.
+    ensure_criteria_panel_open(ctx).await?;
     let mut wrong = Vec::new();
     for a in &answers.criteria {
         for (label, want) in [
             ("Response A", a.response_a.as_str()),
             ("Response B", a.response_b.as_str()),
         ] {
-            let js = CLICK_CRITERION_BUTTON_JS
+            let js = criteria_js(CLICK_CRITERION_BUTTON_BODY)
                 .replace("__NUM__", &js_str(&format!("{}.", a.number)))
                 .replace("__RESP__", &js_str(label))
                 .replace("__WANT__", &js_str(want));
@@ -396,7 +402,7 @@ pub async fn verify_answers_applied(
             }
         }
     }
-    let js = CLICK_OVERALL_BUTTON_JS.replace("__WANT__", &js_str(&answers.overall.winner));
+    let js = criteria_js(CLICK_OVERALL_BUTTON_BODY).replace("__WANT__", &js_str(&answers.overall.winner));
     let v = ctx.eval(&js).await?;
     if !v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
         wrong.push(format!("overall -> {}", answers.overall.winner));
@@ -420,7 +426,7 @@ pub async fn click_criterion_button(
     response_label: &str,
     want: &str,
 ) -> Result<bool> {
-    let js = CLICK_CRITERION_BUTTON_JS
+    let js = criteria_js(CLICK_CRITERION_BUTTON_BODY)
         .replace("__NUM__", &js_str(&format!("{number}.")))
         .replace("__RESP__", &js_str(response_label))
         .replace("__WANT__", &js_str(want));
@@ -430,7 +436,7 @@ pub async fn click_criterion_button(
 /// Find and click the Overall Quality button matching `want` ("Response A",
 /// "Response B", or "Tie"), in the card headed by an `<h3>Overall Quality</h3>`.
 pub async fn click_overall_button(ctx: &mut WorkflowCtx, want: &str) -> Result<bool> {
-    let js = CLICK_OVERALL_BUTTON_JS.replace("__WANT__", &js_str(want));
+    let js = criteria_js(CLICK_OVERALL_BUTTON_BODY).replace("__WANT__", &js_str(want));
     click_until_selected(ctx, &js).await
 }
 
@@ -496,6 +502,9 @@ pub async fn click_until_selected(ctx: &mut WorkflowCtx, find_js: &str) -> Resul
 /// double-submit risk: a click that actually submitted removes the button,
 /// which ends the loop before another press.
 pub async fn click_submit_if_enabled(ctx: &mut WorkflowCtx) -> Result<bool> {
+    // Newest arena layout: submit is the "Save & Continue" button inside the
+    // rating panel, so it does not exist to be found until that is open.
+    ensure_criteria_panel_open(ctx).await?;
     click_submit_with(ctx, FIND_SUBMIT_JS).await
 }
 
@@ -705,6 +714,9 @@ laid out in the current directory:\n\
 (\"1. ...\", \"2. ...\", etc.)\n\
 - responseA/ -- Response A's submitted files (read every file, especially the HTML deliverable)\n\
 - responseB/ -- Response B's submitted files (read every file, especially the HTML deliverable)\n\
+- responseA/response.html and responseB/response.html -- when present, that response WAS a \
+single rendered page (the app shown in the task's Response tab), and it is the whole \
+deliverable: judge the response from it\n\
 - responseA/model_response.txt and responseB/model_response.txt -- when present, the chat text \
 that response's model wrote alongside its files; it is PART OF that response (not a task input \
 or a deliverable file), so judge it as the response's accompanying message\n\n\
@@ -744,19 +756,14 @@ per-criterion ratings: write \"criteria\": [] and judge only the overall pick. \
 Output ONLY that file -- do not print the JSON to stdout, do not add commentary elsewhere. Be \
 strict and specific in your judgment.";
 
-const CLICK_CRITERION_BUTTON_JS: &str = r#"(function(){
+const CLICK_CRITERION_BUTTON_BODY: &str = r#"
   var NUM = __NUM__;
   var RESP = __RESP__;
   var WANT = __WANT__;
 
-  var spans = document.querySelectorAll('span');
-  var header = null;
-  for (var i = 0; i < spans.length; i++) {
-    if ((spans[i].textContent || '').trim() === 'Evaluation Criteria') { header = spans[i]; break; }
-  }
-  if (!header) return null;
-  var card = header.closest('[class*="rounded-lg"]') || header.parentElement;
-  var list = card ? card.querySelector('.divide-y') : null;
+  var root = findCriteriaRoot();
+  if (!root) return null;
+  var list = root.querySelector('.divide-y');
   if (!list) return null;
 
   var rows = list.children;
@@ -788,21 +795,31 @@ const CLICK_CRITERION_BUTTON_JS: &str = r#"(function(){
     return null;
   }
   return null;
-})()"#;
+"#;
 
-const CLICK_OVERALL_BUTTON_JS: &str = r#"(function(){
+const CLICK_OVERALL_BUTTON_BODY: &str = r#"
   var WANT = __WANT__;
-  var h3s = document.querySelectorAll('h3');
-  var header = null;
-  for (var i = 0; i < h3s.length; i++) {
-    if ((h3s[i].textContent || '').trim() === 'Overall Quality') { header = h3s[i]; break; }
+  var card = null;
+  var heads = document.querySelectorAll('h2,h3,h4,span,div');
+  for (var i = 0; i < heads.length; i++) {
+    /* Headed "Overall Quality" on some task variants, plain "Overall" on
+       others -- accept either. */
+    if (!/^overall(\s*quality)?$/i.test((heads[i].textContent || '').trim())) continue;
+    card = heads[i].closest('[class*="rounded-lg"]') || heads[i].parentElement;
+    if (card) break;
   }
-  if (!header) return null;
-  var card = header.closest('[class*="rounded-lg"]') || header.parentElement;
+  /* Newest arena layout: the overall pick moved into the rating drawer, which
+     may head it differently (or not at all). Fall back to the drawer itself --
+     inside it, a plain <button> reading exactly "Response A"/"Response B"/"Tie"
+     is the overall pick: the per-criterion buttons read Good/Bad, their
+     "Response A"/"Response B" labels are <span>s, and the pane's compare tabs
+     are excluded by their role. */
+  if (!card) card = findCriteriaRoot();
   if (!card) return null;
   var btns = card.querySelectorAll('button');
   for (var j = 0; j < btns.length; j++) {
-    if ((btns[j].textContent || '').trim() === WANT) {
+    if (btns[j].getAttribute('role') === 'tab') continue;
+    if ((btns[j].textContent || '').replace(/\s+/g, ' ').trim() === WANT) {
       var e = btns[j];
       try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
       var r = e.getBoundingClientRect();
@@ -816,24 +833,47 @@ const CLICK_OVERALL_BUTTON_JS: &str = r#"(function(){
     }
   }
   return null;
-})()"#;
+"#;
 
+// The multimango submit control, in the two forms the site ships it.
+//
+// Newest arena layout: it sits INSIDE the evaluation-criteria drawer and reads
+// "Save & Continue" -- there is no "Submit task" button and no Skip beside it
+// to anchor on, so it is matched by its own text (`&` or "and", any spacing).
+// Callers open the drawer first (`ensure_criteria_panel_open`), otherwise the
+// button does not exist in the DOM to be found.
+//
+// Older layout: an unlabelled-by-text Submit sitting next to the page's "Skip"
+// button, found by that adjacency exactly as before.
 const FIND_SUBMIT_JS: &str = r#"(function(){
+  function usable(b){
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+    try { b.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+    var r = b.getBoundingClientRect();
+    return r.width >= 1 && r.height >= 1;
+  }
+  function at(b){
+    var r = b.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
   var btns = document.querySelectorAll('button');
-  var skip = null;
   for (var i = 0; i < btns.length; i++) {
-    if ((btns[i].textContent || '').trim().indexOf('Skip') !== -1) { skip = btns[i]; break; }
+    var t = (btns[i].textContent || '').replace(/\s+/g, ' ').trim();
+    if (!/^save\s*(&|and)\s*continue$/i.test(t)) continue;
+    if (!usable(btns[i])) continue;
+    return at(btns[i]);
+  }
+  var skip = null;
+  for (var j = 0; j < btns.length; j++) {
+    if ((btns[j].textContent || '').trim().indexOf('Skip') !== -1) { skip = btns[j]; break; }
   }
   if (!skip || !skip.parentElement) return null;
   var siblings = skip.parentElement.querySelectorAll('button');
-  for (var j = 0; j < siblings.length; j++) {
-    var b = siblings[j];
+  for (var k = 0; k < siblings.length; k++) {
+    var b = siblings[k];
     if (b === skip) continue;
-    if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
-    try { b.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
-    var r = b.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) continue;
-    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    if (!usable(b)) continue;
+    return at(b);
   }
   return null;
 })()"#;
@@ -1348,7 +1388,7 @@ fn list_entries(
 
 /// Finds the Task Data block's download control -- an `<a href>` link (older
 /// layouts) or the archive-viewer's `<button>Download</button>` (newer
-/// layout, see the block-finder comment above `TASK_DATA_ZIP_URL_JS`) -- and
+/// layout, see the block-finder comment above `FIND_TASK_BLOCK_FN`) -- and
 /// returns its clickable centre `{x, y}`, for use with
 /// `click_and_wait_for_download`.
 ///
@@ -1607,9 +1647,8 @@ pub async fn download_response_into(
         GolemError::Other(format!("{label}'s iframe src isn't a usable URL: {iframe_src}"))
     })?;
 
-    let listing = match fetch_page_html(ctx, iframe_src, dest_dir, ".response_page.html").await {
-        Ok(html) if response_page_is_file_listing(&html) => Some(html),
-        Ok(_) => None,
+    let page_html = match fetch_page_html(ctx, iframe_src, dest_dir, ".response_page.html").await {
+        Ok(html) => Some(html),
         Err(e) => {
             ctx.warn(format!(
                 "couldn't peek at {label}'s page ({e}) -- assuming the zip layout"
@@ -1618,13 +1657,39 @@ pub async fn download_response_into(
         }
     };
 
-    let Some(html) = listing else {
-        let zip_url = format!("{origin}/all_files.zip");
-        ctx.output(format!("{label} zip: {zip_url}"));
-        let zip_path = download_into(ctx, &zip_url, dest_dir, "all_files.zip").await?;
-        unzip_and_cleanup(ctx, &zip_path, dest_dir).await?;
-        ctx.output(format!("unzipped {label} into {}", dest_dir.display()));
-        return Ok(());
+    let html = match page_html {
+        Some(html) if response_page_is_file_listing(&html) => html,
+        page => {
+            let zip_url = format!("{origin}/all_files.zip");
+            ctx.output(format!("{label} zip: {zip_url}"));
+            match download_into(ctx, &zip_url, dest_dir, "all_files.zip").await {
+                Ok(zip_path) => {
+                    unzip_and_cleanup(ctx, &zip_path, dest_dir).await?;
+                    ctx.output(format!("unzipped {label} into {}", dest_dir.display()));
+                }
+                // Newest arena layout: the response IS the page rendered in the
+                // iframe -- an interactive app, with no zip and no delivered-files
+                // listing behind it. A 404 here is therefore NOT the "site can't
+                // serve this task's deliverables" case that `fetch`'s caller
+                // skips the task over; it just means this response has nothing to
+                // unpack. Save the page itself, which is what a person judges and
+                // what step 7 hands to Claude.
+                Err(e) if is_missing_file_error(&e) => {
+                    let Some(html) = page else { return Err(e) };
+                    let path = dest_dir.join("response.html");
+                    std::fs::write(&path, &html)
+                        .map_err(|e| GolemError::Io(format!("write {}: {e}", path.display())))?;
+                    ctx.output(format!(
+                        "{label} has no zip or file listing -- saved the rendered page \
+                         ({} bytes) -> {}",
+                        html.len(),
+                        path.display()
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
+            return Ok(());
+        }
     };
 
     let files = collect_same_host_files(ctx, &origin, iframe_src, extract_raw_link_hrefs(&html));
@@ -1970,14 +2035,14 @@ pub enum TaskDataSource {
 /// This is a same-page, top-level anchor (unlike the response zips below), so
 /// it's directly readable -- no cross-origin issue here.
 pub async fn task_data_zip_url(ctx: &WorkflowCtx) -> Result<Option<String>> {
-    let v = ctx.eval(TASK_DATA_ZIP_URL_JS).await?;
+    let v = ctx.eval(&task_block_js(TASK_DATA_ZIP_URL_BODY)).await?;
     Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
 }
 
 /// Whether the Task Data block holds an archive-viewer "Download" button
-/// (see `TASK_DATA_DOWNLOAD_BUTTON_JS`).
+/// (see `TASK_DATA_DOWNLOAD_BUTTON_BODY`).
 pub async fn task_data_download_button(ctx: &WorkflowCtx) -> Result<bool> {
-    let v = ctx.eval(TASK_DATA_DOWNLOAD_BUTTON_JS).await?;
+    let v = ctx.eval(&task_block_js(TASK_DATA_DOWNLOAD_BUTTON_BODY)).await?;
     Ok(v.as_bool().unwrap_or(false))
 }
 
@@ -1985,13 +2050,13 @@ pub async fn task_data_download_button(ctx: &WorkflowCtx) -> Result<bool> {
 /// (see `TaskDataSource::FileBrowserPage`). The link sits inside a `<strong>`
 /// in the task prose block, right under its `<h1>` heading.
 pub async fn task_data_file_browser_url(ctx: &WorkflowCtx) -> Result<Option<String>> {
-    let v = ctx.eval(TASK_DATA_FILE_BROWSER_URL_JS).await?;
+    let v = ctx.eval(&task_block_js(TASK_DATA_FILE_BROWSER_URL_BODY)).await?;
     Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
 }
 
 /// The Task Data block's full visible text (innerText of its wrapper div).
 pub async fn task_data_text(ctx: &WorkflowCtx) -> Result<String> {
-    let v = ctx.eval(TASK_DATA_TEXT_JS).await?;
+    let v = ctx.eval(&task_block_js(TASK_DATA_TEXT_BODY)).await?;
     Ok(v.as_str().unwrap_or_default().to_string())
 }
 
@@ -2014,6 +2079,36 @@ pub async fn response_iframe_src(ctx: &WorkflowCtx, label: &str) -> Result<Optio
     let js = FIND_RESPONSE_IFRAME_SRC_JS.replace("__LABEL__", &js_str(label));
     let v = ctx.eval(&js).await?;
     Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
+}
+
+/// Bring the named response ("Response A" / "Response B") on screen on the
+/// newest arena layout, where the two responses share one pane behind a tab
+/// strip (`[role=tab]` "Response A" / "Response B" over
+/// `#rater-compare-panel-left` / `-right`) and only the selected one is
+/// visible. A person clicks the tab to see that response, so Golem does too.
+///
+/// Older layouts render both responses side by side with no tab strip at all;
+/// there is then nothing to click and this is a no-op. A tab that is present
+/// but won't select is a warning rather than an error: the iframe's `src` is
+/// readable from the parent whether or not its panel is the visible one, so
+/// the download can still go ahead.
+pub async fn activate_response_tab(ctx: &mut WorkflowCtx, label: &str) -> Result<()> {
+    let js = FIND_RESPONSE_TAB_JS.replace("__LABEL__", &js_str(label));
+    if ctx.eval(&js).await?.is_null() {
+        return Ok(());
+    }
+    if click_until_selected(ctx, &js).await? {
+        ctx.output(format!("opened the {label} tab"));
+        // The panel swap is a visibility flip plus the iframe's own paint --
+        // give it a beat before anything reads the pane.
+        ctx.human_pause(600, 1400).await?;
+    } else {
+        ctx.warn(format!(
+            "couldn't select the {label} tab -- reading its panel anyway (the iframe src is \
+             readable while the panel is hidden)"
+        ));
+    }
+    Ok(())
 }
 
 /// Poll every ~250-400ms until the page shows a way to download the Task
@@ -2072,8 +2167,65 @@ pub async fn wait_for_response_iframe_src(
 /// list beneath it -- the first child span in each row is the number, the
 /// second is the criterion text.
 pub async fn evaluation_criteria_text(ctx: &WorkflowCtx) -> Result<Option<String>> {
-    let v = ctx.eval(EVALUATION_CRITERIA_JS).await?;
+    let v = ctx.eval(&criteria_js(EVALUATION_CRITERIA_BODY)).await?;
     Ok(v.as_str().map(str::to_string).filter(|s| !s.is_empty()))
+}
+
+/// Whether the rating UI is on screen: either the newest layout's slide-over
+/// drawer is open, or an older layout renders the criteria inline (in which
+/// case there is no drawer and nothing to open).
+pub async fn criteria_panel_open(ctx: &WorkflowCtx) -> Result<bool> {
+    let v = ctx.eval(&criteria_js(CRITERIA_ROOT_PRESENT_BODY)).await?;
+    Ok(v.as_bool().unwrap_or(false))
+}
+
+/// Open the evaluation-criteria drawer if the page has one and it is shut.
+///
+/// On the newest arena layout the whole rating UI -- the per-criterion
+/// Good/Bad buttons, the overall pick and the "Save & Continue" submit -- lives
+/// in a slide-over panel that starts collapsed to a 48px rail on the right,
+/// labelled "Evaluation criteria" under an icon. Nothing inside it exists in
+/// the DOM until the rail's icon is clicked, so every step that reads or
+/// clicks the rating UI has to open it first (steps 6, 7 and 8 all do).
+///
+/// Returns whether the rating UI is on screen afterwards. Older layouts render
+/// the criteria inline and report `true` immediately with nothing clicked.
+pub async fn ensure_criteria_panel_open(ctx: &mut WorkflowCtx) -> Result<bool> {
+    if criteria_panel_open(ctx).await? {
+        return Ok(true);
+    }
+    // No toggle at all: either an older inline layout that just hasn't
+    // rendered yet, or a page that isn't the task page. Either way there is
+    // nothing here to click.
+    if ctx.eval(FIND_CRITERIA_TOGGLE_JS).await?.is_null() {
+        return Ok(false);
+    }
+    // The clicks below drive the real cursor, so the tab has to be in front.
+    focus_and_settle(ctx).await?;
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let v = ctx.eval(FIND_CRITERIA_TOGGLE_JS).await?;
+        let (Some(x), Some(y)) = (
+            v.get("x").and_then(Value::as_f64),
+            v.get("y").and_then(Value::as_f64),
+        ) else {
+            break;
+        };
+        let (x, y) = jittered(ctx, x, y);
+        if attempt < ATTEMPTS {
+            ctx.click_at_cursor(x, y).await?;
+        } else {
+            ctx.click_at(x, y).await?;
+        }
+        // The drawer slides in over ~200ms; give the transition room plus a
+        // beat for React to mount the rows inside it.
+        ctx.human_pause(600, 1200).await?;
+        if criteria_panel_open(ctx).await? {
+            ctx.output("opened the evaluation criteria panel");
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Outcome of looking for the Evaluation Criteria list on the task page.
@@ -2123,32 +2275,93 @@ pub async fn wait_for_evaluation_criteria(
     }
 }
 
-/// Whether the page's Overall Quality card (an `<h3>Overall Quality</h3>`,
-/// same marker `CLICK_OVERALL_BUTTON_JS` anchors on) is rendered.
+/// Whether the rating UI is rendered enough to say the page has loaded --
+/// used to tell "this task genuinely has no criteria" apart from "the page
+/// isn't ready yet". Older layouts show an Overall Quality card
+/// (`CLICK_OVERALL_BUTTON_BODY`'s marker); the newest one shows the rating
+/// drawer instead, which may head its overall pick differently, so an open
+/// drawer counts as loaded too.
 async fn overall_quality_present(ctx: &WorkflowCtx) -> Result<bool> {
     let v = ctx
-        .eval(
-            r#"(function(){
-  var h3s = document.querySelectorAll('h3');
-  for (var i = 0; i < h3s.length; i++) {
-    if ((h3s[i].textContent || '').trim() === 'Overall Quality') return true;
+        .eval(&criteria_js(
+            r#"
+  var heads = document.querySelectorAll('h2,h3,h4,span,div');
+  for (var i = 0; i < heads.length; i++) {
+    if (/^overall(\s*quality)?$/i.test((heads[i].textContent || '').trim())) return true;
   }
-  return false;
-})()"#,
-        )
+  return !!findCriteriaRoot();
+"#,
+        ))
         .await?;
     Ok(v.as_bool().unwrap_or(false))
 }
 
-const EVALUATION_CRITERIA_JS: &str = r#"(function(){
-  var spans = document.querySelectorAll('span');
-  var header = null;
-  for (var i = 0; i < spans.length; i++) {
-    if ((spans[i].textContent || '').trim() === 'Evaluation Criteria') { header = spans[i]; break; }
+// Everything that reads or clicks the rating UI resolves its container the
+// same way, through the shared `findCriteriaRoot()` below.
+//
+// Two layouts are in play. Older tasks render an inline "Evaluation Criteria"
+// card in the page body. The newest arena layout moves the whole thing into a
+// slide-over drawer headed "Rate this comparison", which is collapsed to a
+// right-hand rail until its icon is clicked -- so the drawer is checked first,
+// and only a drawer that is actually on screen counts (the collapsed one keeps
+// `aria-hidden="true"` and sits translated off the viewport).
+//
+// The rail's own label reads "Evaluation criteria" (lower-case c) while the
+// old inline header reads "Evaluation Criteria", hence the case-insensitive
+// match -- and requiring a `.divide-y` list under that header keeps the rail's
+// label from being mistaken for the criteria card itself.
+const FIND_CRITERIA_ROOT_FN: &str = r#"
+function onScreen(e){
+  if (!e || e.getAttribute('aria-hidden') === 'true') return false;
+  var r = e.getBoundingClientRect();
+  if (r.width < 40 || r.height < 40) return false;
+  return r.right > 0 && r.left < (window.innerWidth || 0);
+}
+function findCriteriaRoot(){
+  var panels = document.querySelectorAll('aside,[role="dialog"],[role="complementary"]');
+  for (var i = 0; i < panels.length; i++) {
+    if (!onScreen(panels[i])) continue;
+    if (/rate this comparison/i.test(panels[i].textContent || '')) return panels[i];
   }
-  if (!header) return null;
-  var card = header.closest('[class*="rounded-lg"]') || header.parentElement;
-  var list = card ? card.querySelector('.divide-y') : null;
+  var els = document.querySelectorAll('span,div,h2,h3');
+  for (var j = 0; j < els.length; j++) {
+    if (!/^evaluation\s*criteria$/i.test((els[j].textContent || '').trim())) continue;
+    var card = els[j].closest('[class*="rounded-lg"]') || els[j].parentElement;
+    if (card && card.querySelector('.divide-y')) return card;
+  }
+  return null;
+}
+"#;
+
+/// Wrap one of the criteria bodies below (each of which calls
+/// `findCriteriaRoot()`) into an evaluatable IIFE.
+fn criteria_js(body: &str) -> String {
+    format!("(function(){{{FIND_CRITERIA_ROOT_FN}\n{body}\n}})()")
+}
+
+const CRITERIA_ROOT_PRESENT_BODY: &str = "return !!findCriteriaRoot();";
+
+// The rail (or, on a narrow window, the floating "Rate · n/m" pill) that opens
+// the drawer. Both carry the same `aria-label`, and only one of the two is
+// ever visible, so the visible one wins.
+const FIND_CRITERIA_TOGGLE_JS: &str = r#"(function(){
+  var btns = document.querySelectorAll('button[aria-label]');
+  for (var i = 0; i < btns.length; i++) {
+    var b = btns[i];
+    if (!/^open evaluation criteria/i.test(b.getAttribute('aria-label') || '')) continue;
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+    try { b.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+    var r = b.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  }
+  return null;
+})()"#;
+
+const EVALUATION_CRITERIA_BODY: &str = r#"
+  var root = findCriteriaRoot();
+  if (!root) return null;
+  var list = root.querySelector('.divide-y');
   if (!list) return null;
   var rows = list.children;
   var lines = [];
@@ -2161,19 +2374,36 @@ const EVALUATION_CRITERIA_JS: &str = r#"(function(){
     if (text) lines.push(num + ' ' + text);
   }
   return lines.length ? lines.join('\n') : null;
-})()"#;
+"#;
 
-// All the Task Data lookups (URL / button / click / text) find the block the
-// same way. The block's class list differs between page variants -- older
-// tasks use `prose prose-sm max-w-none text-sm text-foreground`, the newer
-// archive-viewer layout uses `prose prose-sm dark:prose-invert max-w-none
-// ...` (no `text-sm text-foreground` at all) -- so match on the common
-// `prose prose-sm max-w-none` subset, preferring a candidate that contains
-// the archive viewer (`[data-task-data-archive-viewer]`) or a "Task Data"
-// heading, and falling back to the first match (some tasks' block has no
-// heading/download link at all, only the description text).
-
-const TASK_DATA_ZIP_URL_JS: &str = r#"(function(){
+// All the Task Data lookups (URL / button / text) find the block through the
+// shared `findTaskBlock()` below, which reports both the block and whether it
+// is the newest layout's request brief.
+//
+// Three layouts are in play:
+//   * older tasks: a `prose prose-sm max-w-none text-sm text-foreground` block
+//     headed "Task Data";
+//   * the archive-viewer layout: the same block with
+//     `[data-task-data-archive-viewer]` inside and no `text-sm text-foreground`
+//     at all -- hence matching on the common `prose prose-sm max-w-none`
+//     subset, preferring a candidate holding the viewer or a "Task Data"
+//     heading and falling back to the first match;
+//   * the newest arena layout: a left-rail card headed "User request" whose
+//     body prose IS the task description ("Task data is the sentence under
+//     User request"). It has no "Task Data" heading and no download control,
+//     so it reports `brief: true` and the bare-anchor ZIP fallback is
+//     suppressed for it -- a link inside that prose is part of the request
+//     being described, not an archive to fetch.
+const FIND_TASK_BLOCK_FN: &str = r#"
+function findTaskBlock(){
+  var els = document.querySelectorAll('div,span,h1,h2,h3,h4');
+  for (var i = 0; i < els.length; i++) {
+    if (!/^user\s*request$/i.test((els[i].textContent || '').trim())) continue;
+    var card = els[i].closest('section') || els[i].parentElement;
+    var body = card ? card.querySelector('.prose') : null;
+    if (!body) body = els[i].nextElementSibling;
+    if (body) return { box: body, brief: true };
+  }
   var all = document.querySelectorAll('div.prose.prose-sm.max-w-none');
   var box = null;
   for (var b = 0; b < all.length; b++) {
@@ -2182,7 +2412,20 @@ const TASK_DATA_ZIP_URL_JS: &str = r#"(function(){
         (h && /task\s*data/i.test(h.textContent || ''))) { box = all[b]; break; }
   }
   if (!box && all.length) box = all[0];
-  if (!box) return null;
+  return box ? { box: box, brief: false } : null;
+}
+"#;
+
+/// Wrap one of the Task Data lookup bodies below (each of which calls
+/// `findTaskBlock()`) into an evaluatable IIFE.
+fn task_block_js(body: &str) -> String {
+    format!("(function(){{{FIND_TASK_BLOCK_FN}\n{body}\n}})()")
+}
+
+const TASK_DATA_ZIP_URL_BODY: &str = r#"
+  var found = findTaskBlock();
+  if (!found) return null;
+  var box = found.box;
   var as = box.querySelectorAll('a[href]');
   for (var i = 0; i < as.length; i++) {
     var href = as[i].getAttribute('href') || '';
@@ -2190,54 +2433,44 @@ const TASK_DATA_ZIP_URL_JS: &str = r#"(function(){
     if (/\.zip(\?|$)/i.test(href) || txt.indexOf('download') !== -1) return as[i].href;
   }
   if (box.querySelector('[data-task-data-archive-viewer]')) return null;
+  /* The request brief never carries a task-data archive, so an anchor in it
+     is part of the request text -- never guess that one is a download. */
+  if (found.brief) return null;
   /* Bare-anchor fallback: skip anchors wrapped in <strong> -- that's the
      task-inputs file-browser link (a page LISTING the files, not a zip),
-     detected separately by TASK_DATA_FILE_BROWSER_URL_JS. */
+     detected separately by TASK_DATA_FILE_BROWSER_URL_BODY. */
   for (var k = 0; k < as.length; k++) {
     if (!as[k].closest('strong')) return as[k].href;
   }
   return null;
-})()"#;
+"#;
 
 // True when the block holds the newer archive-viewer's `<button>Download`
 // (identified by its text or its lucide download icon) -- that layout has no
 // `<a href>` to fetch, so the button must be physically clicked instead.
-const TASK_DATA_DOWNLOAD_BUTTON_JS: &str = r#"(function(){
-  var all = document.querySelectorAll('div.prose.prose-sm.max-w-none');
-  var box = null;
-  for (var b = 0; b < all.length; b++) {
-    var h = all[b].querySelector('h1,h2,h3');
-    if (all[b].querySelector('[data-task-data-archive-viewer]') ||
-        (h && /task\s*data/i.test(h.textContent || ''))) { box = all[b]; break; }
-  }
-  if (!box && all.length) box = all[0];
-  if (!box) return false;
-  var btns = box.querySelectorAll('button');
+const TASK_DATA_DOWNLOAD_BUTTON_BODY: &str = r#"
+  var found = findTaskBlock();
+  if (!found) return false;
+  var btns = found.box.querySelectorAll('button');
   for (var i = 0; i < btns.length; i++) {
     var txt = (btns[i].textContent || '').toLowerCase();
     if (txt.indexOf('download') !== -1 || btns[i].querySelector('svg.lucide-download')) return true;
   }
   return false;
-})()"#;
+"#;
 
 // The task-inputs file-browser link: an `<a href>` wrapped in a `<strong>`
-// inside the task prose block, right under its `<h1>` heading ("Open the
-// task's input files (file browser)"). Same block-finding as the lookups
-// above. Prefers a link whose text actually says file browser / input files
-// (in case the description prose ever bolds an ordinary link too), falling
-// back to the first strong-wrapped anchor. Returns the ABSOLUTE href -- the
-// link is never clicked (navigating this tab away loses the task).
-const TASK_DATA_FILE_BROWSER_URL_JS: &str = r#"(function(){
-  var all = document.querySelectorAll('div.prose.prose-sm.max-w-none');
-  var box = null;
-  for (var b = 0; b < all.length; b++) {
-    var h = all[b].querySelector('h1,h2,h3');
-    if (all[b].querySelector('[data-task-data-archive-viewer]') ||
-        (h && /task\s*data/i.test(h.textContent || ''))) { box = all[b]; break; }
-  }
-  if (!box && all.length) box = all[0];
-  if (!box) return null;
-  var links = box.querySelectorAll('strong a[href]');
+// inside the task block ("Open the task's input files (file browser)").
+// Prefers a link whose text actually says file browser / input files (in case
+// the description prose ever bolds an ordinary link too), falling back to the
+// first strong-wrapped anchor. Returns the ABSOLUTE href -- the link is never
+// clicked (navigating this tab away loses the task). This one is left live for
+// the request brief too: if a task ever states its inputs that way, the link
+// is still the right thing to follow out-of-band.
+const TASK_DATA_FILE_BROWSER_URL_BODY: &str = r#"
+  var found = findTaskBlock();
+  if (!found) return null;
+  var links = found.box.querySelectorAll('strong a[href]');
   var pick = null;
   for (var i = 0; i < links.length; i++) {
     var txt = links[i].textContent || '';
@@ -2250,22 +2483,16 @@ const TASK_DATA_FILE_BROWSER_URL_JS: &str = r#"(function(){
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
     return u.href;
   } catch (e) { return null; }
-})()"#;
+"#;
 
 // The block's visible text, minus the archive viewer's file tree when one is
 // present -- that subtree is just a listing of the files the download itself
 // contains ("Input Data Files ... input_0.jpg 26.3 KB ..."), noise in the
 // saved `information` file.
-const TASK_DATA_TEXT_JS: &str = r#"(function(){
-  var all = document.querySelectorAll('div.prose.prose-sm.max-w-none');
-  var box = null;
-  for (var b = 0; b < all.length; b++) {
-    var h = all[b].querySelector('h1,h2,h3');
-    if (all[b].querySelector('[data-task-data-archive-viewer]') ||
-        (h && /task\s*data/i.test(h.textContent || ''))) { box = all[b]; break; }
-  }
-  if (!box && all.length) box = all[0];
-  if (!box) return '';
+const TASK_DATA_TEXT_BODY: &str = r#"
+  var found = findTaskBlock();
+  if (!found) return '';
+  var box = found.box;
   if (!box.querySelector('[data-task-data-archive-viewer]'))
     return box.innerText || box.textContent || '';
   var parts = [];
@@ -2277,6 +2504,24 @@ const TASK_DATA_TEXT_JS: &str = r#"(function(){
     if (t.trim()) parts.push(t);
   }
   return parts.join('\n');
+"#;
+
+// The tab that reveals a response on the newest arena layout. `selected` reads
+// the tab's own `aria-selected`, so `click_until_selected` verifies the switch
+// the same way it verifies a rating.
+const FIND_RESPONSE_TAB_JS: &str = r#"(function(){
+  var LABEL = __LABEL__;
+  var tabs = document.querySelectorAll('[role="tab"]');
+  for (var i = 0; i < tabs.length; i++) {
+    var t = tabs[i];
+    if ((t.textContent || '').replace(/\s+/g, ' ').trim() !== LABEL) continue;
+    var sel = t.getAttribute('aria-selected') === 'true';
+    try { t.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+    var r = t.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return null;
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2, selected: sel };
+  }
+  return null;
 })()"#;
 
 const FIND_RESPONSE_IFRAME_SRC_JS: &str = r#"(function(){

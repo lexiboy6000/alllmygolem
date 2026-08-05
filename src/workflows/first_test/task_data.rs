@@ -1,8 +1,13 @@
 //! Step 2: inside task1, create task_data/, download+unzip the task data
 //! (the "Download all task data (ZIP)" link, the newer archive viewer's
-//! "Download" button, or the newest layout's "Open the task's input files
-//! (file browser)" link -- a page listing the input files individually), and
-//! save the Task Data block's text as a file named "information".
+//! "Download" button, or the file-browser layout's "Open the task's input
+//! files" link -- a page listing the input files individually), and save the
+//! task description as a file named "information".
+//!
+//! The newest arena layout has no downloadable task data at all: the task is
+//! stated as prose in the "User request" card, and that sentence IS the task
+//! data. `util::task_data_text` reads it from there and the download step
+//! finds nothing to fetch, which is a skip rather than a failure.
 
 use crate::prelude::*;
 

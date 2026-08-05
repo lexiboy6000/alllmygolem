@@ -1,10 +1,16 @@
 //! Step 4: download Response A's deliverables into task1/responseA -- the
-//! all_files.zip on the older layout, or the individual files plus the
-//! model-response text on the newer delivered-files listing (which has no
-//! zip). See util::response_iframe_src for why this reads the iframe's src
-//! instead of clicking the copy-link buttons (they live inside a
-//! cross-origin iframe Golem's JS can't reach), and
-//! util::download_response_into for how the two layouts are told apart.
+//! all_files.zip on the older layout, the individual files plus the
+//! model-response text on the delivered-files listing (which has no zip), or
+//! the rendered page itself on the newest arena layout, where the response is
+//! an app shown in a tab and there is nothing to unpack. See
+//! util::response_iframe_src for why this reads the iframe's src instead of
+//! clicking the copy-link buttons (they live inside a cross-origin iframe
+//! Golem's JS can't reach), and util::download_response_into for how the
+//! layouts are told apart.
+//!
+//! On the newest layout the two responses share one pane behind a tab strip,
+//! so the Response A tab is clicked first -- that is how a person brings it on
+//! screen, and it makes sure the iframe has actually loaded.
 
 use crate::prelude::*;
 
@@ -57,6 +63,9 @@ impl Workflow for DownloadResponseA {
 /// skip-and-restart recovery.
 async fn fetch(ctx: &mut WorkflowCtx) -> Result<()> {
     let dir = util::current_task_dir(ctx)?.join("responseA");
+
+    ctx.step("open the Response A tab").await?;
+    util::activate_response_tab(ctx, "Response A").await?;
 
     ctx.step("find Response A's iframe").await?;
     let src = util::wait_for_response_iframe_src(ctx, "Response A", Duration::from_secs(15))
