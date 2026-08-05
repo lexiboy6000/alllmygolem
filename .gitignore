@@ -1,3 +1,5 @@
 /target
 # Golem runtime output (logs, checkpoints, downloads, extracted task data)
 /golem-output
+# Local agent memory / project work log (never commit)
+/RESUME.md
