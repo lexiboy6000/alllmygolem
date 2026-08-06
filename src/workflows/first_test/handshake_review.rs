@@ -82,8 +82,8 @@ impl Workflow for HandshakeReviewAndSubmit {
             ),
             InputSpec::optional(
                 "target_minutes",
-                "Minimum timer minutes before submitting (+ up to 3 min jitter; 1-120, \
-                 anything else means 40)",
+                "Minimum timer minutes before submitting (+ up to 3 min jitter). 40 is a \
+                 floor, not just the default -- lower values are raised to it",
                 "40",
             ),
             InputSpec::optional(
@@ -245,15 +245,18 @@ impl Workflow for HandshakeReviewAndSubmit {
             .await?;
         }
 
-        // Out-of-range and unparseable both fall back to 40. Note that 0 does
-        // too: "wait for no time at all" is not something a typo in the box
-        // should be able to ask for, given the whole point of this number is to
-        // stop tasks being handed in implausibly fast.
-        let target_minutes: u64 = ctx
-            .input("target_minutes")
-            .and_then(|v| v.trim().parse().ok())
-            .filter(|m| (1..=120).contains(m))
-            .unwrap_or(40);
+        let asked = ctx.input("target_minutes");
+        let target_minutes = resolve_target_minutes(asked);
+        if let Some(asked) = asked.map(str::trim).filter(|s| !s.is_empty())
+            && asked.parse::<u64>().ok() != Some(target_minutes)
+        {
+            ctx.warn(format!(
+                "the target_minutes box says '{asked}', but {TIMER_FLOOR_MINUTES} minutes is \
+                 the floor, not just the default -- Handshake's own timer reads \
+                 00:MM:SS/00:{TIMER_FLOOR_MINUTES}:00, so that is the handle time it asks \
+                 for. Waiting {target_minutes} min."
+            ));
+        }
 
         // ---- wait out the task timer ------------------------------------
         // BEFORE either submission, not just the Handshake one. Both platforms
@@ -468,13 +471,10 @@ async fn wait_for_timer(
     switch_timeout: Duration,
     target_minutes: u64,
 ) -> Result<()> {
-    // `0` means "submit as soon as the answers are in". The pipeline can't
-    // produce it -- the `target_minutes` input clamps to 1..=120 and falls back
-    // to 40 -- so this only fires for a caller that passes 0 deliberately.
-    if target_minutes == 0 {
-        ctx.output("target_minutes is 0 -- not waiting for the task timer");
-        return Ok(());
-    }
+    // No "0 means don't wait" escape hatch: callers resolve `target_minutes`
+    // through `resolve_target_minutes`, which never returns less than the
+    // floor. A skip-the-wait branch inside the one function whose entire job is
+    // to enforce the wait is the sort of thing that quietly becomes reachable.
     if !ctx
         .browser
         .switch_to_target("ai.joinhandshake.com", "", switch_timeout)
@@ -611,6 +611,36 @@ async fn between_clicks(ctx: &mut WorkflowCtx) -> Result<()> {
         ctx.wander_cursor().await?;
     }
     Ok(())
+}
+
+/// The handle time Handshake asks for, and the shortest wait this workflow
+/// will ever accept. Its timer widget renders elapsed-over-target as
+/// `00:06:36/00:40:00`, which is where the number comes from.
+const TIMER_FLOOR_MINUTES: u64 = 40;
+
+/// Above this, a `target_minutes` input reads as a typo (`400` for `40`)
+/// rather than a real request, and falls back to the floor.
+const TIMER_CEILING_MINUTES: u64 = 120;
+
+/// Minutes the task timer must reach before the round may submit, resolved
+/// from the raw `target_minutes` input.
+///
+/// [`TIMER_FLOOR_MINUTES`] is a FLOOR, not merely the default value in the
+/// box. A smaller number is raised to it, exactly like a blank or unparseable
+/// one: the whole purpose of this input is to stop tasks being handed in
+/// implausibly fast, so letting it be turned *down* would defeat it. Above the
+/// floor it is honoured, since waiting longer than the platform asks is always
+/// safe. The caller warns when the value it gets back isn't the one typed.
+fn resolve_target_minutes(raw: Option<&str>) -> u64 {
+    match raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(m) if m > TIMER_CEILING_MINUTES => TIMER_FLOOR_MINUTES,
+        Some(m) => m.max(TIMER_FLOOR_MINUTES),
+        None => TIMER_FLOOR_MINUTES,
+    }
 }
 
 /// How long the timer must read before the round may submit: `target_minutes`
@@ -1255,6 +1285,62 @@ mod tests {
         let spread: std::collections::BTreeSet<u64> =
             (0..1000u64).map(|r| timer_target_secs(40, r)).collect();
         assert!(spread.len() > 100, "jitter collapsed to {} values", spread.len());
+    }
+
+    /// The floor is a floor. Typing a smaller number in the box asks for a
+    /// handle time Handshake doesn't accept, so it is raised -- the same as
+    /// leaving the box blank.
+    #[test]
+    fn a_target_below_the_floor_is_raised_to_it() {
+        for asked in ["0", "1", "5", "20", "39", " 30 "] {
+            assert_eq!(
+                resolve_target_minutes(Some(asked)),
+                40,
+                "'{asked}' should have been raised to the 40 min floor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_above_the_floor_is_honoured_and_a_silly_one_is_not() {
+        assert_eq!(resolve_target_minutes(Some("40")), 40);
+        assert_eq!(resolve_target_minutes(Some("55")), 55);
+        assert_eq!(resolve_target_minutes(Some("120")), 120);
+        // past the ceiling reads as a typo for the floor, not a 6-hour wait
+        assert_eq!(resolve_target_minutes(Some("400")), 40);
+    }
+
+    #[test]
+    fn a_blank_or_unparseable_target_falls_back_to_the_floor() {
+        assert_eq!(resolve_target_minutes(None), 40);
+        assert_eq!(resolve_target_minutes(Some("")), 40);
+        assert_eq!(resolve_target_minutes(Some("   ")), 40);
+        assert_eq!(resolve_target_minutes(Some("soon")), 40);
+        assert_eq!(resolve_target_minutes(Some("-5")), 40);
+        assert_eq!(resolve_target_minutes(Some("40.5")), 40);
+    }
+
+    /// The two halves together: whatever goes in the box, the round never
+    /// submits before 40:00.
+    #[test]
+    fn no_input_can_produce_a_wait_under_the_floor() {
+        for asked in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("1"),
+            Some("39"),
+            Some("nonsense"),
+            Some("999"),
+        ] {
+            let mins = resolve_target_minutes(asked);
+            for raw in 0..200u64 {
+                assert!(
+                    timer_target_secs(mins, raw) >= 40 * 60,
+                    "input {asked:?} at raw={raw} allowed a submit under 40:00"
+                );
+            }
+        }
     }
 
     #[test]
