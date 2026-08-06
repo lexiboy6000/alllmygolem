@@ -619,30 +619,56 @@ pub async fn click_until_selected(ctx: &mut WorkflowCtx, find_js: &str) -> Resul
     const ATTEMPTS: usize = 3;
     for attempt in 1..=ATTEMPTS {
         let v = ctx.eval(find_js).await?;
+        // The finder reports `selected` whenever it located the control at
+        // all, whether or not a click could reach it -- so read that FIRST.
+        // An already-correct rating needs no click, and refusing to notice
+        // that just because the control is buried would re-click it (or give
+        // up on it) for no reason.
+        let located = v.get("selected").is_some();
+        if v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(true);
+        }
         let (x, y) = match (
             v.get("x").and_then(Value::as_f64),
             v.get("y").and_then(Value::as_f64),
         ) {
             (Some(x), Some(y)) => (x, y),
-            // The control isn't on the page at all, so there is nothing to
-            // click and no coordinates to retry -- the CDP fallback below
-            // can't help, since it only ever re-aims a click that missed.
-            // Said plainly, because "not found" and "clicked but it didn't
-            // take" have completely different causes and the summary line
-            // upstream reads the same for both.
+            // No reachable point. Two very different causes, and the summary
+            // line upstream reads the same for both, so say which.
             _ => {
-                if attempt == 1 {
-                    ctx.output(
-                        "control not found on the page -- nothing to click (this is a selector \
-                         mismatch, not a missed click)",
-                    );
+                if !located {
+                    // Not on the page at all: nothing to click and no
+                    // coordinates to retry, so the CDP fallback can't help --
+                    // it only ever re-aims a click that missed.
+                    if attempt == 1 {
+                        ctx.output(
+                            "control not found on the page -- nothing to click (this is a \
+                             selector mismatch, not a missed click)",
+                        );
+                    }
+                    return Ok(false);
                 }
-                return Ok(false);
+                // On the page but covered by something else. Clicking its
+                // coordinates anyway is what used to happen, and it pressed
+                // whatever sat on top -- for the rating drawer that is the
+                // pinned "Overall quality" footer, so criterion clicks were
+                // silently landing on the overall pick. Give the page a beat
+                // to settle and re-find (the finder scrolls to clear it), and
+                // if it stays buried, report that rather than clicking blind.
+                if attempt == ATTEMPTS {
+                    ctx.warn(
+                        "the control is on the page but stays covered by another element \
+                         (the rating drawer pins an 'Overall quality' footer over the \
+                         criteria list) -- NOT clicking, since the click would land on \
+                         whatever is on top",
+                    );
+                    return Ok(false);
+                }
+                ctx.output("the control is covered by something -- re-finding after a beat");
+                ctx.human_pause(500, 1100).await?;
+                continue;
             }
         };
-        if v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
-            return Ok(true);
-        }
         match attempt {
             1 => {}
             a if a < ATTEMPTS => {
@@ -967,10 +993,7 @@ const CLICK_CRITERION_BUTTON_BODY: &str = r#"
       for (var b = 0; b < btns.length; b++) {
         var e = btns[b];
         if ((e.textContent || '').trim() !== WANT) continue;
-        try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
-        var r = e.getBoundingClientRect();
-        if (r.width < 1 || r.height < 1) return null;
-        return { x: r.left + r.width / 2, y: r.top + r.height / 2, selected: isSelected(e) };
+        return controlAt(e);
       }
     }
     return null;
@@ -1001,11 +1024,7 @@ const CLICK_OVERALL_BUTTON_BODY: &str = r#"
   for (var j = 0; j < btns.length; j++) {
     if (btns[j].getAttribute('role') === 'tab') continue;
     if ((btns[j].textContent || '').replace(/\s+/g, ' ').trim() === WANT) {
-      var e = btns[j];
-      try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
-      var r = e.getBoundingClientRect();
-      if (r.width < 1 || r.height < 1) return null;
-      return { x: r.left + r.width / 2, y: r.top + r.height / 2, selected: isSelected(e) };
+      return controlAt(btns[j]);
     }
   }
   return null;
@@ -2597,6 +2616,74 @@ function onScreen(e){
   var r = e.getBoundingClientRect();
   if (r.width < 40 || r.height < 40) return false;
   return r.right > 0 && r.left < (window.innerWidth || 0);
+}
+/* The nearest ancestor that actually scrolls, or null for the window. */
+function scrollerFor(e){
+  var s = e.parentElement;
+  while (s && s !== document.body) {
+    var st = getComputedStyle(s);
+    if (/(auto|scroll)/.test(st.overflowY) && s.scrollHeight > s.clientHeight + 2) return s;
+    s = s.parentElement;
+  }
+  return null;
+}
+/* A point on `e` that a real click would actually reach, or null.
+   getBoundingClientRect happily reports coordinates for an element that is
+   scrolled underneath something else, and clicking those hits the thing on
+   top. The rating drawer does exactly that: its criteria list scrolls behind
+   a pinned "Overall quality" footer (`shrink-0 ... border-t`), so a row
+   scrolled low enough sits under the footer's own buttons -- every click
+   aimed at it landed on the overall pick instead, which is both why those
+   ratings read as "missed" and why the overall pick was being nudged around
+   by clicks meant for a criterion.
+   So hit-test with elementFromPoint, and when the centre is covered try
+   other points on the element, then scroll the list to bring it clear. */
+function hittablePoint(e){
+  function probe(){
+    var r = e.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return null;
+    var W = window.innerWidth || 0, H = window.innerHeight || 0;
+    /* centre first, then along the middle, then off the vertical centre --
+       a partial overlap often leaves one edge of the control reachable */
+    var fx = [0.5, 0.3, 0.7, 0.5, 0.5, 0.25, 0.75];
+    var fy = [0.5, 0.5, 0.5, 0.25, 0.75, 0.3, 0.7];
+    for (var i = 0; i < fx.length; i++) {
+      var x = r.left + r.width * fx[i], y = r.top + r.height * fy[i];
+      if (x < 1 || y < 1 || x > W - 1 || y > H - 1) continue;
+      var hit = document.elementFromPoint(x, y);
+      if (hit === e || e.contains(hit)) return { x: x, y: y };
+    }
+    return null;
+  }
+  try { e.scrollIntoView({ block: 'center', inline: 'center' }); } catch (x) {}
+  var p = probe();
+  if (p) return p;
+  /* Covered. Nudge the scroll position both ways -- up-scrolls lift it out
+     from under a bottom footer, down-scrolls out from under a sticky header
+     -- re-testing after each. Bounded, and the original position is put back
+     if nothing works so the page is left as we found it. */
+  var sc = scrollerFor(e);
+  var base = sc ? sc.scrollTop : (window.scrollY || 0);
+  var deltas = [60, 120, 180, 240, 320, -60, -120, -180, -240, -320];
+  for (var d = 0; d < deltas.length; d++) {
+    if (sc) sc.scrollTop = base + deltas[d];
+    else window.scrollTo(0, base + deltas[d]);
+    p = probe();
+    if (p) return p;
+  }
+  if (sc) sc.scrollTop = base; else window.scrollTo(0, base);
+  return null;
+}
+/* What a finder returns for a control it located: the selection state ALWAYS
+   (reading it never needs the control to be clickable, and the verify pass
+   only wants that), plus a click point when one is reachable. `occluded`
+   says the control is on the page but buried, so the caller can say so
+   instead of reporting a plain "not found". */
+function controlAt(e){
+  var p = hittablePoint(e);
+  var out = { selected: isSelected(e), occluded: !p };
+  if (p) { out.x = p.x; out.y = p.y; }
+  return out;
 }
 function findCriteriaRoot(){
   var panels = document.querySelectorAll('aside,[role="dialog"],[role="complementary"]');
