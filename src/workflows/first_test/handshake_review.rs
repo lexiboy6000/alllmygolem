@@ -16,12 +16,16 @@
 //!    is skipped rather than answered twice, and every step is skipped cleanly
 //!    on a re-run. An older page variant used aria-pressed toggle buttons;
 //!    both layouts are handled,
-//! 3. re-verifies the answers are still on the page, then submits on multimango,
-//! 4. back on Handshake: waits for the task timer to reach 40 minutes +/- 3 of
-//!    jitter RIGHT before the final "Submit task" click. A timer already
-//!    at/past 40 when it gets there (the common case when Claude's judging
-//!    ran long) means no wait at all -- it clicks straight through,
-//! 5. "Submit task", then "Confirm time", then "Next task",
+//! 3. waits for the task timer to reach 40 minutes (plus up to 3 of jitter)
+//!    BEFORE either submission -- both platforms record a handle time, so the
+//!    wait sits ahead of the first submit of the round rather than only in
+//!    front of the last one. A timer already at/past 40 when it gets there
+//!    (the common case, since Claude's judging in steps 1-7 usually runs
+//!    longer than that on its own) means no wait at all,
+//! 4. re-verifies the answers are still on the page, then submits on multimango,
+//! 5. back on Handshake, re-checks the timer (normally instant -- it only
+//!    moves forward) and clicks "Submit task", then "Confirm time", then
+//!    "Next task",
 //! 6. queues the next pipeline round, which restarts at workflow 0.
 //!
 //! Every hop between controls goes through [`between_clicks`]: a jittered
@@ -34,7 +38,10 @@
 //! stands between the answers and the submit:
 //! - step 7 never touches Submit when `defer_submit` is set (the pipeline
 //!   always sets it), so submission happens here and only here;
-//! - the timer wait above, which keeps handle times plausible;
+//! - the timer wait above, which keeps handle times plausible. It is a FLOOR,
+//!   not a midpoint: Handshake's own widget reads `00:06:36/00:40:00`, so 40
+//!   minutes is what the platform asks for, and the jitter only ever scatters
+//!   rounds above it;
 //! - the answers are re-verified against the live page right before the
 //!   multimango submit (the platform can swap the open task under us);
 //! - Stop discards the queued next round, so stopping ends the whole loop.
@@ -54,8 +61,9 @@ impl Workflow for HandshakeReviewAndSubmit {
     }
 
     fn description(&self) -> &'static str {
-        "Full pipeline leg: Handshake wizard, waits out the task timer (40 min +/- 3), then \
-         submits on multimango + Handshake and queues the next round. No human gate."
+        "Full pipeline leg: Handshake wizard, waits for the task timer to reach 40 min (+ up \
+         to 3 of jitter), then submits on multimango + Handshake and queues the next round. \
+         No human gate."
     }
 
     fn dependencies(&self) -> Vec<&'static str> {
@@ -74,7 +82,8 @@ impl Workflow for HandshakeReviewAndSubmit {
             ),
             InputSpec::optional(
                 "target_minutes",
-                "Timer minutes to reach before submitting (+/- 3 min jitter)",
+                "Minimum timer minutes before submitting (+ up to 3 min jitter; 1-120, \
+                 anything else means 40)",
                 "40",
             ),
             InputSpec::optional(
@@ -98,16 +107,16 @@ impl Workflow for HandshakeReviewAndSubmit {
         ctx.step("locate the multimango + Handshake tabs").await?;
         // We are currently controlling the multimango tab (steps 1-7 ran on
         // it). Its URL names the arena task type Handshake asks about.
-        let mm_url = ctx.browser.current_url().await.unwrap_or_default();
+        let mm_url = current_url_settled(ctx).await;
         let arena_id = arena_id_from_url(&mm_url).ok_or_else(|| {
             ctx.halt(format!(
-                "the controlled tab isn't on a multimango task page (url: {mm_url}); \
-                 run the pipeline from the multimango arena tab"
+                "the controlled tab isn't on a multimango task page (url: {}); \
+                 run the pipeline from the multimango arena tab",
+                if mm_url.is_empty() { "unreadable" } else { &mm_url }
             ))
         })?;
         ctx.output(format!("arena task type: {arena_id}"));
-        let hs_tabs = ctx.browser.list_targets("ai.joinhandshake.com").await?;
-        if hs_tabs.is_empty() {
+        if !handshake_tab_exists(ctx).await? {
             return Err(util::halt_now(
                 ctx,
                 "no Handshake tab found -- open ai.joinhandshake.com's task page (the \
@@ -126,7 +135,7 @@ impl Workflow for HandshakeReviewAndSubmit {
             return Err(ctx.halt("couldn't switch to the Handshake tab"));
         }
         util::focus_and_settle(ctx).await?;
-        let hs_url = ctx.browser.current_url().await.unwrap_or_default();
+        let hs_url = current_url_settled(ctx).await;
         if !(hs_url.contains("/task/") && hs_url.contains("/run")) {
             return Err(util::halt_now(
                 ctx,
@@ -144,14 +153,7 @@ impl Workflow for HandshakeReviewAndSubmit {
 
         // ---- wizard: a Continue step may gate the task-type question ----
         ctx.step("advance the wizard (Continue, if shown)").await?;
-        match wait_for_coords(ctx, CONTINUE_STEP_JS, Duration::from_secs(6)).await? {
-            Some((x, y)) => {
-                let (x, y) = util::jittered(ctx, x, y);
-                ctx.click_at_cursor(x, y).await?;
-                ctx.output("clicked Continue");
-            }
-            None => ctx.output("no Continue to click -- moving on"),
-        }
+        click_control(ctx, CONTINUE_STEP_JS, "Continue", Duration::from_secs(6)).await?;
 
         // ---- select the arena task type ---------------------------------
         ctx.step("select the task type on Handshake").await?;
@@ -207,14 +209,13 @@ impl Workflow for HandshakeReviewAndSubmit {
 
         // a confirmation popup with its own Continue may follow the selection
         between_clicks(ctx).await?;
-        match wait_for_coords(ctx, CONTINUE_STEP_JS, Duration::from_secs(8)).await? {
-            Some((x, y)) => {
-                let (x, y) = util::jittered(ctx, x, y);
-                ctx.click_at_cursor(x, y).await?;
-                ctx.output("clicked Continue on the follow-up popup");
-            }
-            None => {}
-        }
+        click_control(
+            ctx,
+            CONTINUE_STEP_JS,
+            "Continue (follow-up popup)",
+            Duration::from_secs(8),
+        )
+        .await?;
 
         // ---- wizard: "Continue task" ------------------------------------
         // A miss is fine: the control is also absent when it has already been
@@ -244,14 +245,30 @@ impl Workflow for HandshakeReviewAndSubmit {
             .await?;
         }
 
-        // The timer wait happens later, right before the Handshake "Submit
-        // task" click -- only the target is resolved here (it also rides
-        // along into the next queued round).
+        // Out-of-range and unparseable both fall back to 40. Note that 0 does
+        // too: "wait for no time at all" is not something a typo in the box
+        // should be able to ask for, given the whole point of this number is to
+        // stop tasks being handed in implausibly fast.
         let target_minutes: u64 = ctx
             .input("target_minutes")
             .and_then(|v| v.trim().parse().ok())
             .filter(|m| (1..=120).contains(m))
             .unwrap_or(40);
+
+        // ---- wait out the task timer ------------------------------------
+        // BEFORE either submission, not just the Handshake one. Both platforms
+        // record a handle time, and multimango used to be handed the evaluation
+        // the moment Claude's answers were in -- often only a few minutes after
+        // the task was claimed -- while only the Handshake click waited. The
+        // wait belongs ahead of the first submission of the round so neither
+        // side sees an implausible time.
+        //
+        // Usually this returns straight away: steps 1-7 (downloads plus
+        // Claude's judging) have normally already pushed the timer past 40 min
+        // by the time the chain reaches here. We are on the Handshake tab, and
+        // `wait_for_timer` needs it to read the timer.
+        ctx.step("wait for the Handshake task timer").await?;
+        wait_for_timer(ctx, timeout, target_minutes).await?;
 
         // ---- submit the evaluation on multimango ------------------------
         ctx.step("submit the evaluation on multimango").await?;
@@ -312,14 +329,12 @@ impl Workflow for HandshakeReviewAndSubmit {
             return Err(ctx.halt("couldn't switch back to the Handshake tab"));
         }
         util::focus_and_settle(ctx).await?;
-        // ---- wait out the task timer ------------------------------------
-        // The last thing before the real submission: hold the "Submit task"
-        // click until the page timer reads the target (40 min +/- 3 of
-        // jitter). A timer already at/past 40 submits immediately -- no
-        // jitter is waited out on top. This is the only thing standing
-        // between Claude's answers and a real submission -- the human review
-        // gate is gone by request, so the pipeline runs unattended.
-        ctx.step("wait for the Handshake task timer (40 min +/- 3)").await?;
+        // Re-check the timer before the final click. Normally instant -- the
+        // timer only moves forward and the wait above already cleared the
+        // target -- but the multimango submit sits between the two, and if
+        // Handshake paused the timer while we were away this is what notices
+        // and resumes it.
+        ctx.step("re-check the Handshake task timer").await?;
         wait_for_timer(ctx, timeout, target_minutes).await?;
         // "I submitted my time on Multimango" was already answered earlier in
         // the wizard -- all that's left here is the final submit.
@@ -431,25 +446,31 @@ impl Workflow for HandshakeReviewAndSubmit {
 // timer
 // ---------------------------------------------------------------------------
 
-/// Read the Handshake task timer and wait until it reaches `target_minutes`
-/// +/- up to 3 min of jitter. A FIRST reading already at/past the plain
-/// (un-jittered) target returns immediately: positive jitter only stretches
-/// a wait that is happening anyway, it never delays a round that arrives
-/// late. If the timer is paused, resume it first; if it can't be read at
-/// all, wait the target out by wall clock. The project expects handle times
-/// near the human average -- the timer only exists so tasks aren't claimed
-/// implausibly fast.
+/// Read the Handshake task timer and hold the round until it reaches
+/// `target_minutes` (plus up to 3 min of jitter). `target_minutes` is a FLOOR,
+/// not a midpoint: Handshake's own timer widget renders elapsed-over-target as
+/// `00:06:36/00:40:00`, so the platform itself states 40:00 as the handle time
+/// it expects, and submitting under that is the thing worth avoiding. The
+/// jitter therefore only ever scatters rounds ABOVE the floor, so no round is
+/// submitted at less than the target.
+///
+/// A first reading already at/past the plain target returns immediately: the
+/// jitter stretches a wait that is happening anyway, it never delays a round
+/// that arrives late (the common case, since Claude's judging in steps 1-7
+/// usually runs past 40 min on its own).
+///
+/// If the timer is paused, it is resumed. If it can't be read -- unreadable,
+/// or the browser connection dropped mid-wait -- the wall-clock deadline below
+/// carries the wait instead, so a frozen or unresumable timer can never hang
+/// the round forever.
 async fn wait_for_timer(
     ctx: &mut WorkflowCtx,
     switch_timeout: Duration,
     target_minutes: u64,
 ) -> Result<()> {
-    // `0` means "submit as soon as the answers are in" -- honour it literally.
-    // Without this the jitter floor below (`.max(60)`) and the unreadable-timer
-    // fallback would both still hold the run back, which is exactly the
-    // silent-wait bug a zero target is meant to opt out of. The caller has
-    // already switched to and settled the Handshake tab, so returning here
-    // skips only the waiting, not any setup the submit depends on.
+    // `0` means "submit as soon as the answers are in". The pipeline can't
+    // produce it -- the `target_minutes` input clamps to 1..=120 and falls back
+    // to 40 -- so this only fires for a caller that passes 0 deliberately.
     if target_minutes == 0 {
         ctx.output("target_minutes is 0 -- not waiting for the task timer");
         return Ok(());
@@ -461,25 +482,55 @@ async fn wait_for_timer(
     {
         return Err(ctx.halt("couldn't switch to the Handshake tab to read the timer"));
     }
-    // Jitter the target +/- 3 minutes around `target_minutes` so rounds don't
-    // all land on the exact same handle time. Signed, unlike the old version
-    // which only ever added and then clamped -- that made 40 an absolute
-    // ceiling rather than the midpoint it's meant to be.
     let raw = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_millis() as u64)
         .unwrap_or(0);
-    let jitter = (raw % 361) as i64 - 180; // -180..=180 seconds
-    let target_secs = ((target_minutes * 60) as i64 + jitter).max(60) as u64;
-    // A first reading at/past the un-jittered target submits immediately, so
-    // a round arriving past 40 min never waits out a positive jitter on top.
     let base_secs = target_minutes * 60;
+    let target_secs = timer_target_secs(target_minutes, raw);
     let mut first_read = true;
+    // Whatever the page reports, never sit here longer than the target in real
+    // time. A timer that is paused and won't resume, a frozen SPA, or a
+    // websocket that stays down would otherwise spin this loop forever with
+    // the task claimed and the evaluation unsubmitted. By the time this fires
+    // we have genuinely waited the full target on top of everything steps 1-7
+    // spent, so the handle time is plausible regardless of what the widget says.
+    let wall_deadline = tokio::time::Instant::now() + Duration::from_secs(target_secs);
+    let mut warned_unreadable = false;
 
     let mut last_report: Option<u64> = None;
     loop {
         ctx.guard().await?;
-        let v = ctx.eval(TIMER_READ_JS).await?;
+        if tokio::time::Instant::now() >= wall_deadline {
+            ctx.warn(format!(
+                "the page timer never reached {}:{:02}, but {}:{:02} has now passed by wall \
+                 clock -- submitting (real elapsed time is at least that long).",
+                target_secs / 60,
+                target_secs % 60,
+                target_secs / 60,
+                target_secs % 60
+            ));
+            return Ok(());
+        }
+        // A dropped websocket mid-wait must not abort the round: the CDP layer
+        // already retries each call for ~17s, and a longer outage just means we
+        // keep polling until the wall-clock deadline releases us. Stop and a
+        // deliberate halt still propagate.
+        let v = match ctx.eval(TIMER_READ_JS).await {
+            Ok(v) => v,
+            Err(e @ (GolemError::StoppedByUser | GolemError::Halted(_))) => return Err(e),
+            Err(e) => {
+                if !warned_unreadable {
+                    ctx.warn(format!(
+                        "lost contact with the task timer ({e}) -- retrying while the wait \
+                         runs down"
+                    ));
+                    warned_unreadable = true;
+                }
+                ctx.human_pause(5000, 9000).await?;
+                continue;
+            }
+        };
         let secs = v.get("secs").and_then(Value::as_u64);
         let running = v.get("running").and_then(Value::as_bool).unwrap_or(true);
         let gate = if first_read {
@@ -489,23 +540,18 @@ async fn wait_for_timer(
         };
         first_read = false;
         match secs {
+            // Present but unreadable. Keep looking -- it often becomes readable
+            // again on the next repaint -- and let the wall-clock deadline
+            // above end the wait if it never does.
             None => {
-                // Can't read it, and there is nobody to watch it instead.
-                // Submitting now would post an implausible handle time, so wait
-                // the target out by wall clock: the real task timer started
-                // before this point, so this over-waits, which is the safe
-                // direction to be wrong in.
-                ctx.warn(format!(
-                    "can't read the task timer, so waiting the full {target_minutes} min by \
-                     wall clock before submitting (this over-waits -- the task timer started \
-                     earlier)."
-                ));
-                let until = tokio::time::Instant::now() + Duration::from_secs(target_secs);
-                while tokio::time::Instant::now() < until {
-                    ctx.guard().await?;
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                if !warned_unreadable {
+                    ctx.warn(
+                        "can't read the task timer -- waiting the full target out by wall \
+                         clock instead (this over-waits, which is the safe direction).",
+                    );
+                    warned_unreadable = true;
                 }
-                return Ok(());
+                ctx.human_pause(5000, 9000).await?;
             }
             Some(s) if s >= gate => {
                 ctx.output(format!(
@@ -517,7 +563,9 @@ async fn wait_for_timer(
             }
             Some(s) => {
                 if !running {
-                    // A paused timer never reaches the target; resume it.
+                    // A paused timer never reaches the target; resume it. This
+                    // is retried every pass, so a missed cursor click just
+                    // means another go next time round.
                     if let (Some(x), Some(y)) = (
                         v.get("bx").and_then(Value::as_f64),
                         v.get("by").and_then(Value::as_f64),
@@ -565,6 +613,67 @@ async fn between_clicks(ctx: &mut WorkflowCtx) -> Result<()> {
     Ok(())
 }
 
+/// How long the timer must read before the round may submit: `target_minutes`
+/// plus up to 3 minutes of jitter drawn from `raw` (any arbitrary number --
+/// the caller passes the current millisecond).
+///
+/// The jitter is UNSIGNED on purpose. It used to be `raw % 361 - 180`, i.e.
+/// +/-3 min around the target, which made 40 a midpoint and let rounds submit
+/// at 37:00. Handshake's own timer widget renders elapsed-over-target as
+/// `00:06:36/00:40:00`, so 40:00 is the handle time the platform states it
+/// wants, and coming in under it is the failure worth designing against.
+/// Scattering above the floor keeps rounds from all landing on an identical
+/// handle time just as well as scattering around it did.
+fn timer_target_secs(target_minutes: u64, raw: u64) -> u64 {
+    target_minutes * 60 + raw % 181 // 0..=180 seconds
+}
+
+/// The controlled tab's URL, retried briefly before giving up.
+///
+/// `current_url()` is served from chromiumoxide's cached frame manager, so a
+/// tab that is mid-navigation -- or a connection the CDP supervisor is busy
+/// re-establishing -- reports an error or a blank URL that a moment later
+/// reads fine. Every caller here turns a blank URL into "you're on the wrong
+/// page" and halts the run, which is a bad thing to do on a transient blip.
+/// An empty return means genuinely unreadable.
+async fn current_url_settled(ctx: &WorkflowCtx) -> String {
+    for attempt in 0..5 {
+        if let Ok(u) = ctx.browser.current_url().await
+            && !u.is_empty()
+        {
+            return u;
+        }
+        if attempt < 4 {
+            let _ = ctx.human_pause(400, 800).await;
+        }
+    }
+    String::new()
+}
+
+/// Whether a Handshake tab is open, retried before believing "no".
+///
+/// `list_targets` is one of the few CDP calls with no reconnect retry behind
+/// it: while the supervisor is re-attaching, the browser handle is `None` and
+/// it answers `Ok(vec![])` -- "there are no tabs at all". Halting the round on
+/// a single empty answer means a websocket blip strands a claimed task.
+async fn handshake_tab_exists(ctx: &WorkflowCtx) -> Result<bool> {
+    for attempt in 0..5 {
+        ctx.guard().await?;
+        if !ctx
+            .browser
+            .list_targets("ai.joinhandshake.com")
+            .await?
+            .is_empty()
+        {
+            return Ok(true);
+        }
+        if attempt < 4 {
+            ctx.human_pause(500, 900).await?;
+        }
+    }
+    Ok(false)
+}
+
 /// A round-counting input (`tasks` / `tasks_done`) as a plain count. Blank,
 /// missing and unparseable all mean 0, which the caller reads as "unlimited"
 /// -- a typo in the box must never silently cut the run short.
@@ -590,12 +699,64 @@ fn js_str(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-/// Click a plain Handshake button matched by its text.
+/// Wait for `find_js`'s control to appear, then press it.
 ///
-/// Returns whether it was found and clicked. A miss is NOT an error: the same
-/// control is absent when the step has already been taken -- including when
-/// the user pressed it by hand before Golem got there -- and skipping is
-/// exactly the right response to that.
+/// The press goes through [`util::click_submit_with`], which is the only click
+/// path here that actually checks its own work: it re-reads fresh coordinates
+/// before every attempt, treats "the control is still on the page" as a missed
+/// click, and escalates to a CDP click once the real cursor has failed twice.
+/// Every control this drives (Continue, Continue task, Confirm time, Next
+/// task) advances the wizard and disappears when pressed, so that check is
+/// meaningful for all of them.
+///
+/// This used to be a single unverified `click_at_cursor`. On Wayland the real
+/// cursor is the failure-prone part -- if it lands wrong there is nothing to
+/// notice it, and the run would sail past a wizard step it never actually
+/// took, only to fail much later somewhere unrelated.
+///
+/// Returns whether the control was found and pressed. Not finding it is NOT an
+/// error: the same control is absent when the step has already been taken --
+/// including when the user pressed it by hand before Golem got there -- and
+/// skipping is exactly the right response to that.
+async fn click_control(
+    ctx: &mut WorkflowCtx,
+    find_js: &str,
+    label: &str,
+    timeout: Duration,
+) -> Result<bool> {
+    if wait_for_coords(ctx, find_js, timeout).await?.is_none() {
+        ctx.output(format!(
+            "no '{label}' control visible -- skipping (already pressed, or this state \
+             doesn't show one)"
+        ));
+        return Ok(false);
+    }
+    if util::click_submit_with(ctx, find_js).await? {
+        ctx.output(format!("clicked '{label}'"));
+        return Ok(true);
+    }
+    // `click_submit_with` also reports false when the control was gone before
+    // it got a press in -- the user advancing the step by hand in the gap, or
+    // the page moving on by itself. That is the state we wanted anyway.
+    if ctx.eval(find_js).await?.get("x").is_none() {
+        ctx.output(format!(
+            "'{label}' went away before it could be pressed -- that step is done either way"
+        ));
+        return Ok(true);
+    }
+    // It was on the page, got clicked, and stayed. Report it and carry on:
+    // the checks further down (the answers re-verify, the submit's own
+    // enabled-check, the new-task-page test) are what decide whether the round
+    // really worked, and stopping here would strand a claimed task.
+    ctx.warn(format!(
+        "'{label}' was on the page but is still there after clicking -- carrying on, later \
+         checks will catch it if the step didn't take"
+    ));
+    Ok(false)
+}
+
+/// Click a plain Handshake button matched by its text. See [`click_control`]
+/// for how the press is verified.
 async fn click_button_by_text(
     ctx: &mut WorkflowCtx,
     pattern: &str,
@@ -603,21 +764,7 @@ async fn click_button_by_text(
     timeout: Duration,
 ) -> Result<bool> {
     let find_js = BUTTON_BY_TEXT_JS.replace("__PATTERN__", &js_str(pattern));
-    match wait_for_coords(ctx, &find_js, timeout).await? {
-        Some((x, y)) => {
-            let (x, y) = util::jittered(ctx, x, y);
-            ctx.click_at_cursor(x, y).await?;
-            ctx.output(format!("clicked '{label}'"));
-            Ok(true)
-        }
-        None => {
-            ctx.output(format!(
-                "no '{label}' control visible -- skipping (already pressed, or this state \
-                 doesn't show one)"
-            ));
-            Ok(false)
-        }
-    }
+    click_control(ctx, &find_js, label, timeout).await
 }
 
 /// Poll `find_js` (an IIFE returning `{x, y}` or null) until it yields
@@ -760,7 +907,12 @@ async fn answer_wizard_step(ctx: &mut WorkflowCtx, pattern: &str) -> Result<bool
         }
         ctx.human_pause(300, 600).await?;
     }
-    for _attempt in 0..2 {
+    // Two attempts, and the second one goes through CDP: the first attempt
+    // having missed is itself evidence the real cursor is the problem (bad
+    // window mapping, the compositor moved the window, another window took the
+    // click), and repeating it the same way would just miss again.
+    const ATTEMPTS: usize = 2;
+    for attempt in 1..=ATTEMPTS {
         let v = ctx.eval(&find_js).await?;
         let (Some(x), Some(y)) = (
             v.get("x").and_then(Value::as_f64),
@@ -771,8 +923,16 @@ async fn answer_wizard_step(ctx: &mut WorkflowCtx, pattern: &str) -> Result<bool
         if v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
             return Ok(true);
         }
+        let cdp = attempt == ATTEMPTS;
+        if cdp {
+            ctx.warn("the wizard answer didn't register -- retrying with a CDP click");
+        }
         let (x, y) = util::jittered(ctx, x, y);
-        ctx.click_at_cursor(x, y).await?;
+        if cdp {
+            ctx.click_at_cdp(x, y).await?;
+        } else {
+            ctx.click_at_cursor(x, y).await?;
+        }
         ctx.human_pause(400, 900).await?;
         // occasional idle drift between picking the option and hitting send
         let wander = {
@@ -787,7 +947,11 @@ async fn answer_wizard_step(ctx: &mut WorkflowCtx, pattern: &str) -> Result<bool
         if let Some((sx, sy)) = wait_for_coords(ctx, WIZARD_SEND_JS, Duration::from_secs(4)).await?
         {
             let (sx, sy) = util::jittered(ctx, sx, sy);
-            ctx.click_at_cursor(sx, sy).await?;
+            if cdp {
+                ctx.click_at_cdp(sx, sy).await?;
+            } else {
+                ctx.click_at_cursor(sx, sy).await?;
+            }
         }
         let confirm_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         while tokio::time::Instant::now() < confirm_deadline {
@@ -1074,6 +1238,31 @@ mod tests {
     /// older task carries two id groups, the newer review task one.
     const OLD: &str = "vs-1781035041-260608-multimodal-agent-arena";
     const NEW: &str = "vs-1785279484-multimodal-agent-arena-review";
+
+    /// The whole point of the timer: a round must never be handed in below the
+    /// target. Whatever millisecond the jitter is drawn from, the wait is at
+    /// least 40:00 and at most 43:00.
+    #[test]
+    fn the_timer_target_never_falls_below_the_asked_for_minutes() {
+        for raw in 0..1000u64 {
+            let secs = timer_target_secs(40, raw);
+            assert!(
+                (2400..=2580).contains(&secs),
+                "40 min target jittered out of range at raw={raw}: {secs}s"
+            );
+        }
+        // and it is a real spread, not a constant
+        let spread: std::collections::BTreeSet<u64> =
+            (0..1000u64).map(|r| timer_target_secs(40, r)).collect();
+        assert!(spread.len() > 100, "jitter collapsed to {} values", spread.len());
+    }
+
+    #[test]
+    fn the_timer_target_scales_with_the_requested_minutes() {
+        assert_eq!(timer_target_secs(1, 0), 60);
+        assert_eq!(timer_target_secs(120, 0), 7200);
+        assert_eq!(timer_target_secs(40, 180), 2580);
+    }
 
     #[test]
     fn arena_id_comes_from_the_task_url() {

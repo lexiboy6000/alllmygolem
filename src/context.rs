@@ -691,10 +691,58 @@ impl WorkflowCtx {
 
     /// Human click at explicit viewport coordinates — use this for the
     /// remote-desktop iframe / canvas where there is no queryable DOM.
+    ///
+    /// Honours `input_strategy`, so under `Native`/`Hybrid` this drives the
+    /// REAL cursor. That makes it the wrong thing to fall back to when the
+    /// real cursor is the part that's broken — use [`click_at_cdp`] there.
     pub async fn click_at(&mut self, x: f64, y: f64) -> Result<()> {
         self.info(format!("click @ ({x:.0},{y:.0})"));
         self.move_to(Point::new(x, y)).await?;
         self.press_release_at(MouseButton::Left, Point::new(x, y)).await
+    }
+
+    /// Human click at viewport coordinates dispatched through CDP `Input.*`,
+    /// regardless of the configured input strategy.
+    ///
+    /// This is what every "fall back to a CDP click" path must call.
+    /// [`click_at`] is NOT that: it is strategy-selected, so under
+    /// `Native`/`Hybrid` it hands `raw_move` the *viewport* coordinates it was
+    /// given and `raw_move` passes them to `mouse_move_abs` as *screen*
+    /// coordinates — no window offset added. That aims the real cursor at
+    /// (viewport x, viewport y) on the raw desktop and clicks whatever happens
+    /// to be there, which is exactly the mis-aim `viewport_screen_offset`
+    /// refuses to guess at. Going through CDP sidesteps the mapping entirely:
+    /// viewport coordinates are the only thing `Input.dispatchMouseEvent`
+    /// speaks, and it needs no window focus.
+    pub async fn click_at_cdp(&mut self, x: f64, y: f64) -> Result<()> {
+        let target = Point::new(x, y);
+        self.info(format!("cdp click @ ({x:.0},{y:.0})"));
+        let cfg = self.cfg();
+        let path = {
+            let mut rng = rand::rng();
+            humanize::mouse_path(self.last_mouse, target, &cfg, &mut rng)
+        };
+        for s in path {
+            self.guard().await?;
+            self.browser.mouse_move(s.point.x, s.point.y).await?;
+            if !s.delay.is_zero() {
+                tokio::time::sleep(s.delay).await;
+            }
+        }
+        let (settle, hold) = {
+            let mut rng = rand::rng();
+            (
+                humanize::pre_click_settle(&cfg, &mut rng),
+                humanize::click_hold(&cfg, &mut rng),
+            )
+        };
+        tokio::time::sleep(settle).await;
+        self.guard().await?;
+        self.browser.mouse_press(MouseButton::Left, x, y).await?;
+        tokio::time::sleep(hold).await;
+        self.browser.mouse_release(MouseButton::Left, x, y).await?;
+        self.last_mouse = target;
+        Ok(())
     }
 
     /// Screen-pixel position of the page viewport's origin: add it to
@@ -787,10 +835,10 @@ impl WorkflowCtx {
         self.guard().await?;
         if !self.input.is_available() {
             self.warn("native input unavailable -- falling back to CDP click");
-            return self.click_at(x, y).await;
+            return self.click_at_cdp(x, y).await;
         }
         if self.pointer_unmappable {
-            return self.click_at(x, y).await;
+            return self.click_at_cdp(x, y).await;
         }
         let (ox, oy) = match self.viewport_screen_offset().await {
             Ok(o) => o,
@@ -800,7 +848,7 @@ impl WorkflowCtx {
                     "couldn't map viewport to screen coordinates ({e}) -- using CDP clicks \
                      for the rest of this run"
                 ));
-                return self.click_at(x, y).await;
+                return self.click_at_cdp(x, y).await;
             }
         };
         let target = Point::new(x + ox, y + oy);
@@ -824,7 +872,7 @@ impl WorkflowCtx {
                     "native cursor click failed ({e}) -- using CDP clicks for the rest of \
                      this run"
                 ));
-                self.click_at(x, y).await
+                self.click_at_cdp(x, y).await
             }
         }
     }

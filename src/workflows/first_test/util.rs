@@ -495,7 +495,7 @@ pub async fn click_until_selected(ctx: &mut WorkflowCtx, find_js: &str) -> Resul
         if attempt < ATTEMPTS {
             ctx.click_at_cursor(x, y).await?;
         } else {
-            ctx.click_at(x, y).await?;
+            ctx.click_at_cdp(x, y).await?;
         }
         // give React a beat to repaint the button state before verifying
         ctx.human_pause(300, 600).await?;
@@ -566,7 +566,7 @@ pub async fn click_submit_with(ctx: &mut WorkflowCtx, find_js: &str) -> Result<b
         if attempt < ATTEMPTS {
             ctx.click_at_cursor(x, y).await?;
         } else {
-            ctx.click_at(x, y).await?;
+            ctx.click_at_cdp(x, y).await?;
         }
         clicked = true;
         let patience = if attempt == ATTEMPTS { FINAL_SETTLE } else { SETTLE };
@@ -700,7 +700,7 @@ async fn click_skip(ctx: &mut WorkflowCtx) -> Result<bool> {
         if attempt < ATTEMPTS {
             ctx.click_at_cursor(x, y).await?;
         } else {
-            ctx.click_at(x, y).await?;
+            ctx.click_at_cdp(x, y).await?;
         }
         // a skip takes a moment to go through / swap in the next task
         ctx.human_pause(900, 1600).await?;
@@ -2324,7 +2324,7 @@ pub async fn ensure_criteria_panel_open(ctx: &mut WorkflowCtx) -> Result<bool> {
         if attempt < ATTEMPTS {
             ctx.click_at_cursor(x, y).await?;
         } else {
-            ctx.click_at(x, y).await?;
+            ctx.click_at_cdp(x, y).await?;
         }
         // The drawer slides in over ~200ms; give the transition room plus a
         // beat for React to mount the rows inside it.
