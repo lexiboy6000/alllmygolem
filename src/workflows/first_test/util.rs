@@ -225,14 +225,15 @@ pub fn read_claude_answers(path: &std::path::Path) -> Result<ClaudeAnswers> {
 /// Returns `(applied, missed-labels)`. Shared by workflow 7 and the review
 /// workflow's "reviewer asked for changes -> re-apply" path.
 ///
-/// `paced` (workflow 7's first application only) additionally inserts a
-/// ~2-minute jittered break after every few selections -- see
-/// [`long_answer_break`]. Pacing is PURELY timing: every answer value still
-/// comes verbatim from `claude_answers`, each label keeps its own verdict
-/// through the click-order shuffle below, and every click re-finds and
-/// verifies its exact target (`click_until_selected`) exactly as before --
-/// so slower never means less accurate. The re-apply paths pass `false`:
-/// they run while a human reviewer waits, or right before submit.
+/// `paced` (workflow 7's first application only) spreads the whole pass over
+/// a budget picked up front by [`Pacer`], so the run takes about the same
+/// wall-clock time whether the rubric has five questions or thirty. Pacing is
+/// PURELY timing: every answer value still comes verbatim from
+/// `claude_answers`, each label keeps its own verdict through the click-order
+/// shuffle below, and every click re-finds and verifies its exact target
+/// (`click_until_selected`) exactly as before -- so slower never means less
+/// accurate. The re-apply paths pass `false`: they run while a human reviewer
+/// waits, or right before submit, and keep the old quick dwells.
 pub async fn apply_answers(
     ctx: &mut WorkflowCtx,
     answers: &ClaudeAnswers,
@@ -246,9 +247,17 @@ pub async fn apply_answers(
     ensure_criteria_panel_open(ctx).await?;
     let mut applied = 0usize;
     let mut missed: Vec<String> = Vec::new();
-    // Long-break pacing: selections left before the next ~2-minute break.
-    // u32::MAX effectively disables it on the unpaced paths.
-    let mut until_break: u32 = if paced { next_batch_size() } else { u32::MAX };
+    // Paced runs spend a fixed budget as idle time between selections; unpaced
+    // ones keep the old quick dwells, since they run with a submit waiting.
+    let started = tokio::time::Instant::now();
+    let mut pacer = paced.then(|| Pacer::new(answers.criteria.len()));
+    if let Some(p) = &pacer {
+        ctx.output(format!(
+            "pacing: spreading {} answer(s) over about {} min",
+            p.slots_left,
+            p.budget.as_secs() / 60
+        ));
+    }
     for (i, a) in answers.criteria.iter().enumerate() {
         // scope the (non-Send) thread rng so it never crosses an await
         let (b_first, reread, hesitate, wander, glance) = {
@@ -261,13 +270,10 @@ pub async fn apply_answers(
                 rng.random_bool(0.2),
             )
         };
-        if i > 0 {
-            // The long break fires at row boundaries only -- a person
-            // finishes the row they're reading before stepping away.
-            if until_break == 0 {
-                long_answer_break(ctx).await?;
-                until_break = next_batch_size();
-            }
+        // Paced runs get their reading time from the budget instead (spent in
+        // `idle_for`, which does the same drifting and glancing), so these
+        // fixed beats would be time spent twice.
+        if i > 0 && pacer.is_none() {
             // a beat to "read" the next criterion before rating it
             ctx.human_pause(700, 2600).await?;
             if wander {
@@ -296,27 +302,40 @@ pub async fn apply_answers(
             pair.swap(0, 1);
         }
         for (j, (label, want)) in pair.into_iter().enumerate() {
-            if j > 0 && hesitate {
-                // occasional second-guessing pause before the second pick
-                ctx.human_pause(1200, 3000).await?;
+            match pacer.as_mut() {
+                // One budget slot per selection, spent before the click.
+                Some(p) => {
+                    let gap = p.next_gap();
+                    idle_for(ctx, gap).await?;
+                }
+                None => {
+                    if j > 0 && hesitate {
+                        // occasional second-guessing pause before the second pick
+                        ctx.human_pause(1200, 3000).await?;
+                    }
+                }
             }
             let ok = click_criterion_button(ctx, a.number, label, want).await?;
-            until_break = until_break.saturating_sub(1);
             if ok {
                 applied += 1;
-                // dwell between individual selections like a person deciding
-                ctx.human_pause(350, 1900).await?;
+                if pacer.is_none() {
+                    // dwell between individual selections like a person deciding
+                    ctx.human_pause(350, 1900).await?;
+                }
             } else {
                 missed.push(format!("#{} {} -> {}", a.number, label, want));
             }
         }
     }
-    // the overall pick is the last "answer" -- it can land after a break too
-    if until_break == 0 {
-        long_answer_break(ctx).await?;
+    // the overall pick is the last selection, and takes the last budget slot
+    match pacer.as_mut() {
+        Some(p) => {
+            let gap = p.next_gap();
+            idle_for(ctx, gap).await?;
+        }
+        // weighing the overall verdict takes longer than a single row
+        None => ctx.human_pause(1000, 3600).await?,
     }
-    // weighing the overall verdict takes longer than a single row
-    ctx.human_pause(1000, 3600).await?;
     let (wander, glance) = {
         let mut rng = rand::rng();
         (rng.random_bool(0.35), rng.random_bool(0.15))
@@ -333,46 +352,186 @@ pub async fn apply_answers(
     } else {
         missed.push(format!("overall quality -> {}", answers.overall.winner));
     }
+    if pacer.is_some() {
+        let took = started.elapsed();
+        ctx.output(format!(
+            "pacing: answering took {} min {:02} s",
+            took.as_secs() / 60,
+            took.as_secs() % 60
+        ));
+    }
     Ok((applied, missed))
 }
 
-/// How many individual selections to make before the next long break.
-fn next_batch_size() -> u32 {
-    let mut rng = rand::rng();
-    rng.random_range(3..=7)
+/// Hands a fixed time budget out as idle gaps between selections.
+///
+/// The pacing used to be open-loop: a fixed dwell after every click plus a
+/// ~2-minute break every 3-7 selections. That made the run take as long as it
+/// took, scaling almost linearly with the rubric -- roughly 8 minutes for six
+/// questions and half an hour for thirty. A handle time that tracks question
+/// count that closely is a strange thing to publish, so the total is now
+/// chosen up front and spent, rather than accumulated.
+struct Pacer {
+    deadline: tokio::time::Instant,
+    budget: Duration,
+    /// Selections still to make, including the overall pick.
+    slots_left: u32,
 }
 
-/// A long "stepped away / reading carefully" break between batches of
-/// selections: near two minutes, jittered (85-155s target), slept in small
-/// humanized chunks -- each chunk is a `human_pause`, so Stop/Pause stay
-/// responsive throughout and the humanize layer adds its own jitter on top
-/// -- with occasional idle cursor drift. Timing only: it never touches which
-/// button gets clicked.
-async fn long_answer_break(ctx: &mut WorkflowCtx) -> Result<()> {
-    let target_ms: u64 = {
-        let mut rng = rand::rng();
-        rng.random_range(85_000..=155_000)
-    };
-    ctx.output(format!(
-        "pacing: taking a ~{}s break before the next batch of answers",
-        target_ms / 1000
-    ));
-    let start = tokio::time::Instant::now();
-    while start.elapsed() < Duration::from_millis(target_ms) {
-        ctx.human_pause(2500, 6000).await?;
-        // scope the (non-Send) thread rng so it never crosses an await
-        let (wander, glance) = {
-            let mut rng = rand::rng();
-            (rng.random_bool(0.12), rng.random_bool(0.08))
-        };
-        if wander {
-            ctx.wander_cursor().await?;
-        }
-        if glance {
-            ctx.wander_scroll().await?;
+impl Pacer {
+    fn new(criteria: usize) -> Self {
+        // two selections per criterion (Response A and B), plus the overall
+        let slots = (criteria.saturating_mul(2).saturating_add(1)) as u32;
+        let budget = answering_budget(criteria);
+        Self {
+            deadline: tokio::time::Instant::now() + budget,
+            budget,
+            slots_left: slots.max(1),
         }
     }
-    Ok(())
+
+    /// How long to idle before the next selection.
+    ///
+    /// Recomputed from what is actually left every time, so the total holds
+    /// even when a click runs far longer than planned (a slow re-render, a CDP
+    /// retry, a missed cursor click that had to be redone) or far shorter --
+    /// overspend on one gap and the rest quietly shrink to absorb it.
+    ///
+    /// Individual gaps are jittered hard, and about one in six is stretched
+    /// into a "stepped away" break. Both come out of the same budget, so the
+    /// texture never costs extra time. The multipliers average ~1.0 so the
+    /// spend stays even across the pass instead of front-loading and leaving
+    /// the last few answers squeezed together.
+    fn next_gap(&mut self) -> Duration {
+        self.next_gap_at(tokio::time::Instant::now())
+    }
+
+    /// [`next_gap`](Self::next_gap) against an explicit clock, so the spend can
+    /// be simulated in tests without sleeping through it.
+    fn next_gap_at(&mut self, now: tokio::time::Instant) -> Duration {
+        if self.slots_left == 0 {
+            return Duration::ZERO;
+        }
+        let remaining = self.deadline.saturating_duration_since(now);
+        let even = remaining / self.slots_left;
+        let last = self.slots_left == 1;
+        self.slots_left -= 1;
+        let factor = if last {
+            // The final gap takes exactly what is left. Jittering it would
+            // shave off whatever the multiplier fell short of with no later
+            // gap to make it up, so the pass would land consistently early.
+            1.0
+        } else {
+            let mut rng = rand::rng();
+            if rng.random_bool(0.16) {
+                rng.random_range(1.8..2.6)
+            } else {
+                rng.random_range(0.40..1.15)
+            }
+        };
+        // Never hand out more idle than the budget has left. A stretched
+        // "stepped away" gap drawn with only a slot or two to go asks for more
+        // than a whole even share -- 2.6x of half the remaining time is 1.3x
+        // the remaining time -- and without this the pass would overrun the
+        // budget it exists to enforce.
+        even.mul_f64(factor).min(MAX_GAP).min(remaining)
+    }
+}
+
+/// Longest single idle between two selections, so no one gap can swallow the
+/// whole budget. It is deliberately generous: a two-question rubric only
+/// reaches 21 minutes if the handful of gaps it has are each minutes long, and
+/// that reads fine -- most of the time on a short rubric goes on reading the
+/// two responses, not on the clicking. Capping tighter would make short
+/// rubrics finish early no matter what the budget said.
+const MAX_GAP: Duration = Duration::from_secs(480);
+
+/// The wall-clock window a paced pass over the answers aims to fill.
+///
+/// Centred near 25 minutes and only very loosely tied to how many criteria
+/// there are: a short rubric lands around 21 minutes and a long one around 29.
+/// The curve is logarithmic, so the marginal cost of one more question is
+/// tiny -- doubling the count moves the target by under two minutes -- and the
+/// jitter is wide enough that neighbouring rubric sizes overlap heavily. The
+/// intent is that handle time reads as a person working at their own pace,
+/// with question count barely detectable in it, rather than as a function of
+/// the rubric's length.
+fn answering_budget(criteria: usize) -> Duration {
+    let jitter: f64 = {
+        let mut rng = rand::rng();
+        rng.random_range(-BUDGET_JITTER_MIN..BUDGET_JITTER_MIN)
+    };
+    let mins = (budget_center_minutes(criteria) + jitter).clamp(BUDGET_MIN, BUDGET_MAX);
+    Duration::from_secs_f64(mins * 60.0)
+}
+
+/// Minutes at or below [`NARROW_RUBRIC`] questions, and at or above
+/// [`WIDE_RUBRIC`].
+const BUDGET_FLOOR_MIN: f64 = 21.0;
+const BUDGET_CEIL_MIN: f64 = 29.0;
+/// The rubric sizes the curve is anchored between. Both ends are real sizes
+/// rather than the degenerate extremes: anchoring the floor at a single
+/// question would have spent most of the curve's range on rubrics that don't
+/// occur, leaving a genuinely short one nearer 23 minutes than the 21 wanted.
+const NARROW_RUBRIC: f64 = 3.0;
+const WIDE_RUBRIC: f64 = 30.0;
+/// Random slack either side of the curve. Wide enough that neighbouring
+/// rubric sizes overlap, which is what keeps the question count from being
+/// readable off a single handle time.
+const BUDGET_JITTER_MIN: f64 = 1.5;
+/// Hard bounds on the result, jitter included.
+const BUDGET_MIN: f64 = 20.0;
+const BUDGET_MAX: f64 = 30.0;
+
+/// The un-jittered centre of the budget, in minutes, for a rubric of
+/// `criteria` questions. Split out from [`answering_budget`] so the shape of
+/// the curve can be asserted without sampling the jitter.
+fn budget_center_minutes(criteria: usize) -> f64 {
+    let n = (criteria.max(1)) as f64;
+    let t = ((n.ln() - NARROW_RUBRIC.ln()) / (WIDE_RUBRIC.ln() - NARROW_RUBRIC.ln())).clamp(0.0, 1.0);
+    BUDGET_FLOOR_MIN + (BUDGET_CEIL_MIN - BUDGET_FLOOR_MIN) * t
+}
+
+/// Spend `total` idling, the way the fixed-length break this replaces did:
+/// humanized sleep chunks -- so Stop/Pause stay responsive throughout and the
+/// humanize layer jitters on top -- with occasional cursor drift and page
+/// glances. Timing only: it never touches which button gets clicked.
+async fn idle_for(ctx: &mut WorkflowCtx, total: Duration) -> Result<()> {
+    if total < Duration::from_millis(300) {
+        return Ok(());
+    }
+    if total >= Duration::from_secs(45) {
+        ctx.output(format!(
+            "pacing: idling ~{}s before the next answer",
+            total.as_secs()
+        ));
+    }
+    let start = tokio::time::Instant::now();
+    loop {
+        let left = total.saturating_sub(start.elapsed());
+        if left < Duration::from_millis(300) {
+            return Ok(());
+        }
+        // Chunks shrink as the gap runs out, so the idle lands on its target
+        // instead of overshooting it by most of a chunk.
+        let hi = (left.as_millis() as u64).min(6000);
+        let lo = (hi / 3).max(150).min(hi.saturating_sub(1));
+        ctx.human_pause(lo, hi).await?;
+        // Drifting and glancing take real time, so only when there is room.
+        if left > Duration::from_secs(15) {
+            // scope the (non-Send) thread rng so it never crosses an await
+            let (wander, glance) = {
+                let mut rng = rand::rng();
+                (rng.random_bool(0.12), rng.random_bool(0.08))
+            };
+            if wander {
+                ctx.wander_cursor().await?;
+            }
+            if glance {
+                ctx.wander_scroll().await?;
+            }
+        }
+    }
 }
 
 /// Re-check (without clicking) that every answer still shows as selected on
@@ -2804,5 +2963,223 @@ mod tests {
         assert_eq!(percent_decode("%2E%2E"), "..");
         // an encoded slash surfaces for the caller's contains('/') check
         assert_eq!(percent_decode("a%2Fb"), "a/b");
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    /// The anchors asked for: a short rubric lands near 21 minutes, a long one
+    /// near 29, and the middle sits around 25.
+    #[test]
+    fn the_budget_curve_hits_its_anchors() {
+        // at or below the narrow anchor, and at or above the wide one, the
+        // curve is flat -- rubrics that extreme are all treated the same
+        assert!((budget_center_minutes(3) - 21.0).abs() < 0.01);
+        assert!((budget_center_minutes(1) - 21.0).abs() < 0.01);
+        assert!((budget_center_minutes(30) - 29.0).abs() < 0.01);
+        assert!((budget_center_minutes(90) - 29.0).abs() < 0.01);
+        // a mid-sized rubric is near the 25 min centre
+        let mid = budget_center_minutes(10);
+        assert!((24.0..=26.0).contains(&mid), "10 questions -> {mid} min");
+    }
+
+    /// The whole point: question count must barely show through. One more
+    /// question is worth seconds, and even a doubling is worth under two
+    /// minutes -- comfortably inside the +/-1.5 min of jitter laid on top.
+    #[test]
+    fn the_correlation_with_question_count_is_subtle() {
+        // The steepest step is at the narrow end, where one more question is
+        // a large proportional change -- 3 to 4 is a third more work. Even
+        // there it is worth about a minute, well inside the jitter.
+        for n in 3..40usize {
+            let step = budget_center_minutes(n + 1) - budget_center_minutes(n);
+            assert!(
+                (0.0..1.1).contains(&step),
+                "question {n} -> {} added {step} min, too coarse a step",
+                n + 1
+            );
+        }
+        // and past the first few it is seconds, not minutes
+        for n in 8..40usize {
+            let step = budget_center_minutes(n + 1) - budget_center_minutes(n);
+            assert!(step < 0.5, "question {n} -> {} added {step} min", n + 1);
+        }
+        for n in [3usize, 5, 8, 10, 15] {
+            let doubling = budget_center_minutes(n * 2) - budget_center_minutes(n);
+            assert!(
+                doubling < 2.0 * BUDGET_JITTER_MIN,
+                "doubling {n} -> {} moved the budget {doubling} min, more than the jitter hides",
+                n * 2
+            );
+        }
+    }
+
+    /// More questions never means less time, however subtle the slope.
+    #[test]
+    fn the_budget_never_decreases_with_more_questions() {
+        for n in 1..80usize {
+            assert!(
+                budget_center_minutes(n + 1) >= budget_center_minutes(n) - f64::EPSILON,
+                "budget went down between {n} and {}",
+                n + 1
+            );
+        }
+    }
+
+    /// Jitter included, and for any rubric size, the budget stays inside the
+    /// 25 +/- 5 minute window.
+    #[test]
+    fn the_budget_stays_within_25_plus_or_minus_5() {
+        for criteria in [0usize, 1, 3, 6, 12, 25, 40, 100] {
+            for _ in 0..500 {
+                let mins = answering_budget(criteria).as_secs_f64() / 60.0;
+                assert!(
+                    (20.0..=30.0).contains(&mins),
+                    "{criteria} questions produced a {mins} min budget"
+                );
+            }
+        }
+    }
+
+    /// A rubric with no criteria at all still gets a real budget rather than
+    /// dividing by zero -- only the overall pick is clicked in that case.
+    #[test]
+    fn an_empty_rubric_still_paces() {
+        let p = Pacer::new(0);
+        assert_eq!(p.slots_left, 1);
+        assert!(p.budget >= Duration::from_secs(20 * 60));
+    }
+
+    /// Walk a pacer through a whole rubric against a simulated clock, with
+    /// each click costing `click` on top of the gap. Returns how long the
+    /// pass took end to end, and its budget.
+    fn simulate(criteria: usize, click: Duration) -> (Duration, Duration) {
+        let mut p = Pacer::new(criteria);
+        let budget = p.budget;
+        let start = p.deadline - budget;
+        let mut now = start;
+        for _ in 0..p.slots_left {
+            now += p.next_gap_at(now) + click;
+        }
+        assert_eq!(p.slots_left, 0, "every slot should have been handed out");
+        (now - start, budget)
+    }
+
+    /// The point of the whole exercise: however many questions there are, the
+    /// pass lands near its budget rather than running as long as it happens to
+    /// take. The clock has to be simulated -- the gaps self-correct against
+    /// elapsed time, so a pacer polled without time passing is meaningless.
+    #[test]
+    fn a_paced_pass_lands_near_its_budget() {
+        for criteria in [3usize, 5, 8, 12, 20, 30] {
+            for _ in 0..200 {
+                let (took, budget) = simulate(criteria, Duration::from_millis(800));
+                let ratio = took.as_secs_f64() / budget.as_secs_f64();
+                assert!(
+                    (0.95..=1.15).contains(&ratio),
+                    "{criteria} questions took {took:?} against a {budget:?} budget"
+                );
+            }
+        }
+    }
+
+    /// What the pacing is actually for: the wall time barely moves as the
+    /// rubric grows. One question and thirty are a 30x difference in work and
+    /// under nine minutes apart, where the old open-loop pacing put them
+    /// roughly 8 and 30 minutes apart.
+    #[test]
+    fn wall_time_barely_tracks_the_question_count() {
+        let mean = |criteria: usize| {
+            let n = 300;
+            (0..n)
+                .map(|_| simulate(criteria, Duration::from_millis(800)).0.as_secs_f64() / 60.0)
+                .sum::<f64>()
+                / n as f64
+        };
+        // the anchors asked for: a short rubric near 21, a long one near 29
+        let short = mean(3);
+        let mid = mean(10);
+        let long = mean(30);
+        assert!((20.0..=23.0).contains(&short), "3 questions -> {short} min");
+        assert!((24.0..=27.0).contains(&mid), "10 questions -> {mid} min");
+        assert!((27.0..=30.0).contains(&long), "30 questions -> {long} min");
+        assert!(
+            long - short < 9.0,
+            "3 vs 30 questions differ by {} min -- too readable",
+            long - short
+        );
+    }
+
+    /// One or two questions can't fill the budget: there are only three or
+    /// five gaps to spread it over and no single one may run forever. They
+    /// finish early rather than staring, which is the right trade -- but they
+    /// must still take the better part of the window, not minutes.
+    #[test]
+    fn a_degenerate_rubric_finishes_early_but_not_fast() {
+        for criteria in [1usize, 2] {
+            let slots = (criteria * 2 + 1) as u32;
+            let click = Duration::from_millis(800);
+            for _ in 0..200 {
+                let (took, budget) = simulate(criteria, click);
+                // the only thing it can exceed the budget by is the clicking
+                assert!(
+                    took <= budget + click * slots,
+                    "{criteria} questions overran: {took:?} against {budget:?}"
+                );
+                assert!(
+                    took >= Duration::from_secs(14 * 60),
+                    "{criteria} questions rushed it in {took:?}"
+                );
+            }
+        }
+    }
+
+    /// Slow clicks come out of the gaps rather than being added on top, so a
+    /// page that fights back doesn't stretch the handle time.
+    #[test]
+    fn slow_clicks_are_absorbed_rather_than_added() {
+        for _ in 0..200 {
+            // 8s per selection on a 12-question rubric is ~3.5 min of clicking
+            let (took, budget) = simulate(12, Duration::from_secs(8));
+            assert!(
+                took.as_secs_f64() <= budget.as_secs_f64() * 1.15,
+                "slow clicks pushed the pass to {took:?} against a {budget:?} budget"
+            );
+        }
+    }
+
+    /// Clicking so slow it eats the whole budget can only ever overrun by the
+    /// clicking itself: once the deadline is past, `next_gap` hands out zero
+    /// rather than going negative or wrapping.
+    #[test]
+    fn a_budget_eaten_by_clicking_just_stops_idling() {
+        const CRITERIA: usize = 12;
+        let slots = (CRITERIA * 2 + 1) as u32;
+        let click = Duration::from_secs(120);
+        for _ in 0..50 {
+            let (took, budget) = simulate(CRITERIA, click);
+            assert!(
+                took <= click * slots + budget,
+                "runaway overrun: {took:?} for {slots} slots of {click:?} plus a {budget:?} budget"
+            );
+        }
+    }
+
+    /// No single gap may swallow the budget, however few slots there are to
+    /// spread it over.
+    #[test]
+    fn no_single_gap_exceeds_the_cap() {
+        for criteria in [0usize, 1, 2, 40] {
+            let mut p = Pacer::new(criteria);
+            let start = p.deadline - p.budget;
+            let mut now = start;
+            for _ in 0..p.slots_left {
+                let g = p.next_gap_at(now);
+                assert!(g <= MAX_GAP, "{criteria} questions produced a {g:?} gap");
+                now += g;
+            }
+        }
     }
 }
