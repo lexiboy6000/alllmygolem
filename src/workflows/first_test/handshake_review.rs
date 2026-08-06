@@ -42,6 +42,10 @@
 //!   not a midpoint: Handshake's own widget reads `00:06:36/00:40:00`, so 40
 //!   minutes is what the platform asks for, and the jitter only ever scatters
 //!   rounds above it;
+//! - a task whose timer never ran at all -- paused at 0:00 through the whole
+//!   wait with every resume attempt failing, i.e. Handshake's start gate is
+//!   still up -- halts BEFORE the multimango submit, so a wedged round is
+//!   left wholly unsubmitted instead of half-submitted;
 //! - the answers are re-verified against the live page right before the
 //!   multimango submit (the platform can swap the open task under us);
 //! - Stop discards the queued next round, so stopping ends the whole loop.
@@ -270,8 +274,39 @@ impl Workflow for HandshakeReviewAndSubmit {
         // Claude's judging) have normally already pushed the timer past 40 min
         // by the time the chain reaches here. We are on the Handshake tab, and
         // `wait_for_timer` needs it to read the timer.
+        //
+        // The jittered target and the wall-clock epoch are drawn ONCE and
+        // shared with the re-check after the multimango submit. They used to be
+        // drawn per call, which meant a round whose timer was stuck spent the
+        // full wait twice -- 80+ minutes of wall clock on a 40-minute target.
+        let raw_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_millis() as u64)
+            .unwrap_or(0);
+        let base_secs = target_minutes * 60;
+        let target_secs = timer_target_secs(target_minutes, raw_ms);
+        let wait_epoch = tokio::time::Instant::now();
         ctx.step("wait for the Handshake task timer").await?;
-        wait_for_timer(ctx, timeout, target_minutes).await?;
+        let waited = wait_for_timer(ctx, timeout, base_secs, target_secs, wait_epoch).await?;
+        if waited == TimerWaitOutcome::NeverStarted {
+            // The task was never started on the Handshake side: its timer sat
+            // paused at zero through the whole wait and nothing would resume
+            // it (round 3 on 2026-08-06 hit exactly this -- the start-gate
+            // dialog would not dismiss). NOTHING has been submitted yet, and
+            // stopping here keeps it that way: submitting multimango now
+            // would rate a task whose Handshake half is wedged, leaving a
+            // half-submitted round that cannot be cleanly retried. The
+            // Handshake submit would fail anyway, as it did that night.
+            dump_buttons(ctx).await;
+            return Err(util::halt_now(
+                ctx,
+                "the Handshake task never started -- its timer sat paused at 0:00 through \
+                 the whole wait and could not be resumed (the visible buttons were just \
+                 logged). NOT submitting on either platform. Un-stick the Handshake page \
+                 by hand (start/resume the task), then re-run this workflow.",
+            )
+            .await);
+        }
 
         // ---- submit the evaluation on multimango ------------------------
         ctx.step("submit the evaluation on multimango").await?;
@@ -336,17 +371,41 @@ impl Workflow for HandshakeReviewAndSubmit {
         // timer only moves forward and the wait above already cleared the
         // target -- but the multimango submit sits between the two, and if
         // Handshake paused the timer while we were away this is what notices
-        // and resumes it.
+        // and resumes it. Same target and epoch as the first wait, so a stuck
+        // timer costs a few resume attempts here, never a second full wait.
+        // Whatever it reports, the Handshake submit below is attempted:
+        // multimango is already submitted, so pressing on is the only path
+        // that can still finish the round (and the submit's own failure
+        // handling halts if the page won't take it).
         ctx.step("re-check the Handshake task timer").await?;
-        wait_for_timer(ctx, timeout, target_minutes).await?;
+        let _ = wait_for_timer(ctx, timeout, base_secs, target_secs, wait_epoch).await?;
         // "I submitted my time on Multimango" was already answered earlier in
         // the wizard -- all that's left here is the final submit.
         between_clicks(ctx).await?;
-        if !util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await? {
+        let mut submitted = util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await?;
+        if !submitted {
+            // Multimango is already submitted, so a halt here strands a
+            // half-finished round -- worth one recovery pass first. The two
+            // states seen in the wild that hide the Submit button: a dialog
+            // with its own Continue sitting over the page, and the final
+            // wizard step having been re-asked. Handle both, then retry once.
+            ctx.warn(
+                "the Handshake Submit button wasn't found or never enabled -- trying to \
+                 recover (dismissing any dialog, re-answering the final wizard step)",
+            );
+            dump_buttons(ctx).await;
+            click_control(ctx, CONTINUE_STEP_JS, "Continue", Duration::from_secs(5)).await?;
+            between_clicks(ctx).await?;
+            let _ = answer_wizard_step(ctx, "i submitted my (task|time) on multimango").await?;
+            between_clicks(ctx).await?;
+            submitted = util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await?;
+        }
+        if !submitted {
             return Err(util::halt_now(
                 ctx,
-                "the Handshake Submit button wasn't found or never enabled (is the \
-                 task-type still selected?). Submit by hand.",
+                "the Handshake Submit button wasn't found or never enabled, even after a \
+                 recovery attempt (is the task-type still selected?). The multimango side \
+                 IS submitted -- finish the Handshake side by hand.",
             )
             .await);
         }
@@ -449,32 +508,50 @@ impl Workflow for HandshakeReviewAndSubmit {
 // timer
 // ---------------------------------------------------------------------------
 
+/// How a [`wait_for_timer`] call ended, so the caller can tell "the wait is
+/// satisfied" apart from "the wait gave up on a task that never ran".
+#[derive(PartialEq)]
+enum TimerWaitOutcome {
+    /// The page timer reached the target: the normal case.
+    TargetReached,
+    /// The page timer never got there, but the target has genuinely elapsed
+    /// on the wall clock -- and the timer was seen running (or was never
+    /// readable at all), so the task itself is live. Proceeding is safe.
+    WallClockElapsed,
+    /// The target elapsed on the wall clock with the timer readable the whole
+    /// time and NEVER seen running past the first moments: the task was never
+    /// actually started (Handshake's start gate is still up), and every
+    /// attempt to resume it failed. Submitting now would post a zero handle
+    /// time -- the caller decides, because what is at stake differs by call
+    /// site.
+    NeverStarted,
+}
+
 /// Read the Handshake task timer and hold the round until it reaches
-/// `target_minutes` (plus up to 3 min of jitter). `target_minutes` is a FLOOR,
-/// not a midpoint: Handshake's own timer widget renders elapsed-over-target as
-/// `00:06:36/00:40:00`, so the platform itself states 40:00 as the handle time
-/// it expects, and submitting under that is the thing worth avoiding. The
-/// jitter therefore only ever scatters rounds ABOVE the floor, so no round is
-/// submitted at less than the target.
+/// `target_secs` (drawn once per round via [`timer_target_secs`] -- both the
+/// wait and the later re-check share it, and share `epoch`, so the round waits
+/// the target ONCE, not once per call).
 ///
-/// A first reading already at/past the plain target returns immediately: the
-/// jitter stretches a wait that is happening anyway, it never delays a round
-/// that arrives late (the common case, since Claude's judging in steps 1-7
-/// usually runs past 40 min on its own).
+/// A first reading already at/past `base_secs` (the un-jittered floor) returns
+/// immediately: the jitter stretches a wait that is happening anyway, it never
+/// delays a round that arrives late (the common case, since Claude's judging
+/// in steps 1-7 usually runs past 40 min on its own).
 ///
-/// If the timer is paused, it is resumed. If it can't be read -- unreadable,
-/// or the browser connection dropped mid-wait -- the wall-clock deadline below
-/// carries the wait instead, so a frozen or unresumable timer can never hang
-/// the round forever.
+/// If the timer is paused, it is resumed -- escalating from a cursor click on
+/// the timer button, to a CDP click, to the paused-dialog's own Continue
+/// button (when Handshake pauses a task it covers the page with a dialog, and
+/// an overlay eats clicks aimed at the header underneath it). If none of that
+/// works the clicking STOPS rather than repeating forever: hammering the same
+/// 24px button every few seconds for half an hour is the least human trace
+/// this program could possibly leave. The wall-clock deadline (`epoch` +
+/// `target_secs`) bounds the whole wait either way.
 async fn wait_for_timer(
     ctx: &mut WorkflowCtx,
     switch_timeout: Duration,
-    target_minutes: u64,
-) -> Result<()> {
-    // No "0 means don't wait" escape hatch: callers resolve `target_minutes`
-    // through `resolve_target_minutes`, which never returns less than the
-    // floor. A skip-the-wait branch inside the one function whose entire job is
-    // to enforce the wait is the sort of thing that quietly becomes reachable.
+    base_secs: u64,
+    target_secs: u64,
+    epoch: tokio::time::Instant,
+) -> Result<TimerWaitOutcome> {
     if !ctx
         .browser
         .switch_to_target("ai.joinhandshake.com", "", switch_timeout)
@@ -482,36 +559,29 @@ async fn wait_for_timer(
     {
         return Err(ctx.halt("couldn't switch to the Handshake tab to read the timer"));
     }
-    let raw = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_millis() as u64)
-        .unwrap_or(0);
-    let base_secs = target_minutes * 60;
-    let target_secs = timer_target_secs(target_minutes, raw);
     let mut first_read = true;
     // Whatever the page reports, never sit here longer than the target in real
-    // time. A timer that is paused and won't resume, a frozen SPA, or a
-    // websocket that stays down would otherwise spin this loop forever with
-    // the task claimed and the evaluation unsubmitted. By the time this fires
-    // we have genuinely waited the full target on top of everything steps 1-7
-    // spent, so the handle time is plausible regardless of what the widget says.
-    let wall_deadline = tokio::time::Instant::now() + Duration::from_secs(target_secs);
+    // time past `epoch`. A timer that is paused and won't resume, a frozen
+    // SPA, or a websocket that stays down would otherwise spin this loop
+    // forever with the task claimed and the evaluation unsubmitted.
+    let wall_deadline = epoch + Duration::from_secs(target_secs);
     let mut warned_unreadable = false;
+    // Whether the timer was ever seen actually counting: running, or paused
+    // with real elapsed time on it. Distinguishes "Handshake paused a live
+    // task" (proceed on wall clock) from "the task was never started".
+    let mut ever_ran = false;
+    let mut ever_readable = false;
+    // Paused-timer resume attempts so far. Drives the escalation ladder and
+    // the give-up: after HOPELESS attempts, resumes are retried only sparsely.
+    let mut resume_attempts: u32 = 0;
+    const HOPELESS: u32 = 5;
+    /// Once hopeless, one fresh resume attempt roughly every N polls (~2 min).
+    const SPARSE_EVERY: u32 = 16;
 
     let mut last_report: Option<u64> = None;
     loop {
         ctx.guard().await?;
-        if tokio::time::Instant::now() >= wall_deadline {
-            ctx.warn(format!(
-                "the page timer never reached {}:{:02}, but {}:{:02} has now passed by wall \
-                 clock -- submitting (real elapsed time is at least that long).",
-                target_secs / 60,
-                target_secs % 60,
-                target_secs / 60,
-                target_secs % 60
-            ));
-            return Ok(());
-        }
+        let deadline_passed = tokio::time::Instant::now() >= wall_deadline;
         // A dropped websocket mid-wait must not abort the round: the CDP layer
         // already retries each call for ~17s, and a longer outage just means we
         // keep polling until the wall-clock deadline releases us. Stop and a
@@ -520,6 +590,10 @@ async fn wait_for_timer(
             Ok(v) => v,
             Err(e @ (GolemError::StoppedByUser | GolemError::Halted(_))) => return Err(e),
             Err(e) => {
+                if deadline_passed {
+                    ctx.warn(wall_clock_msg(target_secs));
+                    return Ok(TimerWaitOutcome::WallClockElapsed);
+                }
                 if !warned_unreadable {
                     ctx.warn(format!(
                         "lost contact with the task timer ({e}) -- retrying while the wait \
@@ -533,6 +607,14 @@ async fn wait_for_timer(
         };
         let secs = v.get("secs").and_then(Value::as_u64);
         let running = v.get("running").and_then(Value::as_bool).unwrap_or(true);
+        if secs.is_some() {
+            ever_readable = true;
+        }
+        // A paused timer showing minutes of elapsed time DID run; one at 0:00
+        // never did. The 5-min line just keeps repaint flicker out of it.
+        if running || secs.is_some_and(|s| s >= 300) {
+            ever_ran = true;
+        }
         let gate = if first_read {
             target_secs.min(base_secs)
         } else {
@@ -542,8 +624,12 @@ async fn wait_for_timer(
         match secs {
             // Present but unreadable. Keep looking -- it often becomes readable
             // again on the next repaint -- and let the wall-clock deadline
-            // above end the wait if it never does.
+            // end the wait if it never does.
             None => {
+                if deadline_passed {
+                    ctx.warn(wall_clock_msg(target_secs));
+                    return Ok(TimerWaitOutcome::WallClockElapsed);
+                }
                 if !warned_unreadable {
                     ctx.warn(
                         "can't read the task timer -- waiting the full target out by wall \
@@ -559,21 +645,30 @@ async fn wait_for_timer(
                     s / 60,
                     s % 60
                 ));
-                return Ok(());
+                return Ok(TimerWaitOutcome::TargetReached);
             }
             Some(s) => {
                 if !running {
-                    // A paused timer never reaches the target; resume it. This
-                    // is retried every pass, so a missed cursor click just
-                    // means another go next time round.
-                    if let (Some(x), Some(y)) = (
-                        v.get("bx").and_then(Value::as_f64),
-                        v.get("by").and_then(Value::as_f64),
-                    ) {
-                        ctx.output("task timer is paused -- resuming it");
-                        let (x, y) = util::jittered(ctx, x, y);
-                        ctx.click_at_cursor(x, y).await?;
-                    }
+                    resume_attempts =
+                        try_resume_timer(ctx, &v, resume_attempts, HOPELESS, SPARSE_EVERY)
+                            .await?;
+                } else {
+                    // It resumed (or was never stuck); a later pause starts a
+                    // fresh ladder instead of continuing a spent one.
+                    resume_attempts = 0;
+                }
+                // Past the deadline, a still-paused timer gets the few ladder
+                // steps a fresh pause is owed (the pause may have just
+                // happened, e.g. while we were away submitting on multimango)
+                // -- but not the sparse forever-retry, because the wall clock
+                // has already covered the wait.
+                if deadline_passed && (running || resume_attempts >= HOPELESS.min(3)) {
+                    ctx.warn(wall_clock_msg(target_secs));
+                    return Ok(if ever_ran || !ever_readable {
+                        TimerWaitOutcome::WallClockElapsed
+                    } else {
+                        TimerWaitOutcome::NeverStarted
+                    });
                 }
                 // Progress note roughly once a minute.
                 if last_report.is_none_or(|r| s.saturating_sub(r) >= 60) {
@@ -590,6 +685,109 @@ async fn wait_for_timer(
             }
         }
     }
+}
+
+/// The warning for a wait released by the wall clock rather than the page
+/// timer. Factored out so every exit says the same thing.
+fn wall_clock_msg(target_secs: u64) -> String {
+    format!(
+        "the page timer never reached {}:{:02}, but that long has now passed by wall \
+         clock -- moving on (real elapsed time is at least that long).",
+        target_secs / 60,
+        target_secs % 60
+    )
+}
+
+/// One step of the paused-timer resume ladder. Takes how many attempts have
+/// been made and returns the new count.
+///
+/// The ladder exists because a paused Handshake task has two very different
+/// shapes: a plain paused timer, where clicking the header button (`bx`/`by`
+/// in `reading`, from [`TIMER_READ_JS`]) resumes it -- and the paused-task
+/// DIALOG, which covers the page with an overlay that eats clicks aimed at
+/// that button, and is dismissed by its own Continue control instead. So:
+/// cursor click on the button, then a CDP click (in case the cursor's
+/// screen-mapping is what missed), then the dialog's Continue. After
+/// `hopeless` failed attempts it stops clicking every poll -- repeating an
+/// identical failed click every few seconds for half an hour is the loudest
+/// possible automation signature -- and retries just once every
+/// `sparse_every` polls in case the page unsticks itself.
+async fn try_resume_timer(
+    ctx: &mut WorkflowCtx,
+    reading: &Value,
+    attempts: u32,
+    hopeless: u32,
+    sparse_every: u32,
+) -> Result<u32> {
+    let button = (
+        reading.get("bx").and_then(Value::as_f64),
+        reading.get("by").and_then(Value::as_f64),
+    );
+    match attempts {
+        0 => {
+            ctx.output("task timer is paused -- resuming it");
+            if let (Some(x), Some(y)) = button {
+                let (x, y) = util::jittered(ctx, x, y);
+                ctx.click_at_cursor(x, y).await?;
+            }
+        }
+        1 => {
+            // The cursor click didn't take. The two usual reasons are a
+            // screen-mapping miss (a CDP click sidesteps that) or the paused
+            // dialog's overlay (nothing aimed at the button can work; the
+            // next rung handles it).
+            if let (Some(x), Some(y)) = button {
+                ctx.output("timer still paused -- retrying with a CDP click");
+                let (x, y) = util::jittered(ctx, x, y);
+                ctx.click_at_cdp(x, y).await?;
+            }
+        }
+        a if a < hopeless => {
+            // Clicking the button isn't working, which is exactly how the
+            // paused-task dialog presents. Its Continue is a real control
+            // (CONTINUE_STEP_JS skips sent wizard bubbles), so click that;
+            // when there is no dialog, fall back to the button once more.
+            let continue_btn = ctx.eval(CONTINUE_STEP_JS).await.ok().and_then(|c| {
+                match (
+                    c.get("x").and_then(Value::as_f64),
+                    c.get("y").and_then(Value::as_f64),
+                ) {
+                    (Some(x), Some(y)) => Some((x, y)),
+                    _ => None,
+                }
+            });
+            match continue_btn.or(match button {
+                (Some(x), Some(y)) => Some((x, y)),
+                _ => None,
+            }) {
+                Some((x, y)) => {
+                    ctx.output(
+                        "timer still paused -- clicking the paused-dialog Continue (or the \
+                         timer button) via CDP",
+                    );
+                    let (x, y) = util::jittered(ctx, x, y);
+                    ctx.click_at_cdp(x, y).await?;
+                }
+                None => {}
+            }
+        }
+        a if a == hopeless => {
+            ctx.warn(format!(
+                "the task timer won't resume after {hopeless} attempts (timer button and \
+                 the paused-dialog Continue, cursor and CDP) -- backing off; the wall-clock \
+                 deadline still bounds this wait. The Handshake page likely needs a human."
+            ));
+        }
+        a if (a - hopeless) % sparse_every == 0 => {
+            // the occasional fresh try, in case the page unstuck itself
+            if let (Some(x), Some(y)) = button {
+                let (x, y) = util::jittered(ctx, x, y);
+                ctx.click_at_cdp(x, y).await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(attempts + 1)
 }
 
 // ---------------------------------------------------------------------------
