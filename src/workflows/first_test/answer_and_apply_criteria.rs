@@ -2,7 +2,12 @@
 //! util::ask_claude_for_answers) to read everything in task1, judge every
 //! Evaluation Criteria question for both responses AND pick an overall
 //! winner, then click the matching Good/Bad buttons plus the Overall
-//! Quality (Response A / Response B / Tie) button on the live page.
+//! Quality (Response A / Response B / Tie) button on the live page. Tasks
+//! that also ask required open feedback question(s) -- freeform textareas
+//! with a minimum length that gate the submit -- get those answered too:
+//! the questions are read off the page before the judging run, Claude writes
+//! the answers into claude_answers, and apply types them in for real (the
+//! page blocks and counts paste attempts).
 //!
 //! In the pipeline the chain sets `defer_submit`, so this workflow stops after
 //! applying the ratings and step 8 owns the (real, irreversible) submission.
@@ -22,7 +27,7 @@ impl Workflow for AnswerAndApplyCriteria {
     }
 
     fn description(&self) -> &'static str {
-        "Has Claude judge each evaluation criterion for Response A/B from the files in task1, then clicks the matching Good/Bad buttons on the page. Step 8 submits."
+        "Has Claude judge each evaluation criterion for Response A/B from the files in task1, then clicks the matching Good/Bad buttons and types any required open feedback on the page. Step 8 submits."
     }
 
     fn dependencies(&self) -> Vec<&'static str> {
@@ -41,7 +46,19 @@ impl Workflow for AnswerAndApplyCriteria {
         let task_dir = util::current_task_dir(ctx)?;
 
         ctx.step("ask Claude to judge each criterion").await?;
-        util::ask_claude_for_answers(ctx, &task_dir).await?;
+        // Some tasks also ask required open feedback question(s) -- freeform
+        // textareas that gate the submit. Read them off the live page first so
+        // the judging prompt asks for the written answer(s) too; without them
+        // the submit stays disabled and step 8 cannot finish the round.
+        let feedback_questions = util::open_feedback_questions(ctx).await?;
+        if !feedback_questions.is_empty() {
+            ctx.output(format!(
+                "this task also asks {} open feedback question(s) -- claude will write the \
+                 answer(s)",
+                feedback_questions.len()
+            ));
+        }
+        util::ask_claude_for_answers(ctx, &task_dir, &feedback_questions).await?;
         let answers_path = task_dir.join("claude_answers");
         if !answers_path.exists() {
             return Err(util::halt_now(ctx, format!(

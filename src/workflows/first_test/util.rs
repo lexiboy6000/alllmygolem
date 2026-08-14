@@ -110,6 +110,104 @@ pub struct ClaudeAnswers {
     #[serde(default)]
     pub criteria: Vec<CriterionAnswer>,
     pub overall: OverallAnswer,
+    /// Written answers to the page's open feedback question(s), in the same
+    /// order the questions appear on the page. Present only when the task
+    /// asks any (see [`FeedbackQuestion`]); empty otherwise.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub open_feedback: Vec<String>,
+}
+
+/// Accept `"open_feedback": "..."` as well as `["...", ...]` -- with a single
+/// question on the page (the usual case) claude sometimes writes the string
+/// bare despite the prompt asking for an array, and rejecting the whole file
+/// over that would re-run a full judging pass for nothing.
+fn one_or_many<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => vec![s],
+        Value::Array(a) => a
+            .into_iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// An open-ended feedback question on the rating UI: a required freeform
+/// textarea (e.g. "Open Feedback ... minimum 200 characters") that gates the
+/// submit exactly like the rating buttons do. Read off the live page by
+/// `FEEDBACK_FIELDS_BODY`; optional notes boxes (no minimum, no required
+/// marker) are not included.
+#[derive(Deserialize)]
+pub struct FeedbackQuestion {
+    /// The field's label, e.g. "Open Feedback".
+    #[serde(default)]
+    pub name: String,
+    /// The description under the label, e.g. "Justify your choices above...".
+    #[serde(default)]
+    pub question: String,
+    /// The textarea's placeholder -- often the fullest wording of the question.
+    #[serde(default)]
+    pub placeholder: String,
+    /// Minimum character count the page states ("(minimum N characters)").
+    /// 0 when the field is only marked required with no stated minimum.
+    #[serde(default)]
+    pub min: u32,
+    /// The textarea's current text.
+    #[serde(default)]
+    pub value: String,
+    /// Whether the textarea currently has focus (only reported by the
+    /// single-field lookup, `feedback_field_at`).
+    #[serde(default)]
+    pub focused: bool,
+    /// A clickable point on the field, when one is reachable.
+    #[serde(default)]
+    pub x: Option<f64>,
+    #[serde(default)]
+    pub y: Option<f64>,
+}
+
+impl FeedbackQuestion {
+    /// A short label for log lines, falling back to a number when the page
+    /// gave the field no name.
+    fn label(&self, idx: usize) -> String {
+        if self.name.trim().is_empty() {
+            format!("open feedback #{}", idx + 1)
+        } else {
+            self.name.trim().to_string()
+        }
+    }
+
+    /// Whether the current text satisfies the page's requirement -- the same
+    /// test the page runs (trimmed length against the minimum) to decide
+    /// whether this field still blocks the submit.
+    pub fn satisfied(&self) -> bool {
+        self.value.trim().chars().count() as u32 >= self.min.max(1)
+    }
+}
+
+/// Claude's answer for one feedback question, normalized to the single line
+/// that will actually be typed: newlines and runs of whitespace collapse to
+/// single spaces. Typing a newline into the field is at best a formatting
+/// wart and the caret-to-end recovery in `type_feedback_answer` relies on the
+/// text being one soft-wrapped paragraph.
+pub fn normalize_feedback(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether `answers` carries a usable written answer for every feedback
+/// question on the page: one per question, each meeting the page's stated
+/// minimum length. This is part of the success test for a claude run -- a
+/// file that parses but leaves a required feedback box unanswerable would
+/// leave the submit disabled, which is exactly the failure this exists for.
+fn feedback_answers_ok(answers: &ClaudeAnswers, questions: &[FeedbackQuestion]) -> bool {
+    questions.iter().enumerate().all(|(i, q)| {
+        answers.open_feedback.get(i).is_some_and(|t| {
+            normalize_feedback(t).chars().count() as u32 >= q.min.max(1)
+        })
+    })
 }
 
 /// Run `claude` (the Claude Code CLI) as a subprocess, cwd'd into `task_dir`,
@@ -117,7 +215,17 @@ pub struct ClaudeAnswers {
 /// `task_dir/claude_answers`. Reuses the same launcher settings as the Solve
 /// pipeline (Settings > Claude path / model / effort / timeout) -- this isn't
 /// a "solve" workflow, but those settings are general-purpose, not solve-only.
-pub async fn ask_claude_for_answers(ctx: &WorkflowCtx, task_dir: &std::path::Path) -> Result<()> {
+///
+/// `feedback_questions` are the open feedback questions the caller found on
+/// the live page (see [`open_feedback_questions`]); when any exist, the prompt
+/// asks for a written answer to each and a run whose file lacks them counts
+/// as failed -- an unanswered required feedback box keeps the submit disabled,
+/// so a file without those answers cannot finish the round.
+pub async fn ask_claude_for_answers(
+    ctx: &WorkflowCtx,
+    task_dir: &std::path::Path,
+    feedback_questions: &[FeedbackQuestion],
+) -> Result<()> {
     let claude = if ctx.settings.claude_path.trim().is_empty() {
         "claude".to_string()
     } else {
@@ -125,7 +233,10 @@ pub async fn ask_claude_for_answers(ctx: &WorkflowCtx, task_dir: &std::path::Pat
     };
     let model = ctx.settings.solve_model.clone();
     let effort = ctx.settings.solve_effort.clone();
-    let prompt: String = ANSWER_CRITERIA_PROMPT.to_string();
+    let mut prompt: String = ANSWER_CRITERIA_PROMPT.to_string();
+    if !feedback_questions.is_empty() {
+        prompt.push_str(&feedback_prompt_addendum(feedback_questions));
+    }
     let mut args: Vec<&str> = vec![
         "-p",
         prompt.as_str(),
@@ -175,17 +286,32 @@ pub async fn ask_claude_for_answers(ctx: &WorkflowCtx, task_dir: &std::path::Pat
                 // can drop its connection after having already written a
                 // complete claude_answers (exit non-zero, output fine), and can
                 // exit zero having written nothing usable.
-                if read_claude_answers(&answers_path).is_ok() {
-                    if attempt > 1 {
-                        ctx.output(format!("claude succeeded on attempt {attempt}"));
+                match read_claude_answers(&answers_path) {
+                    Ok(a) if feedback_answers_ok(&a, feedback_questions) => {
+                        if attempt > 1 {
+                            ctx.output(format!("claude succeeded on attempt {attempt}"));
+                        }
+                        return Ok(());
                     }
-                    return Ok(());
+                    // Parsed, but a required open-feedback answer is missing
+                    // or under the page's stated minimum length. Submitting
+                    // is impossible with that box unfilled, so this run
+                    // failed even though the ratings themselves are fine.
+                    Ok(_) => {
+                        last_err = format!(
+                            "claude_answers lacks a long-enough \"open_feedback\" answer for \
+                             each of the {} open feedback question(s) on the page",
+                            feedback_questions.len()
+                        );
+                    }
+                    Err(_) => {
+                        last_err = if out.success() {
+                            "claude exited cleanly but wrote no usable claude_answers".to_string()
+                        } else {
+                            out.combined().trim().to_string()
+                        };
+                    }
                 }
-                last_err = if out.success() {
-                    "claude exited cleanly but wrote no usable claude_answers".to_string()
-                } else {
-                    out.combined().trim().to_string()
-                };
             }
         }
         if attempt < ATTEMPTS {
@@ -245,12 +371,17 @@ pub async fn apply_answers(
     // On the newest arena layout every rating control is inside the slide-over
     // panel, so there is nothing to click until it is open.
     ensure_criteria_panel_open(ctx).await?;
+    // Some tasks also ask open feedback question(s) -- required freeform
+    // textareas that gate the submit exactly like the buttons. Found up front
+    // so the pacer can give each its own budget slot; typed after the overall
+    // pick, like a person writing the justification after making their picks.
+    let feedback = feedback_fields(ctx).await?;
     let mut applied = 0usize;
     let mut missed: Vec<String> = Vec::new();
     // Paced runs spend a fixed budget as idle time between selections; unpaced
     // ones keep the old quick dwells, since they run with a submit waiting.
     let started = tokio::time::Instant::now();
-    let mut pacer = paced.then(|| Pacer::new(answers.criteria.len()));
+    let mut pacer = paced.then(|| Pacer::new(answers.criteria.len(), feedback.len()));
     if let Some(p) = &pacer {
         ctx.output(format!(
             "pacing: spreading {} answer(s) over about {} min",
@@ -352,6 +483,42 @@ pub async fn apply_answers(
     } else {
         missed.push(format!("overall quality -> {}", answers.overall.winner));
     }
+    // Any open feedback questions come last. Each is typed for real (the
+    // page counts paste attempts and blocks pasting), with the same verify
+    // discipline as the clicks: skip a box that's already right, and never
+    // report typed-and-verified when it isn't.
+    for (i, q) in feedback.iter().enumerate() {
+        let label = q.label(i);
+        let want = answers
+            .open_feedback
+            .get(i)
+            .map(|s| normalize_feedback(s))
+            .unwrap_or_default();
+        if want.is_empty() {
+            // claude_answers has nothing for this box (an older file, or a
+            // question that appeared after the judging) -- there is no text
+            // to invent here, so report it missed rather than typing filler.
+            missed.push(format!("{label} (no open_feedback answer in claude_answers)"));
+            continue;
+        }
+        match pacer.as_mut() {
+            Some(p) => {
+                let gap = p.next_gap();
+                idle_for(ctx, gap).await?;
+            }
+            // composing a written justification starts with a beat of thought
+            None => ctx.human_pause(1200, 3200).await?,
+        }
+        if type_feedback_answer(ctx, i, &label, &want).await? {
+            applied += 1;
+            ctx.output(format!(
+                "{label}: wrote {} characters",
+                want.chars().count()
+            ));
+        } else {
+            missed.push(label);
+        }
+    }
     if pacer.is_some() {
         let took = started.elapsed();
         ctx.output(format!(
@@ -379,9 +546,16 @@ struct Pacer {
 }
 
 impl Pacer {
-    fn new(criteria: usize) -> Self {
-        // two selections per criterion (Response A and B), plus the overall
-        let slots = (criteria.saturating_mul(2).saturating_add(1)) as u32;
+    fn new(criteria: usize, feedback: usize) -> Self {
+        // Two selections per criterion (Response A and B), plus the overall,
+        // plus one slot per open feedback question. Feedback slots share the
+        // criteria-anchored budget rather than extending it: typing the
+        // answer costs real time on its own, and the budget's whole point is
+        // that the handle time doesn't track the amount of on-page work.
+        let slots = (criteria
+            .saturating_mul(2)
+            .saturating_add(1)
+            .saturating_add(feedback)) as u32;
         let budget = answering_budget(criteria);
         Self {
             deadline: tokio::time::Instant::now() + budget,
@@ -566,6 +740,15 @@ pub async fn verify_answers_applied(
     if !v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
         wrong.push(format!("overall -> {}", answers.overall.winner));
     }
+    // Open feedback boxes gate the submit exactly like the buttons, so an
+    // unsatisfied one is a wrong answer here too. Judged by the page's own
+    // test (trimmed length against the stated minimum) rather than by exact
+    // text, so a human's hand-edited answer is left standing.
+    for (i, q) in feedback_fields(ctx).await?.iter().enumerate() {
+        if !q.satisfied() {
+            wrong.push(q.label(i));
+        }
+    }
     Ok(wrong)
 }
 
@@ -687,6 +870,152 @@ pub async fn click_until_selected(ctx: &mut WorkflowCtx, find_js: &str) -> Resul
     }
     let v = ctx.eval(find_js).await?;
     Ok(v.get("selected").and_then(Value::as_bool).unwrap_or(false))
+}
+
+/// The open feedback questions on the live page, with the rating UI opened
+/// first (in the drawer layout the fields don't exist in the DOM until it
+/// is). Used by workflow 7 before the judging run, so the prompt can ask for
+/// the written answers alongside the ratings.
+pub async fn open_feedback_questions(ctx: &mut WorkflowCtx) -> Result<Vec<FeedbackQuestion>> {
+    ensure_criteria_panel_open(ctx).await?;
+    feedback_fields(ctx).await
+}
+
+/// All open feedback fields currently on the page, in DOM order (data only --
+/// no hit-testing, no scrolling). The same order `ClaudeAnswers::open_feedback`
+/// is written in, which is what pairs answer to field everywhere.
+async fn feedback_fields(ctx: &WorkflowCtx) -> Result<Vec<FeedbackQuestion>> {
+    let js = criteria_js(FEEDBACK_FIELDS_BODY).replace("__IDX__", "-1");
+    let v = ctx.eval(&js).await?;
+    Ok(v.as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default())
+}
+
+/// One feedback field by index, with the extras only a click/type pass needs:
+/// a hittable point (found the same way as the buttons', so occlusion by the
+/// drawer's pinned footer is handled) and whether the field has focus.
+async fn feedback_field_at(ctx: &WorkflowCtx, idx: usize) -> Result<Option<FeedbackQuestion>> {
+    let js = criteria_js(FEEDBACK_FIELDS_BODY).replace("__IDX__", &idx.to_string());
+    let v = ctx.eval(&js).await?;
+    Ok(v.as_str().and_then(|s| serde_json::from_str(s).ok()))
+}
+
+/// Type `want` (already normalized to one line) into the feedback field at
+/// `idx`, and verify it took. The page blocks pasting and counts the
+/// attempts, so the text is really typed, through the same humanized
+/// keyboard as everything else.
+///
+/// Same discipline as `click_until_selected`: re-find fresh coordinates
+/// before every attempt, verify after, escalate the focusing click to CDP on
+/// the last try, and never report success on a field that doesn't meet the
+/// page's own requirement. Returns `Ok(false)` when the field couldn't be
+/// found, reached, or filled.
+async fn type_feedback_answer(
+    ctx: &mut WorkflowCtx,
+    idx: usize,
+    label: &str,
+    want: &str,
+) -> Result<bool> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let Some(f) = feedback_field_at(ctx, idx).await? else {
+            ctx.output(format!(
+                "{label}: the feedback field is no longer on the page -- nothing to type into"
+            ));
+            return Ok(false);
+        };
+        let have = normalize_feedback(&f.value);
+        if have == want {
+            return Ok(true);
+        }
+        if !have.is_empty() && f.satisfied() && !want.starts_with(&have) {
+            // A different answer that already meets the requirement -- a
+            // human's, or an earlier run's. Clobbering it can only lose
+            // information, so it stands.
+            ctx.output(format!(
+                "{label}: already answered on the page -- leaving it as is"
+            ));
+            return Ok(true);
+        }
+        let (Some(x), Some(y)) = (f.x, f.y) else {
+            if attempt == ATTEMPTS {
+                ctx.warn(format!(
+                    "{label}: the feedback field stays covered by another element -- NOT \
+                     typing blind"
+                ));
+                return Ok(false);
+            }
+            ctx.output(format!(
+                "{label}: the field is covered -- re-finding after a beat"
+            ));
+            ctx.human_pause(500, 1100).await?;
+            continue;
+        };
+        let (jx, jy) = jittered(ctx, x, y);
+        if attempt < ATTEMPTS {
+            ctx.click_at_cursor(jx, jy).await?;
+        } else {
+            ctx.click_at_cdp(jx, jy).await?;
+        }
+        ctx.human_pause(250, 550).await?;
+        let Some(f) = feedback_field_at(ctx, idx).await? else {
+            continue;
+        };
+        if !f.focused {
+            // The click missed; the next attempt re-finds and, on the last
+            // one, goes through CDP.
+            continue;
+        }
+        let have = normalize_feedback(&f.value);
+        if !have.is_empty() {
+            // The caret sits wherever the click landed; walk it to the very
+            // end of the text before touching anything. PageDown clamps to
+            // the last soft-wrapped line and End finishes it, which works
+            // whatever the field's internal scroll position is.
+            for _ in 0..3 {
+                ctx.press_key("PageDown").await?;
+                ctx.human_pause(60, 140).await?;
+            }
+            ctx.press_key("End").await?;
+            ctx.human_pause(120, 260).await?;
+        }
+        let resume = want.starts_with(&have) && !have.is_empty();
+        if !have.is_empty() && !resume {
+            // Not salvageable as a prefix of the answer: backspace it away
+            // and start clean. Bounded -- text this long that also met the
+            // minimum was accepted above instead.
+            for _ in 0..f.value.chars().count() {
+                ctx.press_key("Backspace").await?;
+                ctx.human_pause(30, 90).await?;
+            }
+        }
+        let text = if resume { &want[have.len()..] } else { want };
+        ctx.type_human(text).await?;
+        ctx.human_pause(400, 800).await?;
+        if let Some(f) = feedback_field_at(ctx, idx).await? {
+            let now = normalize_feedback(&f.value);
+            if now == want {
+                return Ok(true);
+            }
+            if f.satisfied() {
+                // Off by a character or two (a key the compositor ate) but
+                // past the page's own bar. Good enough to submit, and
+                // retyping the whole thing risks more than it fixes.
+                ctx.warn(format!(
+                    "{label}: the typed text differs slightly from claude's answer but \
+                     meets the page's minimum -- leaving it"
+                ));
+                return Ok(true);
+            }
+        }
+        if attempt < ATTEMPTS {
+            ctx.warn(format!(
+                "{label}: the typed text didn't register -- trying again"
+            ));
+        }
+    }
+    Ok(false)
 }
 
 /// Find the Submit button (identified by being next to the "Skip" button)
@@ -955,6 +1284,50 @@ per-criterion ratings: write \"criteria\": [] and judge only the overall pick. \
 Output ONLY that file -- do not print the JSON to stdout, do not add commentary elsewhere. Be \
 strict and specific in your judgment.";
 
+/// What gets appended to [`ANSWER_CRITERIA_PROMPT`] when the page asks open
+/// feedback question(s): the questions as the page words them, and the shape
+/// and register the written answers must have. The length floor is restated
+/// per answer because it is the one hard gate -- the page disables its submit
+/// until every required box passes its minimum.
+fn feedback_prompt_addendum(questions: &[FeedbackQuestion]) -> String {
+    let mut s = String::from(
+        "\n\nThis task's evaluation page ALSO asks the following open-ended feedback \
+         question(s), which must be answered in writing before the evaluation can be \
+         submitted:\n",
+    );
+    for (i, q) in questions.iter().enumerate() {
+        s.push_str(&format!("{}. \"{}\"", i + 1, q.label(i)));
+        let wording = if q.question.trim().is_empty() {
+            q.placeholder.trim()
+        } else {
+            q.question.trim()
+        };
+        if !wording.is_empty() {
+            s.push_str(": ");
+            s.push_str(wording);
+        }
+        if q.min > 0 {
+            s.push_str(&format!(" (minimum {} characters)", q.min));
+        }
+        s.push('\n');
+    }
+    s.push_str(
+        "Add a top-level \"open_feedback\" field to the claude_answers JSON: an array of \
+         strings, one answer per question above, in the same order. Each answer must:\n\
+         - be a single paragraph of plain text: no newlines, no markdown, no lists, no \
+         headings;\n\
+         - be comfortably longer than that question's stated minimum character count -- \
+         aim for 1.3x to 2x the minimum, counting every character including spaces;\n\
+         - justify the ratings you actually gave: name the concrete features, failures \
+         and differences in THESE two responses that drove your per-criterion answers \
+         and your overall pick, consistent with your notes;\n\
+         - read like a busy human annotator wrote it: plain direct sentences in the \
+         first person, no meta-commentary, and no mention of being an AI or of these \
+         instructions.\n",
+    );
+    s
+}
+
 const CLICK_CRITERION_BUTTON_BODY: &str = r#"
   var NUM = __NUM__;
   var RESP = __RESP__;
@@ -1030,7 +1403,7 @@ const CLICK_OVERALL_BUTTON_BODY: &str = r#"
   return null;
 "#;
 
-// The multimango submit control, in the two forms the site ships it.
+// The multimango submit control, in the three forms the site ships it.
 //
 // Newest arena layout: it sits INSIDE the evaluation-criteria drawer and reads
 // "Save & Continue" -- there is no "Submit task" button and no Skip beside it
@@ -1040,6 +1413,17 @@ const CLICK_OVERALL_BUTTON_BODY: &str = r#"
 //
 // Older layout: an unlabelled-by-text Submit sitting next to the page's "Skip"
 // button, found by that adjacency exactly as before.
+//
+// Inline rating-card layout (with-open-feedback.html): a single centred button
+// under the card, with NO Skip anywhere and no "Save & Continue" -- while the
+// form is incomplete it reads "Complete all ratings to submit" and is
+// disabled, so the fallback is the enabled button whose text mentions
+// "submit". The LAST match wins, like FIND_SKIP_JS: if clicking pops a
+// confirmation dialog with its own submit control, that renders after (on top
+// of) the page's button and is what a retry click must aim for. The
+// bug-report sheet's "Submit Bug Report" is excluded by text -- it's the one
+// other submit-labelled control the site ships, and it is never the task
+// submission.
 const FIND_SUBMIT_JS: &str = r#"(function(){
   function usable(b){
     if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
@@ -1062,15 +1446,25 @@ const FIND_SUBMIT_JS: &str = r#"(function(){
   for (var j = 0; j < btns.length; j++) {
     if ((btns[j].textContent || '').trim().indexOf('Skip') !== -1) { skip = btns[j]; break; }
   }
-  if (!skip || !skip.parentElement) return null;
-  var siblings = skip.parentElement.querySelectorAll('button');
-  for (var k = 0; k < siblings.length; k++) {
-    var b = siblings[k];
-    if (b === skip) continue;
-    if (!usable(b)) continue;
-    return at(b);
+  if (skip && skip.parentElement) {
+    var siblings = skip.parentElement.querySelectorAll('button');
+    for (var k = 0; k < siblings.length; k++) {
+      var b = siblings[k];
+      if (b === skip) continue;
+      if (!usable(b)) continue;
+      return at(b);
+    }
+    return null;
   }
-  return null;
+  var best = null;
+  for (var m = 0; m < btns.length; m++) {
+    var tm = (btns[m].textContent || '').replace(/\s+/g, ' ').trim();
+    if (!/submit/i.test(tm)) continue;
+    if (/bug|report|issue/i.test(tm)) continue;
+    if (!usable(btns[m])) continue;
+    best = btns[m];
+  }
+  return best ? at(best) : null;
 })()"#;
 
 /// The task page's enabled "Skip" button (the same one `FIND_SUBMIT_JS`
@@ -2744,6 +3138,91 @@ const EVALUATION_CRITERIA_BODY: &str = r#"
   return lines.length ? lines.join('\n') : null;
 "#;
 
+// The rating UI's open feedback fields: required freeform textareas that gate
+// the submit like the buttons do (e.g. "Open Feedback * (minimum 200
+// characters) / Justify your choices above...").
+//
+// The fields ride in every layout the buttons do: the slide-over drawer
+// (`findCriteriaRoot`), an inline Evaluation Criteria card, or the card the
+// "Overall"/"Overall Quality" heading sits in. The inline layouts split
+// across SIBLING cards -- the WITH-FRQ page keeps its required "Overall
+// Reasoning" box in the overall card next to the criteria card -- so both
+// scopes are searched (deduped), the overall one widened to its card's
+// parent. A textarea only counts when its label block states a minimum or
+// carries the required marker: plain optional notes boxes don't block the
+// submit and must not be typed into.
+//
+// `__IDX__` = -1 returns every field's data (no hit-testing, no scrolling);
+// a real index returns that one field plus its hittable click point and
+// whether it currently has focus. Both return JSON strings, in a fixed
+// scope-then-DOM order -- the order `claude_answers.open_feedback` pairs to.
+const FEEDBACK_FIELDS_BODY: &str = r#"
+  var IDX = __IDX__;
+  var scopes = [];
+  var root = findCriteriaRoot();
+  if (root) scopes.push(root);
+  var heads = document.querySelectorAll('h2,h3,h4,span,div');
+  for (var i = 0; i < heads.length; i++) {
+    if (!/^overall(\s*quality)?$/i.test((heads[i].textContent || '').trim())) continue;
+    var card = heads[i].closest('[class*="rounded-lg"]') || heads[i].parentElement;
+    if (card) { scopes.push(card.parentElement || card); break; }
+  }
+  if (!scopes.length) return null;
+  var tas = [];
+  for (var s = 0; s < scopes.length; s++) {
+    var list = scopes[s].querySelectorAll('textarea');
+    for (var n = 0; n < list.length; n++) {
+      if (tas.indexOf(list[n]) === -1) tas.push(list[n]);
+    }
+  }
+  var items = [];
+  var nodes = [];
+  for (var t = 0; t < tas.length; t++) {
+    var ta = tas[t];
+    var r = ta.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    /* the label block: the nearest ancestor holding a <label> */
+    var block = null, lab = null, up = ta.parentElement;
+    for (var d = 0; d < 4 && up && up !== document.body; d++) {
+      var l = up.querySelector('label');
+      if (l) { block = up; lab = l; break; }
+      up = up.parentElement;
+    }
+    var blockText = block ? (block.textContent || '') : '';
+    var m = blockText.match(/minimum\s+(\d+)\s+characters/i);
+    var min = m ? parseInt(m[1], 10) : 0;
+    /* the required asterisk (`text-destructive`) disappears once satisfied,
+       so it only ever ADDS fields the minimum-text didn't already catch */
+    var required = !!(block && block.querySelector('.text-destructive'));
+    if (!min && !required) continue;
+    var q = '';
+    if (block) {
+      var ps = block.querySelectorAll('p');
+      for (var p = 0; p < ps.length; p++) {
+        var pt = (ps[p].textContent || '').trim();
+        if (pt) { q = pt; break; }
+      }
+    }
+    items.push({
+      name: lab ? (lab.textContent || '').trim() : '',
+      question: q,
+      placeholder: ta.getAttribute('placeholder') || '',
+      min: min,
+      value: ta.value || ''
+    });
+    nodes.push(ta);
+  }
+  if (IDX >= 0) {
+    if (IDX >= items.length) return null;
+    var it = items[IDX];
+    it.focused = document.activeElement === nodes[IDX];
+    var pt2 = hittablePoint(nodes[IDX]);
+    if (pt2) { it.x = pt2.x; it.y = pt2.y; }
+    return JSON.stringify(it);
+  }
+  return items.length ? JSON.stringify(items) : JSON.stringify([]);
+"#;
+
 // All the Task Data lookups (URL / button / text) find the block through the
 // shared `findTaskBlock()` below, which reports both the block and whether it
 // is the newest layout's request brief.
@@ -3040,6 +3519,80 @@ mod tests {
         );
     }
 
+    /// A `FeedbackQuestion` as the page probe would report it, for tests.
+    fn question(min: u32) -> FeedbackQuestion {
+        serde_json::from_str(&format!("{{\"name\":\"Open Feedback\",\"min\":{min}}}")).unwrap()
+    }
+
+    /// claude_answers with open_feedback as an array parses, and -- because a
+    /// single question tempts claude into writing the string bare despite the
+    /// prompt -- so does a bare string. Absent means empty, not an error.
+    #[test]
+    fn open_feedback_parses_array_bare_string_and_absent() {
+        let arr: ClaudeAnswers = serde_json::from_str(
+            r#"{"overall": {"winner": "Tie"}, "open_feedback": ["one", "two"]}"#,
+        )
+        .unwrap();
+        assert_eq!(arr.open_feedback, vec!["one", "two"]);
+        let bare: ClaudeAnswers = serde_json::from_str(
+            r#"{"overall": {"winner": "Tie"}, "open_feedback": "just the one answer"}"#,
+        )
+        .unwrap();
+        assert_eq!(bare.open_feedback, vec!["just the one answer"]);
+        let absent: ClaudeAnswers =
+            serde_json::from_str(r#"{"overall": {"winner": "Tie"}}"#).unwrap();
+        assert!(absent.open_feedback.is_empty());
+    }
+
+    /// The success test for a claude run: every page question needs an answer
+    /// meeting its stated minimum, judged AFTER normalizing to the single
+    /// line that will actually be typed (newlines don't count for length).
+    #[test]
+    fn feedback_answers_gate_on_the_pages_minimum() {
+        let long = "x".repeat(60);
+        let a: ClaudeAnswers = serde_json::from_str(&format!(
+            r#"{{"overall": {{"winner": "Tie"}}, "open_feedback": ["{long}"]}}"#
+        ))
+        .unwrap();
+        assert!(feedback_answers_ok(&a, &[question(50)]));
+        assert!(!feedback_answers_ok(&a, &[question(200)]), "60 chars can't pass a 200 floor");
+        assert!(!feedback_answers_ok(&a, &[question(50), question(50)]), "one answer short");
+        // no questions on the page -> nothing to gate on
+        assert!(feedback_answers_ok(&a, &[]));
+        // whitespace padding must not count toward the minimum
+        let padded: ClaudeAnswers = serde_json::from_str(
+            r#"{"overall": {"winner": "Tie"}, "open_feedback": ["  a   b  "]}"#,
+        )
+        .unwrap();
+        assert!(!feedback_answers_ok(&padded, &[question(5)]));
+    }
+
+    /// The normalization every comparison and the typing itself go through:
+    /// one line, single spaces, trimmed.
+    #[test]
+    fn feedback_normalizes_to_one_typed_line() {
+        assert_eq!(
+            normalize_feedback("  Response A\nworks.\r\n\n  B  doesn't. "),
+            "Response A works. B doesn't."
+        );
+        assert_eq!(normalize_feedback("\n \t "), "");
+    }
+
+    /// The page's own satisfied test: trimmed length against the minimum,
+    /// with a required-but-no-stated-minimum field needing at least 1 char.
+    #[test]
+    fn feedback_satisfied_matches_the_pages_test() {
+        let mut q = question(5);
+        q.value = "  abcd  ".into();
+        assert!(!q.satisfied(), "4 trimmed chars against a 5 floor");
+        q.value = "abcde".into();
+        assert!(q.satisfied());
+        let mut bare = question(0);
+        assert!(!bare.satisfied(), "required with no minimum still needs text");
+        bare.value = "x".into();
+        assert!(bare.satisfied());
+    }
+
     #[test]
     fn percent_decoding_and_bad_segments() {
         assert_eq!(percent_decode("Q3%20report.pdf"), "Q3 report.pdf");
@@ -3134,7 +3687,7 @@ mod pacing_tests {
     /// dividing by zero -- only the overall pick is clicked in that case.
     #[test]
     fn an_empty_rubric_still_paces() {
-        let p = Pacer::new(0);
+        let p = Pacer::new(0, 0);
         assert_eq!(p.slots_left, 1);
         assert!(p.budget >= Duration::from_secs(20 * 60));
     }
@@ -3143,7 +3696,7 @@ mod pacing_tests {
     /// each click costing `click` on top of the gap. Returns how long the
     /// pass took end to end, and its budget.
     fn simulate(criteria: usize, click: Duration) -> (Duration, Duration) {
-        let mut p = Pacer::new(criteria);
+        let mut p = Pacer::new(criteria, 0);
         let budget = p.budget;
         let start = p.deadline - budget;
         let mut now = start;
@@ -3259,7 +3812,7 @@ mod pacing_tests {
     #[test]
     fn no_single_gap_exceeds_the_cap() {
         for criteria in [0usize, 1, 2, 40] {
-            let mut p = Pacer::new(criteria);
+            let mut p = Pacer::new(criteria, 0);
             let start = p.deadline - p.budget;
             let mut now = start;
             for _ in 0..p.slots_left {
