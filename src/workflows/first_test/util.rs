@@ -1482,6 +1482,45 @@ per-criterion ratings: write \"criteria\": [] and judge only the overall pick. \
 Output ONLY that file -- do not print the JSON to stdout, do not add commentary elsewhere. Be \
 strict and specific in your judgment.";
 
+/// The comparison questions as numbered text lines -- one per question with
+/// its judging rule and option set. Shared by the claude prompt and step 6's
+/// saved record, so the file on disk always matches what claude was asked.
+pub fn comparison_question_lines(questions: &[ComparisonQuestion]) -> String {
+    let mut s = String::new();
+    for (i, q) in questions.iter().enumerate() {
+        s.push_str(&format!("{}. \"{}\"", i + 1, q.name.trim()));
+        if !q.question.trim().is_empty() {
+            s.push_str(": ");
+            s.push_str(q.question.trim());
+        }
+        s.push_str(&format!(" [options: {}]\n", q.options.join(" | ")));
+    }
+    s
+}
+
+/// The open feedback questions as numbered text lines, same sharing as
+/// [`comparison_question_lines`].
+pub fn feedback_question_lines(questions: &[FeedbackQuestion]) -> String {
+    let mut s = String::new();
+    for (i, q) in questions.iter().enumerate() {
+        s.push_str(&format!("{}. \"{}\"", i + 1, q.label(i)));
+        let wording = if q.question.trim().is_empty() {
+            q.placeholder.trim()
+        } else {
+            q.question.trim()
+        };
+        if !wording.is_empty() {
+            s.push_str(": ");
+            s.push_str(wording);
+        }
+        if q.min > 0 {
+            s.push_str(&format!(" (minimum {} characters)", q.min));
+        }
+        s.push('\n');
+    }
+    s
+}
+
 /// What gets appended to [`ANSWER_CRITERIA_PROMPT`] when the page shows the
 /// multi-question comparison rubric: each question with its judging rules and
 /// its OWN option set, answered by picking one option verbatim. The overall
@@ -1493,14 +1532,7 @@ fn comparison_prompt_addendum(questions: &[ComparisonQuestion]) -> String {
          after each question is that question's judging rule -- follow it exactly \
          (including any instruction about when to mark Tie):\n",
     );
-    for (i, q) in questions.iter().enumerate() {
-        s.push_str(&format!("{}. \"{}\"", i + 1, q.name.trim()));
-        if !q.question.trim().is_empty() {
-            s.push_str(": ");
-            s.push_str(q.question.trim());
-        }
-        s.push_str(&format!(" [options: {}]\n", q.options.join(" | ")));
-    }
+    s.push_str(&comparison_question_lines(questions));
     s.push_str(
         "Add a top-level \"comparisons\" field to the claude_answers JSON: an array with \
          one object per question above, in the SAME order, shaped \
@@ -1524,22 +1556,7 @@ fn feedback_prompt_addendum(questions: &[FeedbackQuestion]) -> String {
          question(s), which must be answered in writing before the evaluation can be \
          submitted:\n",
     );
-    for (i, q) in questions.iter().enumerate() {
-        s.push_str(&format!("{}. \"{}\"", i + 1, q.label(i)));
-        let wording = if q.question.trim().is_empty() {
-            q.placeholder.trim()
-        } else {
-            q.question.trim()
-        };
-        if !wording.is_empty() {
-            s.push_str(": ");
-            s.push_str(wording);
-        }
-        if q.min > 0 {
-            s.push_str(&format!(" (minimum {} characters)", q.min));
-        }
-        s.push('\n');
-    }
+    s.push_str(&feedback_question_lines(questions));
     s.push_str(
         "Add a top-level \"open_feedback\" field to the claude_answers JSON: an array of \
          strings, one answer per question above, in the same order. Each answer must:\n\
