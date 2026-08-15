@@ -115,6 +115,10 @@ pub struct ClaudeAnswers {
     /// asks any (see [`FeedbackQuestion`]); empty otherwise.
     #[serde(default, deserialize_with = "one_or_many")]
     pub open_feedback: Vec<String>,
+    /// Picks for the multi-question comparison rubric, in page order.
+    /// Present only when the task shows one (see [`ComparisonQuestion`]).
+    #[serde(default)]
+    pub comparisons: Vec<ComparisonAnswer>,
 }
 
 /// Accept `"open_feedback": "..."` as well as `["...", ...]` -- with a single
@@ -132,6 +136,74 @@ where
             .filter_map(|x| x.as_str().map(str::to_string))
             .collect(),
         _ => Vec::new(),
+    })
+}
+
+/// One row of the multi-question comparison rubric (first seen 2026-08-15):
+/// a heading like "Produced file(s) -- Instruction following", a description
+/// carrying the judging instructions, and a pick among that row's own
+/// buttons (Response A / Response B / Tie). Read off the live page by
+/// `COMPARISON_ROWS_BODY`; the row headed "Overall"/"Overall Quality" is NOT
+/// included -- that one stays the `overall` pick.
+#[derive(Deserialize)]
+pub struct ComparisonQuestion {
+    /// The row's heading text.
+    #[serde(default)]
+    pub name: String,
+    /// The description under the heading -- the question's judging rules.
+    #[serde(default)]
+    pub question: String,
+    /// The row's button texts, in order (e.g. Response A, Response B, Tie).
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// The currently selected option's text, when one is.
+    #[serde(default)]
+    pub selected: Option<String>,
+}
+
+/// Claude's pick for one comparison question, in `claude_answers`.
+#[derive(Deserialize)]
+pub struct ComparisonAnswer {
+    pub number: u32,
+    /// Must match one of that question's `options` (checked case-insensitively).
+    pub choice: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+impl ComparisonQuestion {
+    /// A short label for log lines, falling back to a number when the row
+    /// somehow has no heading.
+    fn label(&self, idx: usize) -> String {
+        if self.name.trim().is_empty() {
+            format!("comparison #{}", idx + 1)
+        } else {
+            self.name.trim().to_string()
+        }
+    }
+
+    /// The page's own spelling of `choice`, when it names one of this
+    /// question's options -- the exact text the click JS must match.
+    fn page_option(&self, choice: &str) -> Option<&str> {
+        self.options
+            .iter()
+            .find(|o| o.trim().eq_ignore_ascii_case(choice.trim()))
+            .map(String::as_str)
+    }
+}
+
+/// Whether `answers` carries a valid pick for every comparison question on
+/// the page: one per question in order, each choosing one of that question's
+/// actual options. Part of the success test for a claude run -- like the
+/// feedback check, a file that leaves required rows unanswerable leaves the
+/// submit disabled.
+fn comparison_answers_ok(answers: &ClaudeAnswers, questions: &[ComparisonQuestion]) -> bool {
+    questions.iter().enumerate().all(|(i, q)| {
+        answers.comparisons.get(i).is_some_and(|c| {
+            q.options
+                .iter()
+                .any(|o| o.trim().eq_ignore_ascii_case(c.choice.trim()))
+        })
     })
 }
 
@@ -221,10 +293,13 @@ fn feedback_answers_ok(answers: &ClaudeAnswers, questions: &[FeedbackQuestion]) 
 /// asks for a written answer to each and a run whose file lacks them counts
 /// as failed -- an unanswered required feedback box keeps the submit disabled,
 /// so a file without those answers cannot finish the round.
+/// `comparison_questions` work the same way for the multi-question A/B/Tie
+/// rubric (see [`comparison_questions`]).
 pub async fn ask_claude_for_answers(
     ctx: &WorkflowCtx,
     task_dir: &std::path::Path,
     feedback_questions: &[FeedbackQuestion],
+    comparison_questions: &[ComparisonQuestion],
 ) -> Result<()> {
     let claude = if ctx.settings.claude_path.trim().is_empty() {
         "claude".to_string()
@@ -234,6 +309,9 @@ pub async fn ask_claude_for_answers(
     let model = ctx.settings.solve_model.clone();
     let effort = ctx.settings.solve_effort.clone();
     let mut prompt: String = ANSWER_CRITERIA_PROMPT.to_string();
+    if !comparison_questions.is_empty() {
+        prompt.push_str(&comparison_prompt_addendum(comparison_questions));
+    }
     if !feedback_questions.is_empty() {
         prompt.push_str(&feedback_prompt_addendum(feedback_questions));
     }
@@ -287,22 +365,34 @@ pub async fn ask_claude_for_answers(
                 // complete claude_answers (exit non-zero, output fine), and can
                 // exit zero having written nothing usable.
                 match read_claude_answers(&answers_path) {
-                    Ok(a) if feedback_answers_ok(&a, feedback_questions) => {
+                    Ok(a) if feedback_answers_ok(&a, feedback_questions)
+                        && comparison_answers_ok(&a, comparison_questions) =>
+                    {
                         if attempt > 1 {
                             ctx.output(format!("claude succeeded on attempt {attempt}"));
                         }
                         return Ok(());
                     }
-                    // Parsed, but a required open-feedback answer is missing
-                    // or under the page's stated minimum length. Submitting
-                    // is impossible with that box unfilled, so this run
-                    // failed even though the ratings themselves are fine.
-                    Ok(_) => {
-                        last_err = format!(
-                            "claude_answers lacks a long-enough \"open_feedback\" answer for \
-                             each of the {} open feedback question(s) on the page",
-                            feedback_questions.len()
-                        );
+                    // Parsed, but a required answer is missing: an
+                    // open-feedback answer absent or under the page's stated
+                    // minimum, or a comparison pick absent or naming an
+                    // option the row doesn't offer. Submitting is impossible
+                    // with a required control unfilled, so this run failed
+                    // even though the rest of the file may be fine.
+                    Ok(a) => {
+                        last_err = if !comparison_answers_ok(&a, comparison_questions) {
+                            format!(
+                                "claude_answers lacks a valid \"comparisons\" pick for each \
+                                 of the {} comparison question(s) on the page",
+                                comparison_questions.len()
+                            )
+                        } else {
+                            format!(
+                                "claude_answers lacks a long-enough \"open_feedback\" answer \
+                                 for each of the {} open feedback question(s) on the page",
+                                feedback_questions.len()
+                            )
+                        };
                     }
                     Err(_) => {
                         last_err = if out.success() {
@@ -372,16 +462,19 @@ pub async fn apply_answers(
     // panel, so there is nothing to click until it is open.
     ensure_criteria_panel_open(ctx).await?;
     // Some tasks also ask open feedback question(s) -- required freeform
-    // textareas that gate the submit exactly like the buttons. Found up front
-    // so the pacer can give each its own budget slot; typed after the overall
-    // pick, like a person writing the justification after making their picks.
+    // textareas that gate the submit exactly like the buttons -- and some
+    // show a multi-question comparison rubric instead of Good/Bad criteria.
+    // Both are found up front so the pacer can give each its own budget
+    // slot, then worked in page order: comparisons, overall, feedback.
     let feedback = feedback_fields(ctx).await?;
+    let comparisons = comparison_rows(ctx).await?;
     let mut applied = 0usize;
     let mut missed: Vec<String> = Vec::new();
     // Paced runs spend a fixed budget as idle time between selections; unpaced
     // ones keep the old quick dwells, since they run with a submit waiting.
     let started = tokio::time::Instant::now();
-    let mut pacer = paced.then(|| Pacer::new(answers.criteria.len(), feedback.len()));
+    let mut pacer =
+        paced.then(|| Pacer::new(answers.criteria.len(), feedback.len() + comparisons.len()));
     if let Some(p) = &pacer {
         ctx.output(format!(
             "pacing: spreading {} answer(s) over about {} min",
@@ -458,7 +551,38 @@ pub async fn apply_answers(
             }
         }
     }
-    // the overall pick is the last selection, and takes the last budget slot
+    // The comparison rubric (when the page shows one) comes next, top to
+    // bottom like a person works the card. Each pick re-finds, verifies and
+    // escalates through click_until_selected exactly like a criterion.
+    for (i, q) in comparisons.iter().enumerate() {
+        let label = q.label(i);
+        let Some(choice) = answers
+            .comparisons
+            .get(i)
+            .and_then(|c| q.page_option(&c.choice))
+            .map(str::to_string)
+        else {
+            missed.push(format!(
+                "{label} (no valid comparisons pick in claude_answers)"
+            ));
+            continue;
+        };
+        match pacer.as_mut() {
+            Some(p) => {
+                let gap = p.next_gap();
+                idle_for(ctx, gap).await?;
+            }
+            // a beat to re-read the question's rule before picking
+            None => ctx.human_pause(700, 2400).await?,
+        }
+        let js = comparison_row_js(i, &choice);
+        if click_until_selected(ctx, &js).await? {
+            applied += 1;
+        } else {
+            missed.push(format!("{label} -> {choice}"));
+        }
+    }
+    // the overall pick takes the next budget slot
     match pacer.as_mut() {
         Some(p) => {
             let gap = p.next_gap();
@@ -735,6 +859,23 @@ pub async fn verify_answers_applied(
             }
         }
     }
+    // The comparison rubric's rows, when the page shows one.
+    for (i, q) in comparison_rows(ctx).await?.iter().enumerate() {
+        let label = q.label(i);
+        match answers
+            .comparisons
+            .get(i)
+            .and_then(|c| q.page_option(&c.choice))
+        {
+            Some(choice) => {
+                let v = ctx.eval(&comparison_row_js(i, choice)).await?;
+                if !v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
+                    wrong.push(format!("{label} -> {choice}"));
+                }
+            }
+            None => wrong.push(format!("{label} (no valid pick in claude_answers)")),
+        }
+    }
     let js = criteria_js(CLICK_OVERALL_BUTTON_BODY).replace("__WANT__", &js_str(&answers.overall.winner));
     let v = ctx.eval(&js).await?;
     if !v.get("selected").and_then(Value::as_bool).unwrap_or(false) {
@@ -899,6 +1040,39 @@ async fn feedback_field_at(ctx: &WorkflowCtx, idx: usize) -> Result<Option<Feedb
     let js = criteria_js(FEEDBACK_FIELDS_BODY).replace("__IDX__", &idx.to_string());
     let v = ctx.eval(&js).await?;
     Ok(v.as_str().and_then(|s| serde_json::from_str(s).ok()))
+}
+
+/// The comparison-rubric questions on the live page, with the rating UI
+/// opened first. Used by workflow 7 before the judging run, so the prompt
+/// asks for a pick per question.
+pub async fn comparison_questions(ctx: &mut WorkflowCtx) -> Result<Vec<ComparisonQuestion>> {
+    ensure_criteria_panel_open(ctx).await?;
+    comparison_rows(ctx).await
+}
+
+/// All comparison-rubric rows currently on the page, in DOM order (data
+/// only). The same order `ClaudeAnswers::comparisons` is written in, which
+/// is what pairs pick to row everywhere.
+async fn comparison_rows(ctx: &WorkflowCtx) -> Result<Vec<ComparisonQuestion>> {
+    let js = criteria_js(
+        &COMPARISON_ROWS_BODY
+            .replace("__IDX__", "-1")
+            .replace("__WANT__", "null"),
+    );
+    let v = ctx.eval(&js).await?;
+    Ok(v.as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default())
+}
+
+/// The finder JS for row `idx`'s button reading exactly `want` -- the shape
+/// `click_until_selected` drives.
+fn comparison_row_js(idx: usize, want: &str) -> String {
+    criteria_js(
+        &COMPARISON_ROWS_BODY
+            .replace("__IDX__", &idx.to_string())
+            .replace("__WANT__", &js_str(want)),
+    )
 }
 
 /// Type `want` (already normalized to one line) into the feedback field at
@@ -1308,6 +1482,37 @@ per-criterion ratings: write \"criteria\": [] and judge only the overall pick. \
 Output ONLY that file -- do not print the JSON to stdout, do not add commentary elsewhere. Be \
 strict and specific in your judgment.";
 
+/// What gets appended to [`ANSWER_CRITERIA_PROMPT`] when the page shows the
+/// multi-question comparison rubric: each question with its judging rules and
+/// its OWN option set, answered by picking one option verbatim. The overall
+/// pick stays separate -- these are the per-dimension questions above it.
+fn comparison_prompt_addendum(questions: &[ComparisonQuestion]) -> String {
+    let mut s = String::from(
+        "\n\nINSTEAD of a Good/Bad criteria list, this task's evaluation page asks you to \
+         pick a winner for each of the following comparison questions. The description \
+         after each question is that question's judging rule -- follow it exactly \
+         (including any instruction about when to mark Tie):\n",
+    );
+    for (i, q) in questions.iter().enumerate() {
+        s.push_str(&format!("{}. \"{}\"", i + 1, q.name.trim()));
+        if !q.question.trim().is_empty() {
+            s.push_str(": ");
+            s.push_str(q.question.trim());
+        }
+        s.push_str(&format!(" [options: {}]\n", q.options.join(" | ")));
+    }
+    s.push_str(
+        "Add a top-level \"comparisons\" field to the claude_answers JSON: an array with \
+         one object per question above, in the SAME order, shaped \
+         [{\"number\": 1, \"choice\": \"Response A\", \"notes\": \"one short sentence \
+         why\"}, ...]. Each \"choice\" must EXACTLY match one of that question's listed \
+         options. Judge every question independently on its own rule -- the same side \
+         does not have to win them all -- and keep the picks consistent with your \
+         overall answer and notes.\n",
+    );
+    s
+}
+
 /// What gets appended to [`ANSWER_CRITERIA_PROMPT`] when the page asks open
 /// feedback question(s): the questions as the page words them, and the shape
 /// and register the written answers must have. The length floor is restated
@@ -1406,7 +1611,23 @@ const CLICK_OVERALL_BUTTON_BODY: &str = r#"
     /* Headed "Overall Quality" on some task variants, plain "Overall" on
        others -- accept either. */
     if (!/^overall(\s*quality)?$/i.test((heads[i].textContent || '').trim())) continue;
-    card = heads[i].closest('[class*="rounded-lg"]') || heads[i].parentElement;
+    /* Scope to the heading's own ROW -- the nearest ancestor that also holds
+       the pick buttons -- NOT the whole card. The multi-question rubric
+       (2026-08-15) puts eight identically-buttoned rows in one card, and
+       searching the card from here clicked the FIRST question's buttons:
+       the overall pick landed on "Produced file(s) -- Instruction following"
+       while Overall Quality itself stayed empty. */
+    var up = heads[i].parentElement;
+    for (var d = 0; d < 5 && up; d++) {
+      var bs = up.querySelectorAll('button');
+      var n = 0;
+      for (var m = 0; m < bs.length; m++) {
+        if (bs[m].getAttribute('role') !== 'tab') n++;
+      }
+      if (n >= 2) { card = up; break; }
+      up = up.parentElement;
+    }
+    if (!card) card = heads[i].closest('[class*="rounded-lg"]') || heads[i].parentElement;
     if (card) break;
   }
   /* Newest arena layout: the overall pick moved into the rating drawer, which
@@ -3270,6 +3491,86 @@ const FEEDBACK_FIELDS_BODY: &str = r#"
   return items.length ? JSON.stringify(items) : JSON.stringify([]);
 "#;
 
+// The multi-question comparison rubric (2026-08-15's layout): one card of
+// rows, each a heading ("Produced file(s) -- Instruction following"), a
+// description carrying that question's judging rule, and its own pick
+// buttons (Response A / Response B / Tie). Rows are anchored on a non-tab
+// button reading exactly "Response A" -- the response-pane tabs carry
+// role="tab", and the Good/Bad layouts label their responses with spans, so
+// older pages yield no rows at all. The row headed "Overall"/"Overall
+// Quality" is excluded: that one is the `overall` pick.
+//
+// `__IDX__` = -1 returns every question (name, judging rule, options, and
+// which option is currently selected) as a JSON string, no hit-testing. A
+// real index returns `controlAt` for that row's button whose text equals
+// `__WANT__` -- the shape `click_until_selected` drives -- so the click
+// re-finds, verifies and escalates exactly like every other rating button.
+const COMPARISON_ROWS_BODY: &str = r#"
+  var IDX = __IDX__;
+  var WANT = __WANT__;
+  var scopes = [];
+  var root = findCriteriaRoot();
+  if (root) scopes.push(root);
+  var heads = document.querySelectorAll('h2,h3,h4,span,div');
+  for (var i = 0; i < heads.length; i++) {
+    if (!/^overall(\s*quality)?$/i.test((heads[i].textContent || '').trim())) continue;
+    var card = heads[i].closest('[class*="rounded-lg"]') || heads[i].parentElement;
+    if (card) { scopes.push(card.parentElement || card); break; }
+  }
+  if (!scopes.length) return null;
+  var rows = [];
+  for (var s = 0; s < scopes.length; s++) {
+    var btns = scopes[s].querySelectorAll('button');
+    for (var b = 0; b < btns.length; b++) {
+      if (btns[b].getAttribute('role') === 'tab') continue;
+      if ((btns[b].textContent || '').replace(/\s+/g, ' ').trim() !== 'Response A') continue;
+      var up = btns[b].parentElement, row = null;
+      for (var d = 0; d < 5 && up; d++) {
+        if (up.querySelector('h1,h2,h3,h4,label')) { row = up; break; }
+        up = up.parentElement;
+      }
+      if (row && rows.indexOf(row) === -1) rows.push(row);
+    }
+  }
+  var items = [];
+  var groups = [];
+  for (var r = 0; r < rows.length; r++) {
+    var head = rows[r].querySelector('h1,h2,h3,h4,label');
+    var name = head ? (head.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    if (/^overall(\s*quality)?$/i.test(name)) continue;
+    var p = rows[r].querySelectorAll('p');
+    var desc = '';
+    for (var q = 0; q < p.length; q++) {
+      var pt = (p[q].textContent || '').replace(/\s+/g, ' ').trim();
+      if (pt) { desc = pt; break; }
+    }
+    var opts = [], sel = null, obtns = [];
+    var rb = rows[r].querySelectorAll('button');
+    for (var j = 0; j < rb.length; j++) {
+      if (rb[j].getAttribute('role') === 'tab') continue;
+      var t = (rb[j].textContent || '').replace(/\s+/g, ' ').trim();
+      if (!t) continue;
+      opts.push(t);
+      obtns.push(rb[j]);
+      if (isSelected(rb[j])) sel = t;
+    }
+    if (opts.length < 2) continue;
+    items.push({ name: name, question: desc, options: opts, selected: sel });
+    groups.push(obtns);
+  }
+  if (IDX >= 0) {
+    if (IDX >= items.length) return null;
+    var group = groups[IDX];
+    for (var k = 0; k < group.length; k++) {
+      if ((group[k].textContent || '').replace(/\s+/g, ' ').trim() === WANT) {
+        return controlAt(group[k]);
+      }
+    }
+    return null;
+  }
+  return JSON.stringify(items);
+"#;
+
 // All the Task Data lookups (URL / button / text) find the block through the
 // shared `findTaskBlock()` below, which reports both the block and whether it
 // is the newest layout's request brief.
@@ -3585,6 +3886,49 @@ mod tests {
         assert!(!is_context_destroyed(&GolemError::Other(
             "Cannot find context".into()
         )));
+    }
+
+    /// A comparison-rubric question as the page probe reports it, for tests.
+    fn comparison(name: &str) -> ComparisonQuestion {
+        serde_json::from_str(&format!(
+            r#"{{"name":"{name}","options":["Response A","Response B","Tie"]}}"#
+        ))
+        .unwrap()
+    }
+
+    /// The comparisons field parses, defaults to empty when absent, and the
+    /// gate requires one pick per page question naming a real option --
+    /// case-insensitively, since claude's casing can drift from the page's.
+    #[test]
+    fn comparison_answers_gate_on_the_pages_options() {
+        let a: ClaudeAnswers = serde_json::from_str(
+            r#"{"overall": {"winner": "Tie"}, "comparisons": [
+                {"number": 1, "choice": "response a"},
+                {"number": 2, "choice": "Tie", "notes": "even"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(a.comparisons.len(), 2);
+        let qs = [comparison("Factuality"), comparison("Style")];
+        assert!(comparison_answers_ok(&a, &qs), "case-insensitive match must pass");
+        assert!(
+            !comparison_answers_ok(&a, &[comparison("a"), comparison("b"), comparison("c")]),
+            "a third page question has no pick"
+        );
+        let bad: ClaudeAnswers = serde_json::from_str(
+            r#"{"overall": {"winner": "Tie"}, "comparisons": [{"number": 1, "choice": "Good"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            !comparison_answers_ok(&bad, &qs[..1]),
+            "'Good' is not one of this row's options"
+        );
+        let absent: ClaudeAnswers =
+            serde_json::from_str(r#"{"overall": {"winner": "Tie"}}"#).unwrap();
+        assert!(absent.comparisons.is_empty());
+        assert!(comparison_answers_ok(&absent, &[]), "no rubric, nothing to gate");
+        // the applier needs the PAGE's spelling back, not claude's
+        assert_eq!(qs[0].page_option("response a"), Some("Response A"));
+        assert_eq!(qs[0].page_option("Both Good"), None);
     }
 
     /// A `FeedbackQuestion` as the page probe would report it, for tests.

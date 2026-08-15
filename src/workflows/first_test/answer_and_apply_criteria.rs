@@ -47,9 +47,11 @@ impl Workflow for AnswerAndApplyCriteria {
 
         ctx.step("ask Claude to judge each criterion").await?;
         // Some tasks also ask required open feedback question(s) -- freeform
-        // textareas that gate the submit. Read them off the live page first so
-        // the judging prompt asks for the written answer(s) too; without them
-        // the submit stays disabled and step 8 cannot finish the round.
+        // textareas that gate the submit -- and some replace the Good/Bad
+        // criteria with a multi-question comparison rubric (per-question
+        // Response A/B/Tie picks). Read both off the live page first so the
+        // judging prompt asks for everything the page requires; anything
+        // unanswered keeps the submit disabled and step 8 cannot finish.
         let feedback_questions = util::open_feedback_questions(ctx).await?;
         if !feedback_questions.is_empty() {
             ctx.output(format!(
@@ -58,7 +60,16 @@ impl Workflow for AnswerAndApplyCriteria {
                 feedback_questions.len()
             ));
         }
-        util::ask_claude_for_answers(ctx, &task_dir, &feedback_questions).await?;
+        let comparison_questions = util::comparison_questions(ctx).await?;
+        if !comparison_questions.is_empty() {
+            ctx.output(format!(
+                "this task uses a comparison rubric with {} question(s) -- claude will pick \
+                 a winner for each",
+                comparison_questions.len()
+            ));
+        }
+        util::ask_claude_for_answers(ctx, &task_dir, &feedback_questions, &comparison_questions)
+            .await?;
         let answers_path = task_dir.join("claude_answers");
         if !answers_path.exists() {
             return Err(util::halt_now(ctx, format!(
