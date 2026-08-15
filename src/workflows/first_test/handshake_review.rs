@@ -1022,8 +1022,16 @@ async fn click_control(
     }
     // `click_submit_with` also reports false when the control was gone before
     // it got a press in -- the user advancing the step by hand in the gap, or
-    // the page moving on by itself. That is the state we wanted anyway.
-    if ctx.eval(find_js).await?.get("x").is_none() {
+    // the page moving on by itself. That is the state we wanted anyway. A
+    // torn-down JS context is the same story told harder: the page NAVIGATED,
+    // so the control is gone with it.
+    let gone = match ctx.eval(find_js).await {
+        Ok(v) => v.get("x").is_none(),
+        Err(e @ (GolemError::StoppedByUser | GolemError::Halted(_))) => return Err(e),
+        Err(e) if util::is_context_destroyed(&e) => true,
+        Err(e) => return Err(e),
+    };
+    if gone {
         ctx.output(format!(
             "'{label}' went away before it could be pressed -- that step is done either way"
         ));
@@ -1054,6 +1062,10 @@ async fn click_button_by_text(
 
 /// Poll `find_js` (an IIFE returning `{x, y}` or null) until it yields
 /// coordinates or `timeout` passes.
+///
+/// A torn-down JS context mid-poll (the page navigating under us -- e.g. the
+/// previous control's click just landed) reads as "not found yet": the next
+/// iteration asks the NEW page, which is exactly where the control would be.
 pub(super) async fn wait_for_coords(
     ctx: &mut WorkflowCtx,
     find_js: &str,
@@ -1062,12 +1074,18 @@ pub(super) async fn wait_for_coords(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         ctx.guard().await?;
-        let v = ctx.eval(find_js).await?;
-        if let (Some(x), Some(y)) = (
-            v.get("x").and_then(Value::as_f64),
-            v.get("y").and_then(Value::as_f64),
-        ) {
-            return Ok(Some((x, y)));
+        match ctx.eval(find_js).await {
+            Ok(v) => {
+                if let (Some(x), Some(y)) = (
+                    v.get("x").and_then(Value::as_f64),
+                    v.get("y").and_then(Value::as_f64),
+                ) {
+                    return Ok(Some((x, y)));
+                }
+            }
+            Err(e @ (GolemError::StoppedByUser | GolemError::Halted(_))) => return Err(e),
+            Err(e) if util::is_context_destroyed(&e) => {}
+            Err(e) => return Err(e),
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(None);

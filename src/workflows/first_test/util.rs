@@ -1063,7 +1063,14 @@ pub async fn click_submit_with(ctx: &mut WorkflowCtx, find_js: &str) -> Result<b
 
     let mut clicked = false;
     for attempt in 1..=ATTEMPTS {
-        let v = ctx.eval(find_js).await?;
+        // A torn-down JS context here means the page navigated between
+        // attempts -- for a control whose landing navigates, that's the same
+        // "not findable any more" as the arm below, not an error.
+        let v = match ctx.eval(find_js).await {
+            Ok(v) => v,
+            Err(e) if is_context_destroyed(&e) => return Ok(clicked),
+            Err(e) => return Err(e),
+        };
         let (x, y) = match (
             v.get("x").and_then(Value::as_f64),
             v.get("y").and_then(Value::as_f64),
@@ -1096,6 +1103,13 @@ pub async fn click_submit_with(ctx: &mut WorkflowCtx, find_js: &str) -> Result<b
 ///
 /// Stop/Pause-aware via `human_pause`, and the pause comes first so a click
 /// always gets a beat to dispatch before the first look.
+///
+/// Eval errors are NOT propagated here, because the controls this watches
+/// (Submit, Next task, Confirm time) navigate the page when they land -- so
+/// the poll racing the navigation is the SUCCESS path, and a torn-down JS
+/// context (`is_context_destroyed`) is the button going away, reported as
+/// such. Anything else transient is retried until patience runs out; only
+/// Stop and a deliberate halt cut through.
 async fn wait_until_gone(
     ctx: &mut WorkflowCtx,
     find_js: &str,
@@ -1104,8 +1118,18 @@ async fn wait_until_gone(
     let deadline = tokio::time::Instant::now() + patience;
     loop {
         ctx.human_pause(350, 650).await?;
-        if ctx.eval(find_js).await?.get("x").is_none() {
-            return Ok(true);
+        match ctx.eval(find_js).await {
+            Ok(v) => {
+                if v.get("x").is_none() {
+                    return Ok(true);
+                }
+            }
+            Err(e @ (GolemError::StoppedByUser | GolemError::Halted(_))) => return Err(e),
+            Err(e) if is_context_destroyed(&e) => return Ok(true),
+            Err(_) => {
+                // a CDP wobble mid-poll; the next iteration re-asks, and the
+                // deadline below still bounds the whole wait
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             return Ok(false);
@@ -1523,6 +1547,29 @@ pub fn is_missing_file_error(e: &GolemError) -> bool {
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|code| code.parse::<u16>().ok())
         .is_some_and(|code| (400..500).contains(&code))
+}
+
+/// Whether `e` is the browser saying the page's JS world went away mid-call:
+/// CDP's "Cannot find context with specified id" / "Execution context was
+/// destroyed" -- i.e. the page NAVIGATED between our lookup and the eval.
+///
+/// For a finder being polled to see whether a click landed, this is the
+/// strongest possible evidence that it DID: the click didn't just remove the
+/// button, it moved the whole page. It ended the 2026-08-15 run instead --
+/// the final CDP click on "Next task" navigated to the next task, the
+/// follow-up eval hit the torn-down context, and the error propagated as a
+/// workflow failure, killing the chain at the moment it succeeded.
+pub fn is_context_destroyed(e: &GolemError) -> bool {
+    match e {
+        GolemError::Browser(m) => {
+            let m = m.to_ascii_lowercase();
+            m.contains("cannot find context")
+                || m.contains("context was destroyed")
+                || m.contains("context with specified id")
+                || m.contains("navigated or closed")
+        }
+        _ => false,
+    }
 }
 
 /// Abandon the current multimango task and queue a fresh pipeline run.
@@ -3517,6 +3564,27 @@ mod tests {
             attr_value("data-href=nope href=yes", "href"),
             Some("yes".to_string())
         );
+    }
+
+    /// The exact error that killed the 2026-08-15 chain, plus the other CDP
+    /// spellings of "the page navigated mid-eval" -- and the shapes that must
+    /// NOT match: an ordinary eval failure, and a non-browser error that
+    /// happens to contain the words.
+    #[test]
+    fn context_destroyed_errors_are_recognized() {
+        assert!(is_context_destroyed(&GolemError::Browser(
+            "eval: Error -32000: Cannot find context with specified id".into()
+        )));
+        assert!(is_context_destroyed(&GolemError::Browser(
+            "Execution context was destroyed.".into()
+        )));
+        assert!(is_context_destroyed(&GolemError::Browser(
+            "Inspected target navigated or closed".into()
+        )));
+        assert!(!is_context_destroyed(&GolemError::Browser("eval: timed out".into())));
+        assert!(!is_context_destroyed(&GolemError::Other(
+            "Cannot find context".into()
+        )));
     }
 
     /// A `FeedbackQuestion` as the page probe would report it, for tests.
