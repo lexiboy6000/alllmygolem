@@ -24,13 +24,22 @@
 //! tab. Cold start, the throwaway sign-in tab, and a previous round's leftover
 //! all fall out of that one rule.
 //!
-//! Everything here is skip-safe -- no "Open Multimango" control visible (the
-//! user already pressed it, or this state doesn't show one) means the step is
-//! simply skipped, never a failure.
+//! The clicking is skip-safe -- no "Open Multimango" control visible (the
+//! user already pressed it, or this state doesn't show one) means that step
+//! is simply skipped. What is NOT skippable is the invariant the clicking
+//! exists to establish: the Handshake task timer must be RUNNING before the
+//! round proceeds. On 2026-08-14 the start-gate "Timer paused" dialog
+//! rendered after this workflow's 8-second look, the skip branch fired, and
+//! the whole round was worked against a task that had never started -- 70
+//! minutes of downloads and judging that step 8's never-started guard then
+//! refused to submit. So after the clicking, the timer is read and driven
+//! (via the same resume ladder step 8 uses, which knows the gate dialog's
+//! own Open Multimango button) until it runs, and a timer that stays at
+//! 0:00 HALTS the round here, before anything has been spent on it.
 
 use crate::prelude::*;
 
-use super::handshake_review::{OPEN_MULTIMANGO_JS, wait_for_coords};
+use super::handshake_review::{OPEN_MULTIMANGO_JS, TIMER_READ_JS, try_resume_timer, wait_for_coords};
 use super::util;
 
 pub struct OpenMultimango;
@@ -134,6 +143,69 @@ impl Workflow for OpenMultimango {
                 "never saw a new multimango tab open -- continuing to the tab cleanup anyway; \
                  click through to Multimango by hand if Handshake still expects it",
             );
+        }
+
+        // ---- the actual invariant: the task timer is running ------------
+        // The clicking above is best-effort; THIS is what the round needs. A
+        // fresh task sits behind the start-gate "Timer paused" dialog until
+        // its Open Multimango is pressed, and that dialog can render after
+        // the 8-second look above (2026-08-14: the skip branch fired and the
+        // round was worked against a task that never started). Read the
+        // timer while still on the Handshake tab and drive the resume ladder
+        // -- which knows the gate dialog's button -- until it runs.
+        ctx.step("verify the task timer is running").await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let mut resume_attempts: u32 = 0;
+        let mut timer_ok = false;
+        loop {
+            ctx.guard().await?;
+            let Ok(v) = ctx.eval(TIMER_READ_JS).await else {
+                ctx.human_pause(1500, 2500).await?;
+                if tokio::time::Instant::now() >= deadline {
+                    break;
+                }
+                continue;
+            };
+            if v.is_null() {
+                // No timer widget at all. Not a state to hard-block on -- a
+                // layout without the widget would otherwise strand every
+                // round -- but say so, loudly enough to be seen.
+                ctx.warn(
+                    "couldn't find the task timer on the Handshake page -- proceeding; if \
+                     the task hasn't started, click Open Multimango there by hand",
+                );
+                timer_ok = true;
+                break;
+            }
+            let running = v.get("running").and_then(Value::as_bool).unwrap_or(false);
+            if running {
+                let secs = v.get("secs").and_then(Value::as_u64).unwrap_or(0);
+                ctx.output(format!(
+                    "task timer is running at {}:{:02}",
+                    secs / 60,
+                    secs % 60
+                ));
+                timer_ok = true;
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            resume_attempts = try_resume_timer(ctx, &v, resume_attempts, 5, 1000).await?;
+            ctx.human_pause(1500, 2500).await?;
+        }
+        if !timer_ok {
+            // Halting HERE is the cheap version of the failure: nothing has
+            // been downloaded or judged yet, and proceeding guarantees step
+            // 8's never-started guard strands the round 70 minutes from now.
+            return Err(util::halt_now(
+                ctx,
+                "the Handshake task timer is paused and would not start (Open Multimango, \
+                 the timer button and the dialog Continue were all tried) -- on a fresh task \
+                 this is the start-gate dialog refusing to clear. Start/resume the task by \
+                 hand on the Handshake page, then re-run this workflow.",
+            )
+            .await);
         }
 
         // ---- settle on ONE multimango tab: the task page ----------------

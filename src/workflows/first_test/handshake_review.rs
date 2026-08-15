@@ -699,20 +699,24 @@ fn wall_clock_msg(target_secs: u64) -> String {
 }
 
 /// One step of the paused-timer resume ladder. Takes how many attempts have
-/// been made and returns the new count.
+/// been made and returns the new count. Shared with workflow 0's start-gate
+/// check, which is why it's `pub(super)`.
 ///
-/// The ladder exists because a paused Handshake task has two very different
-/// shapes: a plain paused timer, where clicking the header button (`bx`/`by`
-/// in `reading`, from [`TIMER_READ_JS`]) resumes it -- and the paused-task
-/// DIALOG, which covers the page with an overlay that eats clicks aimed at
-/// that button, and is dismissed by its own Continue control instead. So:
-/// cursor click on the button, then a CDP click (in case the cursor's
-/// screen-mapping is what missed), then the dialog's Continue. After
-/// `hopeless` failed attempts it stops clicking every poll -- repeating an
-/// identical failed click every few seconds for half an hour is the loudest
-/// possible automation signature -- and retries just once every
-/// `sparse_every` polls in case the page unsticks itself.
-async fn try_resume_timer(
+/// The ladder exists because a paused Handshake task has THREE shapes: a
+/// plain paused timer, where clicking the header button (`bx`/`by` in
+/// `reading`, from [`TIMER_READ_JS`]) resumes it; the paused-task DIALOG,
+/// which covers the page with an overlay that eats clicks aimed at that
+/// button and is dismissed by its own Continue control; and the START-GATE
+/// variant of that dialog (fresh task, timer at 0:00 -- seen live
+/// 2026-08-14), whose ONLY working control is its "Open Multimango" button.
+/// When that button is on screen the dialog is up and every rung goes
+/// through it; otherwise: cursor click on the timer button, then a CDP click
+/// (in case the cursor's screen-mapping is what missed), then the dialog's
+/// Continue. After `hopeless` failed attempts it stops clicking every poll
+/// -- repeating an identical failed click every few seconds for half an hour
+/// is the loudest possible automation signature -- and retries just once
+/// every `sparse_every` polls in case the page unsticks itself.
+pub(super) async fn try_resume_timer(
     ctx: &mut WorkflowCtx,
     reading: &Value,
     attempts: u32,
@@ -723,6 +727,58 @@ async fn try_resume_timer(
         reading.get("bx").and_then(Value::as_f64),
         reading.get("by").and_then(Value::as_f64),
     );
+    // The gate dialog's own button, when the dialog is up. OPEN_MULTIMANGO_JS
+    // reports `kind`: only the `button` shape lives in the dialog -- the
+    // `link` shape is the Important-list prose on the normal page, which
+    // resumes nothing and must not be treated as a gate.
+    let gate = ctx.eval(OPEN_MULTIMANGO_JS).await.ok().and_then(|v| {
+        if v.get("kind").and_then(Value::as_str) != Some("button") {
+            return None;
+        }
+        match (
+            v.get("x").and_then(Value::as_f64),
+            v.get("y").and_then(Value::as_f64),
+        ) {
+            (Some(x), Some(y)) => Some((x, y)),
+            _ => None,
+        }
+    });
+    if let Some((x, y)) = gate
+        && (attempts < hopeless || (attempts - hopeless) % sparse_every == 0)
+    {
+        // The overlay eats everything else, so while the dialog is up the
+        // ladder IS this button: cursor first, CDP from then on. Clicking it
+        // spawns a duplicate multimango tab (it's how Handshake wants the
+        // arena reached), so note the tabs before and close whatever is new
+        // -- leaving it around would let a later switch_to_target land on a
+        // half-loaded sign-in page instead of the task tab.
+        if attempts == 0 {
+            ctx.output("task timer is paused behind its dialog -- clicking Open Multimango");
+        } else {
+            ctx.output("timer still paused -- clicking the dialog's Open Multimango via CDP");
+        }
+        let before = ctx
+            .browser
+            .list_targets("multimango.com")
+            .await
+            .unwrap_or_default();
+        let (jx, jy) = util::jittered(ctx, x, y);
+        if attempts == 0 {
+            ctx.click_at_cursor(jx, jy).await?;
+        } else {
+            ctx.click_at_cdp(jx, jy).await?;
+        }
+        ctx.human_pause(900, 1600).await?;
+        if let Ok(now) = ctx.browser.list_targets("multimango.com").await {
+            for id in now.iter().filter(|id| !before.contains(id)) {
+                let _ = ctx.browser.close_target_by_id(id).await;
+            }
+        }
+        // the new tab may have stolen the window -- put the controlled tab
+        // (Handshake here) back in front so later cursor clicks land right
+        util::focus_and_settle(ctx).await?;
+        return Ok(attempts + 1);
+    }
     match attempts {
         0 => {
             ctx.output("task timer is paused -- resuming it");
@@ -773,9 +829,10 @@ async fn try_resume_timer(
         }
         a if a == hopeless => {
             ctx.warn(format!(
-                "the task timer won't resume after {hopeless} attempts (timer button and \
-                 the paused-dialog Continue, cursor and CDP) -- backing off; the wall-clock \
-                 deadline still bounds this wait. The Handshake page likely needs a human."
+                "the task timer won't resume after {hopeless} attempts (Open Multimango, \
+                 the timer button and the paused-dialog Continue, cursor and CDP) -- backing \
+                 off; the wall-clock deadline still bounds this wait. The Handshake page \
+                 likely needs a human."
             ));
         }
         a if (a - hopeless) % sparse_every == 0 => {
@@ -1374,7 +1431,7 @@ const HANDSHAKE_SUBMIT_JS: &str = r#"(function(){
 /// text. Falls back to the document title ("MM:SS - Handshake AI"). Returns
 /// `{secs, running, bx, by}` (bx/by = the timer button, for resuming a
 /// paused timer) or null.
-const TIMER_READ_JS: &str = r#"(function(){
+pub(super) const TIMER_READ_JS: &str = r#"(function(){
   function parse(t) {
     var m = (t || '').match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
     if (!m) return null;
