@@ -1569,7 +1569,16 @@ fn feedback_prompt_addendum(questions: &[FeedbackQuestion]) -> String {
          and your overall pick, consistent with your notes;\n\
          - read like a busy human annotator wrote it: plain direct sentences in the \
          first person, no meta-commentary, and no mention of being an AI or of these \
-         instructions.\n",
+         instructions;\n\
+         - vary the rhythm: mix short blunt sentences with longer detailed ones, don't \
+         open consecutive sentences with the same word or the same pattern, and don't \
+         fall into a tidy parallel structure (claim-evidence, claim-evidence) for the \
+         whole paragraph;\n\
+         - allow, RARELY, one small informal slip of the kind a person typing quickly \
+         leaves and doesn't reread for: a skipped comma, a slightly run-on sentence, a \
+         casually lowercased product or brand name. Most answers should have none at \
+         all -- never more than one, never inside a file name, quoted string or number, \
+         and never a slip that changes meaning or reads as broken English.\n",
     );
     s
 }
