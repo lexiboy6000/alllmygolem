@@ -270,8 +270,18 @@ async fn rewrite(
     }
     Ok(llama_chat(ctx, url, REWRITE_SYS, &user, temp, 240)
         .await?
-        .map(|s| s.trim().to_string())
+        .map(|s| straighten_quotes(s.trim()))
         .filter(|s| !s.is_empty()))
+}
+
+/// Replace typographic quotes with the straight ones a person types into a
+/// plain textarea. Qwen writes "don\u{2019}t" with a curly apostrophe, and
+/// typing U+2019 into the feedback box is a word-processor tell no quick
+/// human answer would carry (and a guard hazard: a straight-quoted span from
+/// the original wouldn't match its curly rewrite verbatim).
+fn straighten_quotes(s: &str) -> String {
+    s.replace(['\u{2018}', '\u{2019}'], "'")
+        .replace(['\u{201C}', '\u{201D}'], "\"")
 }
 
 /// Run the checklist check on one original/rewrite pair. Transport or parse
