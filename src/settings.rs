@@ -78,6 +78,12 @@ pub struct Settings {
     /// Model for the solve/review agents (`--model`); alias like "opus" or a full
     /// id like "claude-opus-4-7". Empty = Claude Code's default.
     pub solve_model: String,
+    /// Fallback model when a `solve_model` run is rejected for usage or rate
+    /// limits (e.g. run "fable" until the plan runs dry, then drop to "opus").
+    /// Tried within the same retry loop, so a limited round degrades instead
+    /// of stalling; the primary is probed fresh each round, so this reverts
+    /// by itself once the limit window resets. Empty = no fallback.
+    pub solve_model_fallback: String,
     /// Reasoning effort for the solve/review agents (`--effort`): low/medium/high/
     /// xhigh/max. Empty = Claude Code's default.
     pub solve_effort: String,
@@ -115,6 +121,7 @@ impl Default for Settings {
             solve_max_iterations: 5,
             claude_timeout_secs: 900,
             solve_model: "opus".to_string(),
+            solve_model_fallback: String::new(),
             solve_effort: "high".to_string(),
             // Opt-in: the overlay is a separate always-on-top window, which on
             // Wayland can steal focus and get flagged "not responding" by the

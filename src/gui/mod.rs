@@ -770,6 +770,13 @@ impl GolemApp {
             );
         });
         ui.horizontal(|ui| {
+            ui.label("model fallback");
+            ui.add(
+                egui::TextEdit::singleline(&mut s.solve_model_fallback)
+                    .hint_text("used when the model above hits its usage limit"),
+            );
+        });
+        ui.horizontal(|ui| {
             ui.label("solve effort");
             ui.add(
                 egui::TextEdit::singleline(&mut s.solve_effort)

@@ -306,7 +306,13 @@ pub async fn ask_claude_for_answers(
     } else {
         ctx.settings.claude_path.clone()
     };
-    let model = ctx.settings.solve_model.clone();
+    // The model can change mid-loop: when the primary is rejected for usage
+    // or rate limits and Settings names a fallback, the remaining attempts
+    // run on the fallback -- "use fable until it runs dry, then opus". The
+    // primary is probed fresh every round, so a reset limit window reverts
+    // this by itself; the switch below only lasts the current judging run.
+    let mut model = ctx.settings.solve_model.clone();
+    let fallback = ctx.settings.solve_model_fallback.clone();
     let effort = ctx.settings.solve_effort.clone();
     let mut prompt: String = ANSWER_CRITERIA_PROMPT.to_string();
     if !comparison_questions.is_empty() {
@@ -314,22 +320,6 @@ pub async fn ask_claude_for_answers(
     }
     if !feedback_questions.is_empty() {
         prompt.push_str(&feedback_prompt_addendum(feedback_questions));
-    }
-    let mut args: Vec<&str> = vec![
-        "-p",
-        prompt.as_str(),
-        "--dangerously-skip-permissions",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ];
-    if !model.trim().is_empty() {
-        args.push("--model");
-        args.push(model.as_str());
-    }
-    if !effort.trim().is_empty() {
-        args.push("--effort");
-        args.push(effort.as_str());
     }
     let timeout = Duration::from_secs(ctx.settings.claude_timeout_secs.max(60));
 
@@ -355,7 +345,29 @@ pub async fn ask_claude_for_answers(
     let mut last_err = String::new();
     for attempt in 1..=ATTEMPTS {
         ctx.guard().await?;
-        match ctx.run_claude(&claude, &args, Some(task_dir), Some(timeout)).await {
+        // args borrows the (mutable-across-attempts) model, so it lives in
+        // its own scope: by the time the retry tail may switch models, the
+        // borrow is gone.
+        let run = {
+            let mut args: Vec<&str> = vec![
+                "-p",
+                prompt.as_str(),
+                "--dangerously-skip-permissions",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+            ];
+            if !model.trim().is_empty() {
+                args.push("--model");
+                args.push(model.as_str());
+            }
+            if !effort.trim().is_empty() {
+                args.push("--effort");
+                args.push(effort.as_str());
+            }
+            ctx.run_claude(&claude, &args, Some(task_dir), Some(timeout)).await
+        };
+        match run {
             // A user Stop is a stop, never a retry.
             Err(GolemError::StoppedByUser) => return Err(GolemError::StoppedByUser),
             Err(e) => last_err = e.to_string(),
@@ -405,11 +417,34 @@ pub async fn ask_claude_for_answers(
             }
         }
         if attempt < ATTEMPTS {
-            let backoff = Duration::from_secs(30u64 << (attempt - 1));
-            ctx.warn(format!(
-                "claude attempt {attempt}/{ATTEMPTS} failed ({last_err}) -- retrying in {}s",
-                backoff.as_secs()
-            ));
+            // A usage/rate-limited primary is not a transient blip: waiting
+            // out the backoff and re-asking the same model would just be
+            // rejected again. With a fallback configured, switch to it for
+            // the rest of this run -- and skip the long wait, because the
+            // rejection was instant and the fallback is a different bucket.
+            let switched = is_usage_limited(&last_err)
+                && !fallback.trim().is_empty()
+                && !model.trim().eq_ignore_ascii_case(fallback.trim());
+            if switched {
+                ctx.warn(format!(
+                    "'{}' looks out of usage ({}) -- falling back to '{}' for this round",
+                    if model.trim().is_empty() { "the default model" } else { model.trim() },
+                    last_err.chars().take(120).collect::<String>(),
+                    fallback.trim()
+                ));
+                model = fallback.clone();
+            }
+            let backoff = if switched {
+                Duration::from_secs(3)
+            } else {
+                Duration::from_secs(30u64 << (attempt - 1))
+            };
+            if !switched {
+                ctx.warn(format!(
+                    "claude attempt {attempt}/{ATTEMPTS} failed ({last_err}) -- retrying in {}s",
+                    backoff.as_secs()
+                ));
+            }
             let until = tokio::time::Instant::now() + backoff;
             while tokio::time::Instant::now() < until {
                 ctx.guard().await?;
@@ -1794,6 +1829,24 @@ pub fn is_missing_file_error(e: &GolemError) -> bool {
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|code| code.parse::<u16>().ok())
         .is_some_and(|code| (400..500).contains(&code))
+}
+
+/// Whether a failed claude run's error text says the MODEL is out of budget
+/// -- plan usage limits, rate limits, or capacity -- rather than a transient
+/// transport or agent failure. This is what flips the judging run onto
+/// `solve_model_fallback`: a limited model rejects instantly and will keep
+/// rejecting until its window resets, so retrying it is pure waste, while a
+/// crash or dropped connection deserves the normal same-model retry.
+pub fn is_usage_limited(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("usage limit")
+        || e.contains("rate limit")
+        || e.contains("rate_limit")
+        || e.contains("limit reached")
+        || e.contains("out of usage")
+        || e.contains("overloaded")
+        || e.contains("insufficient credit")
+        || e.contains("quota")
 }
 
 /// Whether `e` is the browser saying the page's JS world went away mid-call:
@@ -3891,6 +3944,30 @@ mod tests {
             attr_value("data-href=nope href=yes", "href"),
             Some("yes".to_string())
         );
+    }
+
+    /// The strings the claude CLI/API actually emit when a model is out of
+    /// budget must trip the fallback; ordinary failures must not, or every
+    /// crash would silently downgrade the judging model.
+    #[test]
+    fn usage_limit_errors_are_recognized() {
+        for limited in [
+            "Claude usage limit reached. Your limit will reset at 3pm",
+            "API Error: 429 rate_limit_error: Number of requests has exceeded your rate limit",
+            "You've reached your usage limit for Fable",
+            "Error: overloaded_error: Overloaded",
+            "insufficient credit balance",
+        ] {
+            assert!(is_usage_limited(limited), "should trip on: {limited}");
+        }
+        for transient in [
+            "API Error: Connection closed mid-response",
+            "claude exited cleanly but wrote no usable claude_answers",
+            "spawn claude: No such file or directory",
+            "timed out: no output for 900s",
+        ] {
+            assert!(!is_usage_limited(transient), "must NOT trip on: {transient}");
+        }
     }
 
     /// The exact error that killed the 2026-08-15 chain, plus the other CDP
