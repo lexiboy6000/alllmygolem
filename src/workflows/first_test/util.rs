@@ -1837,9 +1837,19 @@ pub fn is_missing_file_error(e: &GolemError) -> bool {
 /// `solve_model_fallback`: a limited model rejects instantly and will keep
 /// rejecting until its window resets, so retrying it is pure waste, while a
 /// crash or dropped connection deserves the normal same-model retry.
+///
+/// The CLI's per-model banner reads "You've reached your Fable 5 limit. Switch
+/// to another model, or manage usage credits at ...?from=cc_cli_limit_message,
+/// to continue." -- the MODEL NAME sits between "your" and "limit", so no fixed
+/// substring spans it and the older patterns below all missed it, leaving the
+/// judging run to burn its backoff re-asking the model that just said no. Match
+/// the marker in the URL, the instruction, and the split halves as well.
 pub fn is_usage_limited(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
-    e.contains("usage limit")
+    e.contains("cc_cli_limit_message")
+        || e.contains("switch to another model")
+        || (e.contains("reached your") && e.contains("limit"))
+        || e.contains("usage limit")
         || e.contains("rate limit")
         || e.contains("rate_limit")
         || e.contains("limit reached")
@@ -3955,6 +3965,11 @@ mod tests {
             "Claude usage limit reached. Your limit will reset at 3pm",
             "API Error: 429 rate_limit_error: Number of requests has exceeded your rate limit",
             "You've reached your usage limit for Fable",
+            // Verbatim from the 2026-08-16 run, which retried fable four times
+            // instead of falling back: the model name splits "your"/"limit".
+            "You've reached your Fable 5 limit. Switch to another model, or manage usage \
+             credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.",
+            "You've reached your Opus 5 limit.",
             "Error: overloaded_error: Overloaded",
             "insufficient credit balance",
         ] {
