@@ -412,9 +412,24 @@ impl Workflow for HandshakeReviewAndSubmit {
         ctx.output("Handshake task submitted");
 
         // Handshake asks to confirm the handle time before releasing the task.
+        // The dialog is normally up within a second or two, but it only
+        // appears once the server has taken the submission, and a slow round
+        // trip has been seen to outlast a 15s wait -- which stranded the whole
+        // round, because "Next task" only exists on the other side of this
+        // dialog. Waiting a full minute costs nothing when it appears on time
+        // (the poll returns the moment it does) and saves the round when it
+        // doesn't.
         ctx.step("confirm the time").await?;
         between_clicks(ctx).await?;
-        click_button_by_text(ctx, "confirm.*time", "Confirm time", Duration::from_secs(15)).await?;
+        if !click_button_by_text(ctx, "confirm.*time", "Confirm time", Duration::from_secs(60))
+            .await?
+        {
+            // Either the dialog never came, or it was already confirmed. The
+            // two look identical from here and lead to different next moves,
+            // so record what the page was actually showing -- without it the
+            // only trace is a "Next task" that also isn't there.
+            dump_buttons(ctx).await;
+        }
 
         // ---- move to the next task + queue the next round ---------------
         ctx.step("go to the next task").await?;

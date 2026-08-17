@@ -206,10 +206,14 @@ pub struct WorkflowCtx {
     inputs: BTreeMap<String, String>,
     last_mouse: Point,
     /// Set once the window turns out to be unmappable to screen pixels (the
-    /// Wayland case — see [`viewport_screen_offset`](Self::viewport_screen_offset)).
+    /// Wayland case — see [`viewport_pointer_map`](Self::viewport_pointer_map)).
     /// It cannot become mappable later in a run, so cache it: without this,
     /// every native-cursor click re-probes and logs the same warning.
     pointer_unmappable: bool,
+    /// Whether the "browser window isn't on the displayed workspace" warning
+    /// has already been given. Cleared as soon as it comes back into view, so
+    /// the warning marks each time it goes away rather than every click.
+    pointer_offscreen_noted: bool,
     /// Last screen point we drove the REAL OS cursor to. Wayland has no
     /// protocol for reading the cursor position, so this is the fallback
     /// start point for native moves when `cursor_pos()` fails.
@@ -254,6 +258,7 @@ impl WorkflowCtx {
             inputs,
             last_mouse: Point::ZERO,
             pointer_unmappable: false,
+            pointer_offscreen_noted: false,
             last_native_mouse: None,
             step_index: 0,
             http,
@@ -745,70 +750,95 @@ impl WorkflowCtx {
         Ok(())
     }
 
-    /// Screen-pixel position of the page viewport's origin: add it to
-    /// viewport coordinates to aim the REAL OS cursor at a page element.
-    /// Derived from the window's own geometry: side borders are
-    /// `(outerWidth - innerWidth) / 2` (zero on macOS), and everything above
-    /// the viewport (title bar, tab strip, URL bar) is the remainder of
-    /// `outerHeight - innerHeight`. Both `screenX/Y` and enigo speak logical
-    /// (not physical-Retina) pixels, so no DPR scaling is needed — but this
-    /// does assume 100% page zoom and no docked devtools.
+    /// How to aim the REAL OS cursor at a page element:
+    /// `screen = origin + css * css_to_screen`.
+    ///
+    /// Off Wayland this is derived from the window's own geometry: side
+    /// borders are `(outerWidth - innerWidth) / 2` (zero on macOS), everything
+    /// above the viewport (title bar, tab strip, URL bar) is the remainder of
+    /// `outerHeight - innerHeight`, and `screenX/Y` says where the window is.
+    /// Both `screenX/Y` and enigo speak logical (not physical-Retina) pixels,
+    /// so no DPR scaling is needed there — but it does assume 100% page zoom
+    /// and no docked devtools.
     ///
     /// Under a Wayland compositor (Hyprland, GNOME, Sway, ...) none of that
-    /// holds: a Wayland client is never told where its own window sits, so
-    /// Chromium reports `screenX`/`screenY` as a constant 0, and with
-    /// client-side decorations `outerHeight == innerHeight` — the tab strip
-    /// and URL bar measure as zero height. The naive arithmetic then yields a
-    /// perfectly plausible-looking `(0, 0)`, which would silently aim the real
-    /// cursor at raw screen coordinates and click somewhere else entirely
-    /// (possibly in another window). Detect that signature and fail instead,
-    /// so callers fall back to the CDP click, which works purely in viewport
-    /// coordinates and is unaffected.
-    async fn viewport_screen_offset(&self) -> Result<(f64, f64)> {
-        // NB: a Wayland session is NOT bailed out of here. A Wayland client is
-        // never told where its own window sits, so `screenX`/`screenY` read a
-        // constant 0 -- but rather than give up on native input entirely, we
-        // ask the compositor for the window position below (see
-        // `compositor_browser_window_pos`), which restores real cursor clicks
-        // on Hyprland/Sway. The `positioned` guard still catches the case where
-        // the window reports nothing AND the compositor can't be reached.
+    /// holds, and the failure is silent rather than loud:
+    ///
+    /// - a Wayland client is never told where its own window sits, so
+    ///   `screenX`/`screenY` are a constant 0;
+    /// - with client-side decorations `outerHeight == innerHeight`, so the tab
+    ///   strip and URL bar measure as zero height — the naive arithmetic puts
+    ///   the viewport's origin at the window's top-left corner, ~87px too high
+    ///   on a stock Chromium;
+    /// - `outerWidth/Height` are window pixels while `innerWidth/Height` are
+    ///   CSS pixels, so at any page zoom but 100% subtracting one from the
+    ///   other mixes units and invents a frame that isn't there.
+    ///
+    /// So on Hyprland the window rectangle comes from the compositor
+    /// ([`compositor_browser_window`]) and the viewport is measured inside it:
+    /// `innerWidth/Height` scaled by the page zoom gives the viewport in the
+    /// compositor's own pixels, and whatever space is left in the window is
+    /// the browser frame. Page zoom is recoverable because
+    /// `devicePixelRatio == monitor scale * zoom`, and the monitor's scale is
+    /// something the compositor will tell us.
+    ///
+    /// Anywhere the mapping can't be derived this fails instead of guessing,
+    /// so the caller falls back to the CDP click, which works purely in
+    /// viewport coordinates and is unaffected by all of the above.
+    async fn viewport_pointer_map(&self) -> Result<PointerMap> {
         let v = self
             .browser
             .eval(
                 "(function(){ var side = (window.outerWidth - window.innerWidth) / 2; \
                  var chrome = window.outerHeight - window.innerHeight; \
                  return { wx: window.screenX, wy: window.screenY, \
+                          iw: window.innerWidth, ih: window.innerHeight, \
+                          dpr: window.devicePixelRatio, \
                           sx: window.screenX + side, \
                           sy: window.screenY + chrome - side, \
                           positioned: chrome > 0 || window.screenX !== 0 || window.screenY !== 0 }; })()",
             )
             .await?;
-        let (sx, sy) = match (
-            v.get("sx").and_then(Value::as_f64),
-            v.get("sy").and_then(Value::as_f64),
-        ) {
-            (Some(sx), Some(sy)) => (sx, sy),
-            _ => {
-                return Err(GolemError::Other(
-                    "couldn't read the window's screen position".into(),
-                ));
-            }
+        let num = |k: &str| v.get(k).and_then(Value::as_f64);
+        let (Some(sx), Some(sy)) = (num("sx"), num("sy")) else {
+            return Err(GolemError::Other(
+                "couldn't read the window's screen position".into(),
+            ));
         };
         // A native-Wayland browser can't know its own screen position --
-        // `screenX/Y` report 0 -- so `(sx, sy)` is only the viewport's offset
-        // within the window. Add the compositor's idea of where the window is.
-        let screen_pos_unknown = v.get("wx").and_then(Value::as_f64) == Some(0.0)
-            && v.get("wy").and_then(Value::as_f64) == Some(0.0);
-        if screen_pos_unknown && is_wayland_session() {
-            if let Some((wx, wy)) = compositor_browser_window_pos().await {
-                return Ok((sx + wx, sy + wy));
-            }
+        // `screenX/Y` report 0 -- so nothing it says about where the viewport
+        // is can be trusted. Measure the viewport inside the compositor's
+        // window rectangle instead.
+        let screen_pos_unknown = num("wx") == Some(0.0) && num("wy") == Some(0.0);
+        if screen_pos_unknown
+            && is_wayland_session()
+            && let (Some(iw), Some(ih)) = (num("iw"), num("ih"))
+            && let Some(win) = compositor_browser_window().await
+            && let Some(mon) = compositor_monitor(win.monitor).await
+        {
+            // devicePixelRatio = monitor scale * page zoom, so this is the
+            // page zoom -- the number of compositor pixels one CSS pixel
+            // spans. 1.0 at 100% zoom, and the whole reason the old
+            // outer-minus-inner arithmetic mis-aimed every click on a zoomed
+            // page.
+            let zoom = num("dpr").map_or(1.0, |dpr| dpr / mon.scale);
+            return viewport_map_in_window(&win, iw, ih, zoom).ok_or_else(|| {
+                GolemError::Other(format!(
+                    "the {:.0}x{:.0} viewport doesn't fit the compositor's {:.0}x{:.0} \
+                     window rectangle at zoom {zoom:.2} -- viewport coordinates cannot \
+                     be mapped to screen pixels",
+                    iw * zoom,
+                    ih * zoom,
+                    win.w,
+                    win.h
+                ))
+            });
         }
-        // The compositor couldn't be reached either. If the window reports
-        // neither a screen position nor a frame height, `(sx, sy)` is a
-        // plausible-looking (0, 0) that would aim the real cursor at raw screen
-        // coordinates and click in some other window entirely. Fail instead, so
-        // the caller falls back to CDP clicks (and caches `pointer_unmappable`).
+        // If the window reports neither a screen position nor a frame height,
+        // `(sx, sy)` is a plausible-looking (0, 0) that would aim the real
+        // cursor at raw screen coordinates and click in some other window
+        // entirely. Fail instead, so the caller falls back to CDP clicks (and
+        // caches `pointer_unmappable`).
         if v.get("positioned").and_then(Value::as_bool) == Some(false) {
             return Err(GolemError::Other(
                 "the window reports neither a screen position nor a frame height \
@@ -818,7 +848,11 @@ impl WorkflowCtx {
                     .into(),
             ));
         }
-        Ok((sx, sy))
+        Ok(PointerMap {
+            ox: sx,
+            oy: sy,
+            css_to_screen: 1.0,
+        })
     }
 
     /// Like [`click_at`](Self::click_at), but moves the REAL OS cursor to the
@@ -840,8 +874,28 @@ impl WorkflowCtx {
         if self.pointer_unmappable {
             return self.click_at_cdp(x, y).await;
         }
-        let (ox, oy) = match self.viewport_screen_offset().await {
-            Ok(o) => o,
+        // The real cursor clicks whatever the screen is SHOWING at that point.
+        // A browser window parked on a workspace the compositor isn't
+        // displaying is therefore not clickable at all: the press lands on
+        // whichever window occupies those pixels on the visible workspace --
+        // in this project's own setup, Golem's window and the terminals next
+        // to it. Unlike an unmappable window this is not a property of the
+        // run, so it is re-checked per click and never latched: switching back
+        // to the browser's workspace restores native clicking immediately.
+        if browser_window_is_showing().await == Some(false) {
+            if !self.pointer_offscreen_noted {
+                self.pointer_offscreen_noted = true;
+                self.warn(
+                    "the browser window is on a workspace that isn't being displayed, so a \
+                     real-cursor click would land on whatever IS on screen -- using CDP \
+                     clicks until it comes back into view",
+                );
+            }
+            return self.click_at_cdp(x, y).await;
+        }
+        self.pointer_offscreen_noted = false;
+        let map = match self.viewport_pointer_map().await {
+            Ok(m) => m,
             Err(e) => {
                 self.pointer_unmappable = true;
                 self.warn(format!(
@@ -851,7 +905,10 @@ impl WorkflowCtx {
                 return self.click_at_cdp(x, y).await;
             }
         };
-        let target = Point::new(x + ox, y + oy);
+        let target = Point::new(
+            map.ox + x * map.css_to_screen,
+            map.oy + y * map.css_to_screen,
+        );
         self.info(format!(
             "cursor click @ ({x:.0},{y:.0}) -> screen ({:.0},{:.0})",
             target.x, target.y
@@ -1566,21 +1623,47 @@ async fn sleep_opt(d: Option<Duration>) {
     }
 }
 
-/// Where the Wayland compositor says the browser window is, in global screen
-/// pixels. Only Hyprland is supported (`hyprctl clients -j`); anywhere else
-/// this returns `None` and the caller keeps the browser-reported offset. When
-/// several browser windows exist, the most recently focused one wins (lowest
-/// `focusHistoryID`) -- native clicks land on the frontmost window anyway.
-async fn compositor_browser_window_pos() -> Option<(f64, f64)> {
+/// Run a `hyprctl ... -j` query and parse its JSON. `None` for anything that
+/// isn't a working Hyprland session (the command missing, a non-zero exit,
+/// unparseable output), which every caller reads as "the compositor can't be
+/// asked".
+async fn hyprctl_json(args: &[&str]) -> Option<Value> {
     let out = tokio::process::Command::new("hyprctl")
-        .args(["clients", "-j"])
+        .args(args)
         .output()
         .await
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let clients: Value = serde_json::from_slice(&out.stdout).ok()?;
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+/// The browser window as the compositor sees it: position and size in global
+/// logical screen pixels, plus the workspace and monitor it lives on.
+struct CompositorWindow {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    workspace: i64,
+    monitor: i64,
+}
+
+/// A monitor as the compositor sees it: its scale (logical pixels are
+/// physical/scale) and the workspace it is currently displaying.
+struct CompositorMonitor {
+    scale: f64,
+    active_workspace: i64,
+}
+
+/// Where the Wayland compositor says the browser window is. Only Hyprland is
+/// supported (`hyprctl clients -j`); anywhere else this returns `None` and the
+/// caller keeps the browser-reported geometry. When several browser windows
+/// exist, the most recently focused one wins (lowest `focusHistoryID`) --
+/// native clicks land on the frontmost window anyway.
+async fn compositor_browser_window() -> Option<CompositorWindow> {
+    let clients = hyprctl_json(&["clients", "-j"]).await?;
     let win = clients
         .as_array()?
         .iter()
@@ -1592,7 +1675,99 @@ async fn compositor_browser_window_pos() -> Option<(f64, f64)> {
         })
         .min_by_key(|c| c.get("focusHistoryID").and_then(Value::as_i64).unwrap_or(i64::MAX))?;
     let at = win.get("at")?.as_array()?;
-    Some((at.first()?.as_f64()?, at.get(1)?.as_f64()?))
+    let size = win.get("size")?.as_array()?;
+    Some(CompositorWindow {
+        x: at.first()?.as_f64()?,
+        y: at.get(1)?.as_f64()?,
+        w: size.first()?.as_f64()?,
+        h: size.get(1)?.as_f64()?,
+        workspace: win.get("workspace")?.get("id")?.as_i64()?,
+        monitor: win.get("monitor").and_then(Value::as_i64).unwrap_or(-1),
+    })
+}
+
+/// The compositor's view of monitor `id` (or the focused one, when the window
+/// didn't say which monitor it is on).
+async fn compositor_monitor(id: i64) -> Option<CompositorMonitor> {
+    let monitors = hyprctl_json(&["monitors", "-j"]).await?;
+    let monitors = monitors.as_array()?;
+    let mon = monitors
+        .iter()
+        .find(|m| m.get("id").and_then(Value::as_i64) == Some(id))
+        .or_else(|| {
+            monitors
+                .iter()
+                .find(|m| m.get("focused").and_then(Value::as_bool) == Some(true))
+        })
+        .or_else(|| monitors.first())?;
+    Some(CompositorMonitor {
+        scale: mon
+            .get("scale")
+            .and_then(Value::as_f64)
+            .filter(|s| *s > 0.0)
+            .unwrap_or(1.0),
+        active_workspace: mon.get("activeWorkspace")?.get("id")?.as_i64()?,
+    })
+}
+
+/// Whether the browser window is on a workspace the compositor is actually
+/// displaying — i.e. whether a real-cursor click aimed at it would reach it.
+/// `None` when there is no compositor to ask (X11, macOS, a non-Hyprland
+/// Wayland session), which callers treat as "assume it is showing" so nothing
+/// changes on those platforms.
+async fn browser_window_is_showing() -> Option<bool> {
+    if !is_wayland_session() {
+        return None;
+    }
+    let win = compositor_browser_window().await?;
+    let mon = compositor_monitor(win.monitor).await?;
+    Some(win.workspace == mon.active_workspace)
+}
+
+/// Where the page viewport sits on screen, and how far one CSS pixel reaches
+/// there: `screen = origin + css * css_to_screen`. Built by
+/// [`WorkflowCtx::viewport_pointer_map`], which documents where each part
+/// comes from.
+struct PointerMap {
+    ox: f64,
+    oy: f64,
+    /// Screen pixels per CSS pixel — the page zoom, 1.0 at 100%.
+    css_to_screen: f64,
+}
+
+/// Locate the viewport inside the compositor's window rectangle, given the
+/// page's own `innerWidth`/`innerHeight` (CSS pixels) and the page zoom.
+///
+/// `iw * zoom` by `ih * zoom` is the viewport in the compositor's pixels;
+/// whatever is left of the window around it is the browser's frame. Chromium
+/// puts that frame above the viewport, so any leftover WIDTH is a side border
+/// (split evenly, and the same border runs along the bottom) and everything
+/// else is the tab strip and URL bar on top.
+///
+/// `None` when the numbers can't describe one window — a viewport wider or
+/// taller than the window it is supposedly inside, or a frame taller than the
+/// window is. That means some assumption here is wrong (docked devtools, a
+/// second browser window picked by mistake, a compositor reporting physical
+/// pixels), and a wrong-but-plausible answer would aim the real cursor at
+/// whatever happens to sit at those coordinates.
+fn viewport_map_in_window(
+    win: &CompositorWindow,
+    iw: f64,
+    ih: f64,
+    zoom: f64,
+) -> Option<PointerMap> {
+    let (vw, vh) = (iw * zoom, ih * zoom);
+    let side = ((win.w - vw) / 2.0).max(0.0);
+    let top = win.h - vh - side;
+    let plausible = (0.1..10.0).contains(&zoom)
+        && vw <= win.w + 2.0
+        && vh <= win.h + 2.0
+        && (-2.0..=win.h * 0.6).contains(&top);
+    plausible.then(|| PointerMap {
+        ox: win.x + side,
+        oy: win.y + top,
+        css_to_screen: zoom,
+    })
 }
 
 /// Strip path separators and other awkward characters from a download filename.
@@ -1610,5 +1785,69 @@ fn sanitize_filename(name: &str) -> String {
         "download.bin".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The window Golem drives on the machine this was measured on: Hyprland
+    /// at scale 1.5, a maximized Chromium tiled under a 35px bar with 22px
+    /// gaps, all in logical pixels (`hyprctl clients -j`).
+    fn window() -> CompositorWindow {
+        CompositorWindow {
+            x: 22.0,
+            y: 57.0,
+            w: 1236.0,
+            h: 641.0,
+            workspace: 3,
+            monitor: 0,
+        }
+    }
+
+    /// At 100% zoom the viewport is the full window width, and the ~87px the
+    /// window has left over is the tab strip and URL bar above it.
+    #[test]
+    fn maps_an_unzoomed_page_below_the_browser_frame() {
+        let m = viewport_map_in_window(&window(), 1236.0, 554.0, 1.0).expect("maps");
+        assert!((m.ox - 22.0).abs() < 1.0, "ox = {}", m.ox);
+        assert!((m.oy - 144.0).abs() < 1.0, "oy = {}", m.oy);
+        assert!((m.css_to_screen - 1.0).abs() < f64::EPSILON);
+    }
+
+    /// The same window with the page zoomed to 110% (devicePixelRatio 1.65 on
+    /// a 1.5x monitor): innerWidth/Height shrink to CSS pixels, so the
+    /// viewport must be scaled back up before it can be located -- and it
+    /// lands in exactly the same place, because it is the same window. This is
+    /// what the old `outerHeight - innerHeight` arithmetic got wrong: it read
+    /// the zoom as a 138px frame and aimed every click ~54px high.
+    #[test]
+    fn a_zoomed_page_maps_to_the_same_viewport_origin() {
+        let plain = viewport_map_in_window(&window(), 1236.0, 554.0, 1.0).expect("maps");
+        let zoomed = viewport_map_in_window(&window(), 1123.0, 503.0, 1.65 / 1.5).expect("maps");
+        assert!((zoomed.ox - plain.ox).abs() < 1.5, "ox = {}", zoomed.ox);
+        assert!((zoomed.oy - plain.oy).abs() < 1.5, "oy = {}", zoomed.oy);
+        assert!((zoomed.css_to_screen - 1.1).abs() < 0.001);
+        // A button at CSS (561, 281) -- where "Confirm time" sits -- is inside
+        // the window, not 34px above it in the page's own chrome.
+        let (x, y) = (
+            zoomed.ox + 561.0 * zoomed.css_to_screen,
+            zoomed.oy + 281.0 * zoomed.css_to_screen,
+        );
+        let w = window();
+        assert!(x > w.x && x < w.x + w.w, "x = {x}");
+        assert!(y > w.y && y < w.y + w.h, "y = {y}");
+    }
+
+    /// A viewport that doesn't fit its window means one of the inputs isn't
+    /// describing what we think it is, so there is no map to return.
+    #[test]
+    fn refuses_a_viewport_that_cannot_fit_its_window() {
+        assert!(viewport_map_in_window(&window(), 1920.0, 554.0, 1.0).is_none());
+        assert!(viewport_map_in_window(&window(), 1236.0, 700.0, 1.0).is_none());
+        // A frame taller than half the window: the window rectangle and the
+        // page are not the same window.
+        assert!(viewport_map_in_window(&window(), 1236.0, 100.0, 1.0).is_none());
     }
 }
