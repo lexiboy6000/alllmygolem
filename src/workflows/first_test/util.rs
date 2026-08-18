@@ -119,6 +119,57 @@ pub struct ClaudeAnswers {
     /// Present only when the task shows one (see [`ComparisonQuestion`]).
     #[serde(default)]
     pub comparisons: Vec<ComparisonAnswer>,
+    /// One or two sentences on why the SAME side wins (or ties) every
+    /// A/B/Tie question -- what gets typed into the page's "All ratings are
+    /// the same" confirmation when it pops up on submit (see
+    /// [`answer_same_ratings_dialog`]). Asked for whenever the page shows a
+    /// comparison rubric; older files and terse runs may lack it, in which
+    /// case [`ClaudeAnswers::same_verdict_justification`] falls back to the
+    /// notes claude did write.
+    #[serde(default)]
+    pub same_verdict_reason: Option<String>,
+}
+
+impl ClaudeAnswers {
+    /// The text to give the page's "All ratings are the same" dialog: the
+    /// dedicated `same_verdict_reason` when claude wrote one long enough,
+    /// else the overall notes, else the comparison notes, else the opening
+    /// of the open feedback -- always something claude actually said about
+    /// THIS pair, never filler. `None` only when nothing meets `min`.
+    pub fn same_verdict_justification(&self, min: u32) -> Option<String> {
+        let long_enough = |s: &str| s.chars().count() as u32 >= min.max(1);
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(r) = &self.same_verdict_reason {
+            candidates.push(normalize_feedback(r));
+        }
+        candidates.push(normalize_feedback(&self.overall.notes));
+        let comparison_notes = self
+            .comparisons
+            .iter()
+            .map(|c| normalize_feedback(&c.notes))
+            .filter(|n| !n.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        candidates.push(comparison_notes);
+        if let Some(fb) = self.open_feedback.first() {
+            candidates.push(leading_sentences(&normalize_feedback(fb), 320));
+        }
+        candidates.into_iter().find(|c| long_enough(c))
+    }
+}
+
+/// The first whole sentence(s) of `text` that fit in `max_chars` -- at least
+/// one sentence, even if that one runs long, so the result never ends
+/// mid-thought.
+fn leading_sentences(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for sentence in text.split_inclusive(|c| c == '.' || c == '!' || c == '?') {
+        if !out.is_empty() && out.chars().count() + sentence.chars().count() > max_chars {
+            break;
+        }
+        out.push_str(sentence);
+    }
+    out.trim().to_string()
 }
 
 /// Accept `"open_feedback": "..."` as well as `["...", ...]` -- with a single
@@ -1245,6 +1296,191 @@ pub async fn click_submit_if_enabled(ctx: &mut WorkflowCtx) -> Result<bool> {
     click_submit_with(ctx, FIND_SUBMIT_JS).await
 }
 
+/// Submit the multimango evaluation: press Save & Continue (or Submit), and
+/// if the page answers with its "All ratings are the same" confirmation
+/// instead of submitting, fill that in and confirm it. `true` means the
+/// evaluation is submitted; `false` means the submit control couldn't be
+/// pressed, or the dialog came up and couldn't be answered (each case is
+/// logged before returning). The one entry point both step 7 (standalone)
+/// and step 8 use, so a submit is never declared done with that dialog
+/// still up -- which is exactly how a uniform verdict used to strand a
+/// round: the press "landed" (the button went behind the modal), the
+/// workflow moved on to Handshake, and the evaluation was never sent.
+pub async fn submit_evaluation(ctx: &mut WorkflowCtx, answers: &ClaudeAnswers) -> Result<bool> {
+    // A dialog already up (an earlier attempt opened it) means the press
+    // has been made; pressing again would only hit the overlay.
+    if same_ratings_dialog(ctx).await?.is_none() {
+        if !click_submit_if_enabled(ctx).await? {
+            return Ok(false);
+        }
+        // The dialog, when it comes, is React state set in the click handler
+        // -- rendered by the time the wait-until-gone poll saw the button go
+        // -- but give it a beat anyway before deciding it isn't there.
+        ctx.human_pause(500, 1000).await?;
+    }
+    answer_same_ratings_dialog(ctx, answers).await
+}
+
+/// The "All ratings are the same" confirmation as it currently stands, or
+/// `None` when it isn't up (see `SAME_RATINGS_DIALOG_BODY`). A torn-down JS
+/// context is the page having moved on -- no dialog.
+#[derive(Deserialize)]
+struct SameRatingsDialog {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    min: u32,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    focused: bool,
+    #[serde(default)]
+    confirm_enabled: bool,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+}
+
+impl SameRatingsDialog {
+    /// The page's own test for the textarea: trimmed length against the
+    /// stated minimum (the confirm button stays disabled below it).
+    fn satisfied(&self) -> bool {
+        self.value.trim().chars().count() as u32 >= self.min.max(1)
+    }
+}
+
+async fn same_ratings_dialog(ctx: &WorkflowCtx) -> Result<Option<SameRatingsDialog>> {
+    match ctx.eval(&criteria_js(SAME_RATINGS_DIALOG_BODY)).await {
+        Ok(v) => Ok(v.as_str().and_then(|s| serde_json::from_str(s).ok())),
+        Err(e) if is_context_destroyed(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// When the "All ratings are the same" confirmation is up, type claude's
+/// justification into it and press Confirm & Submit; when it isn't, there
+/// is nothing to do and the submit stands. Returns `false` (after saying
+/// why) if the dialog is up but couldn't be answered -- no text long enough
+/// in claude_answers, a textarea that wouldn't take focus, or a confirm
+/// press that never landed. Typed for real, like the feedback boxes: the
+/// page counts paste attempts.
+pub async fn answer_same_ratings_dialog(
+    ctx: &mut WorkflowCtx,
+    answers: &ClaudeAnswers,
+) -> Result<bool> {
+    const ATTEMPTS: usize = 3;
+    let Some(first) = same_ratings_dialog(ctx).await? else {
+        return Ok(true);
+    };
+    let title = if first.title.trim().is_empty() {
+        "All ratings are the same".to_string()
+    } else {
+        first.title.trim().to_string()
+    };
+    let Some(want) = answers.same_verdict_justification(first.min) else {
+        ctx.warn(format!(
+            "the page put up its '{title}' confirmation (it wants at least {} characters \
+             on why one side wins or ties every question) but claude_answers has no note \
+             that long -- NOT typing filler; answer it by hand",
+            first.min
+        ));
+        return Ok(false);
+    };
+    ctx.output(format!(
+        "the page asks to confirm the uniform verdict ('{title}') -- typing the justification: \
+         {want}"
+    ));
+    // a person reads the dialog before answering it
+    ctx.human_pause(1800, 3600).await?;
+    let mut typed = false;
+    for attempt in 1..=ATTEMPTS {
+        let Some(d) = same_ratings_dialog(ctx).await? else {
+            // Gone between attempts: either a hand answered it, or the page
+            // moved on. Nothing left to type into.
+            ctx.output("the confirmation went away on its own -- carrying on");
+            return Ok(true);
+        };
+        let have = normalize_feedback(&d.value);
+        if have == want || (d.satisfied() && !have.is_empty() && !want.starts_with(&have)) {
+            // Already answered (by us a moment ago, or by a hand): a
+            // sufficient different answer stands, same as the feedback boxes.
+            typed = true;
+            break;
+        }
+        let (Some(x), Some(y)) = (d.x, d.y) else {
+            if attempt == ATTEMPTS {
+                ctx.warn(format!(
+                    "'{title}': the justification box stays covered by another element -- \
+                     NOT typing blind"
+                ));
+                return Ok(false);
+            }
+            ctx.human_pause(500, 1100).await?;
+            continue;
+        };
+        let (jx, jy) = jittered(ctx, x, y);
+        if attempt < ATTEMPTS {
+            ctx.click_at_cursor(jx, jy).await?;
+        } else {
+            ctx.click_at_cdp(jx, jy).await?;
+        }
+        ctx.human_pause(250, 550).await?;
+        let Some(d) = same_ratings_dialog(ctx).await? else {
+            continue;
+        };
+        if !d.focused {
+            continue;
+        }
+        let have = normalize_feedback(&d.value);
+        if !have.is_empty() {
+            for _ in 0..3 {
+                ctx.press_key("PageDown").await?;
+                ctx.human_pause(60, 140).await?;
+            }
+            ctx.press_key("End").await?;
+            ctx.human_pause(120, 260).await?;
+        }
+        let resume = !have.is_empty() && want.starts_with(&have);
+        if !have.is_empty() && !resume {
+            for _ in 0..d.value.chars().count() {
+                ctx.press_key("Backspace").await?;
+                ctx.human_pause(30, 90).await?;
+            }
+        }
+        let text = if resume { &want[have.len()..] } else { want.as_str() };
+        ctx.type_human(text).await?;
+        ctx.human_pause(400, 800).await?;
+        if let Some(d) = same_ratings_dialog(ctx).await? {
+            if d.satisfied() && d.confirm_enabled {
+                typed = true;
+                break;
+            }
+        }
+        if attempt < ATTEMPTS {
+            ctx.warn(format!(
+                "'{title}': the typed justification didn't register -- trying again"
+            ));
+        }
+    }
+    if !typed {
+        ctx.warn(format!(
+            "'{title}': couldn't get the justification typed in -- finish the dialog by hand"
+        ));
+        return Ok(false);
+    }
+    // a beat between finishing the sentence and reaching for the button
+    ctx.human_pause(700, 1600).await?;
+    if click_submit_with(ctx, FIND_CONFIRM_SUBMIT_JS).await? {
+        ctx.output(format!("confirmed the uniform verdict ('{title}')"));
+        return Ok(true);
+    }
+    ctx.warn(format!(
+        "'{title}': Confirm & Submit was pressed but the dialog is still up -- finish it by hand"
+    ));
+    Ok(false)
+}
+
 /// The mechanism behind [`click_submit_if_enabled`], reusable with any
 /// find-JS returning `{x, y}` for an ENABLED submit control (the review
 /// workflow feeds it the Handshake page's submit button).
@@ -1669,7 +1905,14 @@ fn comparison_prompt_addendum(questions: &[ComparisonQuestion]) -> String {
          why\"}, ...]. Each \"choice\" must EXACTLY match one of that question's listed \
          options. Judge every question independently on its own rule -- the same side \
          does not have to win them all -- and keep the picks consistent with your \
-         overall answer and notes.\n",
+         overall answer and notes.\n\
+         ALSO add a top-level \"same_verdict_reason\" string: if the SAME side wins (or \
+         it is a Tie on) every comparison question above AND the overall pick, the page \
+         pops up a confirmation asking why one output clearly wins (or ties) on every \
+         dimension, and this is what gets typed into it. Write one or two plain \
+         first-person sentences (between 60 and 300 characters, no newlines) naming the \
+         concrete thing that decided it, consistent with your notes. Include the field \
+         even when the picks are mixed -- it is only used when the page asks.\n",
     );
     s
 }
@@ -1836,6 +2079,17 @@ const FIND_SUBMIT_JS: &str = r#"(function(){
     return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
   }
   var btns = document.querySelectorAll('button');
+  /* The "All ratings are the same" confirmation is a modal on top of the
+     rating panel: while it is up, Save & Continue is still in the DOM but
+     nothing behind the modal can be pressed, and the press that opened it
+     DID land. Report the submit control as gone so the click loop stops
+     re-pressing at the overlay; the caller answers the dialog itself. */
+  for (var c = 0; c < btns.length; c++) {
+    var ct = (btns[c].textContent || '').replace(/\s+/g, ' ').trim();
+    if (!/^confirm\s*(&|and)\s*submit$/i.test(ct)) continue;
+    var cr = btns[c].getBoundingClientRect();
+    if (cr.width >= 1 && cr.height >= 1) return null;
+  }
   for (var i = 0; i < btns.length; i++) {
     var t = (btns[i].textContent || '').replace(/\s+/g, ' ').trim();
     if (!/^save\s*(&|and)\s*continue$/i.test(t)) continue;
@@ -1865,6 +2119,78 @@ const FIND_SUBMIT_JS: &str = r#"(function(){
     best = btns[m];
   }
   return best ? at(best) : null;
+})()"#;
+
+// The "All ratings are the same" confirmation (first seen 2026-08-18). The
+// arena's submit handler (`detectAllSameChoiceRatings` in its bundle) checks
+// every single-select A/B/Tie question -- the comparison rubric's rows plus
+// Overall -- and when they all resolve to the same side (all A, all B, or all
+// Tie) it opens this alert dialog INSTEAD of submitting: "You've rated one
+// output the same on every dimension. This can be correct, but please add a
+// brief justification to confirm this is intentional", a textarea ("Why does
+// one output clearly win (or tie) on every dimension? (min 20 characters)"),
+// "Go Back", and "Confirm & Submit" (disabled under the minimum). Anchored on
+// the confirm button's text, with the textarea found in the same dialog
+// container, so a reworded title still resolves. Returns a JSON string with
+// the textarea's state and a hittable point on it, plus the confirm button's
+// state -- or null when no such dialog is up.
+const SAME_RATINGS_DIALOG_BODY: &str = r#"
+  var btns = document.querySelectorAll('button');
+  var confirm = null;
+  for (var i = 0; i < btns.length; i++) {
+    var t = (btns[i].textContent || '').replace(/\s+/g, ' ').trim();
+    if (!/^confirm\s*(&|and)\s*submit$/i.test(t)) continue;
+    var r = btns[i].getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    confirm = btns[i];
+  }
+  if (!confirm) return null;
+  var box = confirm.closest('[role="alertdialog"],[role="dialog"]');
+  var ta = box ? box.querySelector('textarea') : null;
+  if (!ta) {
+    var up = confirm.parentElement;
+    for (var d = 0; d < 8 && up && up !== document.body && !ta; d++) {
+      ta = up.querySelector('textarea');
+      if (!ta) up = up.parentElement;
+    }
+    if (ta) box = up;
+  }
+  if (!ta) return null;
+  var text = (box ? box.textContent : '') || '';
+  var m = (ta.getAttribute('placeholder') || '').match(/min(?:imum)?\s+(\d+)\s+characters/i)
+       || text.match(/min(?:imum)?\s+(\d+)\s+characters/i);
+  var out = {
+    title: (function(){
+      var h = box ? box.querySelector('h1,h2,h3,[role="heading"]') : null;
+      return h ? (h.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    })(),
+    min: m ? parseInt(m[1], 10) : 20,
+    value: ta.value || '',
+    focused: document.activeElement === ta,
+    confirm_enabled: !(confirm.disabled || confirm.getAttribute('aria-disabled') === 'true')
+  };
+  var p = hittablePoint(ta);
+  if (p) { out.x = p.x; out.y = p.y; }
+  return JSON.stringify(out);
+"#;
+
+/// The dialog's enabled "Confirm & Submit" button, in the `{x, y}` shape
+/// [`click_submit_with`] drives -- so the press gets the same re-find /
+/// wait-until-gone / escalate-to-CDP discipline as every other submit.
+const FIND_CONFIRM_SUBMIT_JS: &str = r#"(function(){
+  var btns = document.querySelectorAll('button');
+  var best = null;
+  for (var i = 0; i < btns.length; i++) {
+    var t = (btns[i].textContent || '').replace(/\s+/g, ' ').trim();
+    if (!/^confirm\s*(&|and)\s*submit$/i.test(t)) continue;
+    if (btns[i].disabled || btns[i].getAttribute('aria-disabled') === 'true') continue;
+    var r = btns[i].getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    best = btns[i];
+  }
+  if (!best) return null;
+  var r2 = best.getBoundingClientRect();
+  return { x: r2.left + r2.width / 2, y: r2.top + r2.height / 2 };
 })()"#;
 
 /// The task page's enabled "Skip" button (the same one `FIND_SUBMIT_JS`
@@ -3964,6 +4290,71 @@ const FIND_RESPONSE_IFRAME_SRC_JS: &str = r#"(function(){
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn answers(json: &str) -> ClaudeAnswers {
+        serde_json::from_str(json).expect("test JSON parses")
+    }
+
+    /// The "All ratings are the same" dialog gets claude's dedicated reason
+    /// when there is one; a file from before that field existed (or a run
+    /// that skipped it) falls back to the notes claude DID write, in a
+    /// fixed order, and never to invented filler.
+    #[test]
+    fn same_verdict_justification_prefers_the_dedicated_reason_then_falls_back() {
+        let full = answers(
+            r#"{"overall":{"winner":"Response A","notes":"A's table reconciles; B's does not."},
+                "comparisons":[{"number":1,"choice":"Response A","notes":"A meets all 10."}],
+                "open_feedback":["The math decided this one. I multiplied every unit cost."],
+                "same_verdict_reason":"A is right on every line and B\n is not, so A wins each question."}"#,
+        );
+        assert_eq!(
+            full.same_verdict_justification(20).as_deref(),
+            Some("A is right on every line and B is not, so A wins each question.")
+        );
+        // no dedicated reason -> the overall notes
+        let old = answers(
+            r#"{"overall":{"winner":"Response A","notes":"A's table reconciles; B's does not."},
+                "comparisons":[{"number":1,"choice":"Response A","notes":"A meets all 10."}],
+                "open_feedback":["The math decided this one. I multiplied every unit cost."]}"#,
+        );
+        assert_eq!(
+            old.same_verdict_justification(20).as_deref(),
+            Some("A's table reconciles; B's does not.")
+        );
+        // overall notes too short -> the comparison notes, joined
+        let terse = answers(
+            r#"{"overall":{"winner":"Tie","notes":"equal"},
+                "comparisons":[{"number":1,"choice":"Tie","notes":"Both render."},
+                               {"number":2,"choice":"Tie","notes":"Both cite the source."}],
+                "open_feedback":["Neither side did anything the other did not. Both fine."]}"#,
+        );
+        assert_eq!(
+            terse.same_verdict_justification(20).as_deref(),
+            Some("Both render. Both cite the source.")
+        );
+        // nothing but the feedback -> its leading sentences, whole
+        let feedback_only = answers(
+            r#"{"overall":{"winner":"Response B","notes":"B"},
+                "open_feedback":["B ran and A did not. That settled every question here. Long tail follows."]}"#,
+        );
+        assert_eq!(
+            feedback_only.same_verdict_justification(20).as_deref(),
+            Some("B ran and A did not. That settled every question here. Long tail follows.")
+        );
+        // nothing long enough anywhere -> None, so the caller stops instead of typing filler
+        let bare = answers(r#"{"overall":{"winner":"Response B","notes":"B"}}"#);
+        assert_eq!(bare.same_verdict_justification(20), None);
+    }
+
+    #[test]
+    fn leading_sentences_keeps_whole_sentences_within_the_budget() {
+        let text = "First one here. Second one is longer than the first! Third? Fourth.";
+        assert_eq!(leading_sentences(text, 40), "First one here.");
+        assert_eq!(leading_sentences(text, 55), "First one here. Second one is longer than the first!");
+        // a single sentence over budget is still returned whole
+        assert_eq!(leading_sentences("One very long opening sentence.", 5), "One very long opening sentence.");
+        assert_eq!(leading_sentences(text, 500), text);
+    }
 
     const ORIGIN: &str =
         "https://13bd4fc8-ef7c-5ee7-aec1-12e7551eb868.multimodal-agentic-generation-preview.mangovibe.net";

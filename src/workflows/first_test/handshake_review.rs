@@ -349,13 +349,18 @@ impl Workflow for HandshakeReviewAndSubmit {
             .await);
         }
         between_clicks(ctx).await?;
-        if !util::click_submit_if_enabled(ctx).await? {
+        // Presses Save & Continue, and answers the "All ratings are the same"
+        // confirmation the page raises instead of submitting when every
+        // A/B/Tie question went the same way (the reason it needs is in
+        // claude_answers, or is taken from claude's notes).
+        if !util::submit_evaluation(ctx, &answers).await? {
             return Err(util::halt_now(
                 ctx,
-                "the multimango submit control wasn't found or never enabled (\"Save & \
+                "the multimango evaluation didn't go through: the submit control (\"Save & \
                  Continue\" inside the evaluation-criteria panel on the newest layout, or \
-                 Submit next to Skip on older ones) -- submit by hand, then continue on the \
-                 Handshake side manually.",
+                 Submit next to Skip on older ones) wasn't found or never enabled, or the \
+                 page's confirmation dialog couldn't be answered (see the log line above) -- \
+                 submit by hand, then continue on the Handshake side manually.",
             )
             .await);
         }

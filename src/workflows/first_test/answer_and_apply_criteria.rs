@@ -155,13 +155,14 @@ impl Workflow for AnswerAndApplyCriteria {
             "submitting {applied} rating(s) ({} missed) with no confirmation prompt",
             missed.len()
         ));
-        let clicked = util::click_submit_if_enabled(ctx).await?;
+        let clicked = util::submit_evaluation(ctx, &answers).await?;
         if clicked {
             ctx.output("submitted the evaluation.");
         } else {
             ctx.warn(
                 "the submit control (\"Save & Continue\", or Submit on older layouts) wasn't \
-                 found or is still disabled -- check the page manually.",
+                 found or is still disabled, or the page's confirmation dialog couldn't be \
+                 answered (see above) -- check the page manually.",
             );
         }
 
