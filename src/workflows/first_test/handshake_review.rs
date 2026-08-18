@@ -15,7 +15,14 @@
 //!    "already answered" is detected -- so a step the user pre-clicked by hand
 //!    is skipped rather than answered twice, and every step is skipped cleanly
 //!    on a re-run. An older page variant used aria-pressed toggle buttons;
-//!    both layouts are handled,
+//!    both layouts are handled. Every press is verified bounce-aware: a
+//!    wizard button that vanishes into its spinner and comes straight back
+//!    was taken and REFUSED, not landed. If the instructions step is still
+//!    up after Continue was pressed, the run page is reloaded -- the wizard
+//!    is server-side state and comes back at the step really pending -- and
+//!    the two steps are walked again (2026-08-17/18: two rounds stalled here
+//!    with every later step then failing against a wizard on its first
+//!    question),
 //! 3. waits for the task timer to reach 40 minutes (plus up to 3 of jitter)
 //!    BEFORE either submission -- both platforms record a handle time, so the
 //!    wait sits ahead of the first submit of the round rather than only in
@@ -155,6 +162,15 @@ impl Workflow for HandshakeReviewAndSubmit {
         // The Open Multimango busywork now leads the chain as workflow 0, so
         // that the round is worked in the right tab from the start.
 
+        // The tab has sat in the background for the whole multimango leg
+        // (25-40 min). Coming back to the front, its app refreshes the task
+        // state on the visibility change; give that a moment to land before
+        // the first press. In two rounds on 2026-08-17/18 the Continue below
+        // was pressed within ~1s of the switch and the wizard never advanced
+        // (see `instructions_step_pending` / `reload_task_page` below) -- a
+        // small settle costs nothing when the page didn't need it.
+        ctx.human_pause(2500, 4000).await?;
+
         // ---- wizard: a Continue step may gate the task-type question ----
         ctx.step("advance the wizard (Continue, if shown)").await?;
         click_control(ctx, CONTINUE_STEP_JS, "Continue", Duration::from_secs(6)).await?;
@@ -162,39 +178,27 @@ impl Workflow for HandshakeReviewAndSubmit {
         // ---- select the arena task type ---------------------------------
         ctx.step("select the task type on Handshake").await?;
         between_clicks(ctx).await?;
-        // Try the multimango slug verbatim first -- when both sides agree,
-        // which is the common case, this is the whole story.
-        let mut selected = answer_wizard_step(ctx, &regex_escape(&arena_id)).await?;
-        if selected {
-            ctx.output(format!("selected task type: {arena_id}"));
-        } else {
-            // They didn't agree. Handshake labels the same job with a
-            // different id group often enough that failing here would stall
-            // the unattended loop, so decide from what is actually on offer.
-            let options = wizard_option_texts(ctx).await?;
-            match pick_task_type_option(&arena_id, &options) {
-                Some(pick) => {
-                    if !pick.exact {
-                        ctx.warn(format!(
-                            "the multimango task is '{arena_id}' but Handshake offers '{}' -- \
-                             taking it as the same task type",
-                            pick.text
-                        ));
-                    }
-                    selected = answer_wizard_step(ctx, &regex_escape(&pick.text)).await?;
-                    if selected {
-                        ctx.output(format!("selected task type: {}", pick.text));
-                    }
-                }
-                None => ctx.warn(format!(
-                    "no task-type option matches '{arena_id}'; offered: {}",
-                    if options.is_empty() {
-                        "(none found)".to_string()
-                    } else {
-                        options.join(", ")
-                    }
-                )),
-            }
+        let mut selected = select_task_type(ctx, &arena_id).await?;
+        if !selected && instructions_step_pending(ctx).await {
+            // The Continue above was pressed (its button vanished for a
+            // moment) and yet the wizard is still on the instructions step:
+            // the page took the press and refused the block submit, so the
+            // task-type question never appeared. Reload the run page -- the
+            // wizard is server-side state and comes back at whichever step is
+            // really pending -- and walk the two steps again from there.
+            ctx.warn(
+                "the Handshake wizard is still on its instructions step after Continue was \
+                 pressed -- the page refused the step. Reloading the task page and \
+                 walking the wizard again.",
+            );
+            reload_task_page(ctx).await?;
+            ctx.step("advance the wizard after the reload (Continue, if shown)")
+                .await?;
+            click_control(ctx, CONTINUE_STEP_JS, "Continue", Duration::from_secs(10)).await?;
+            ctx.step("select the task type on Handshake (after the reload)")
+                .await?;
+            between_clicks(ctx).await?;
+            selected = select_task_type(ctx, &arena_id).await?;
         }
         if !selected {
             dump_buttons(ctx).await;
@@ -382,7 +386,8 @@ impl Workflow for HandshakeReviewAndSubmit {
         // "I submitted my time on Multimango" was already answered earlier in
         // the wizard -- all that's left here is the final submit.
         between_clicks(ctx).await?;
-        let mut submitted = util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await?;
+        let mut submitted =
+            util::click_submit_with_grace(ctx, HANDSHAKE_SUBMIT_JS, BOUNCE_GRACE).await?;
         if !submitted {
             // Multimango is already submitted, so a halt here strands a
             // half-finished round -- worth one recovery pass first. The two
@@ -398,7 +403,8 @@ impl Workflow for HandshakeReviewAndSubmit {
             between_clicks(ctx).await?;
             let _ = answer_wizard_step(ctx, "i submitted my (task|time) on multimango").await?;
             between_clicks(ctx).await?;
-            submitted = util::click_submit_with(ctx, HANDSHAKE_SUBMIT_JS).await?;
+            submitted =
+                util::click_submit_with_grace(ctx, HANDSHAKE_SUBMIT_JS, BOUNCE_GRACE).await?;
         }
         if !submitted {
             return Err(util::halt_now(
@@ -1001,13 +1007,15 @@ fn js_str(s: &str) -> String {
 
 /// Wait for `find_js`'s control to appear, then press it.
 ///
-/// The press goes through [`util::click_submit_with`], which is the only click
-/// path here that actually checks its own work: it re-reads fresh coordinates
-/// before every attempt, treats "the control is still on the page" as a missed
-/// click, and escalates to a CDP click once the real cursor has failed twice.
-/// Every control this drives (Continue, Continue task, Confirm time, Next
-/// task) advances the wizard and disappears when pressed, so that check is
-/// meaningful for all of them.
+/// The press goes through [`util::click_submit_with_grace`], which is the only
+/// click path here that actually checks its own work: it re-reads fresh
+/// coordinates before every attempt, treats "the control is still on the
+/// page" as a missed click, and escalates to a CDP click once the real cursor
+/// has failed twice. Every control this drives (Continue, Continue task,
+/// Confirm time, Next task) advances the wizard and disappears when pressed,
+/// so that check is meaningful for all of them -- with [`BOUNCE_GRACE`] on
+/// top, because these buttons also disappear (into a spinner) for a press the
+/// page goes on to refuse, and only staying gone tells the two apart.
 ///
 /// This used to be a single unverified `click_at_cursor`. On Wayland the real
 /// cursor is the failure-prone part -- if it lands wrong there is nothing to
@@ -1031,15 +1039,15 @@ async fn click_control(
         ));
         return Ok(false);
     }
-    if util::click_submit_with(ctx, find_js).await? {
+    if util::click_submit_with_grace(ctx, find_js, BOUNCE_GRACE).await? {
         ctx.output(format!("clicked '{label}'"));
         return Ok(true);
     }
-    // `click_submit_with` also reports false when the control was gone before
-    // it got a press in -- the user advancing the step by hand in the gap, or
-    // the page moving on by itself. That is the state we wanted anyway. A
-    // torn-down JS context is the same story told harder: the page NAVIGATED,
-    // so the control is gone with it.
+    // `click_submit_with_grace` also reports false when the control was gone
+    // before it got a press in -- the user advancing the step by hand in the
+    // gap, or the page moving on by itself. That is the state we wanted
+    // anyway. A torn-down JS context is the same story told harder: the page
+    // NAVIGATED, so the control is gone with it.
     let gone = match ctx.eval(find_js).await {
         Ok(v) => v.get("x").is_none(),
         Err(e @ (GolemError::StoppedByUser | GolemError::Halted(_))) => return Err(e),
@@ -1109,7 +1117,148 @@ pub(super) async fn wait_for_coords(
     }
 }
 
-/// Escape a literal string for embedding in a JS regex source.
+/// How long a pressed Handshake control has to STAY gone before the press
+/// counts as landed. Its wizard buttons swap their label for a spinner and
+/// disable themselves while the block submit is in flight, so "gone" alone is
+/// also what a rejected press looks like for its first second; the round trip
+/// that decides which is which takes well under this.
+const BOUNCE_GRACE: Duration = Duration::from_millis(2500);
+
+/// Answer the wizard's task-type question with the option that corresponds to
+/// `arena_id`. The multimango slug is tried verbatim first -- when both sides
+/// agree, which is the common case, that is the whole story. When they don't,
+/// Handshake labels the same job with a different id group often enough that
+/// failing would stall the unattended loop, so the choice is made from what
+/// is actually on offer ([`pick_task_type_option`]). `false` when nothing on
+/// the page could be matched or the answer never registered; the mismatch is
+/// logged either way.
+async fn select_task_type(ctx: &mut WorkflowCtx, arena_id: &str) -> Result<bool> {
+    if answer_wizard_step(ctx, &regex_escape(arena_id)).await? {
+        ctx.output(format!("selected task type: {arena_id}"));
+        return Ok(true);
+    }
+    let options = wizard_option_texts(ctx).await?;
+    match pick_task_type_option(arena_id, &options) {
+        Some(pick) => {
+            if !pick.exact {
+                ctx.warn(format!(
+                    "the multimango task is '{arena_id}' but Handshake offers '{}' -- taking \
+                     it as the same task type",
+                    pick.text
+                ));
+            }
+            let selected = answer_wizard_step(ctx, &regex_escape(&pick.text)).await?;
+            if selected {
+                ctx.output(format!("selected task type: {}", pick.text));
+            }
+            Ok(selected)
+        }
+        None => {
+            ctx.warn(format!(
+                "no task-type option matches '{arena_id}'; offered: {}",
+                if options.is_empty() {
+                    "(none found)".to_string()
+                } else {
+                    options.join(", ")
+                }
+            ));
+            Ok(false)
+        }
+    }
+}
+
+/// Whether the wizard is (still) showing its instructions step: a pending
+/// Continue control with no task-type option anywhere on the page. This is
+/// the state a refused Continue leaves behind -- the button vanished into its
+/// spinner and came back -- and the one [`reload_task_page`] recovers from.
+async fn instructions_step_pending(ctx: &mut WorkflowCtx) -> bool {
+    let continue_shown = ctx
+        .eval(CONTINUE_STEP_JS)
+        .await
+        .map(|v| v.get("x").is_some())
+        .unwrap_or(false);
+    continue_shown && wizard_option_texts(ctx).await.map(|o| o.is_empty()).unwrap_or(true)
+}
+
+/// Reload the Handshake task run page and wait for it to come back up.
+///
+/// The wizard is server-side state: after the reload it renders at whichever
+/// step is genuinely pending, which is what makes this a recovery for a page
+/// whose own view of the wizard has stopped matching the server's (its Continue
+/// keeps being taken and refused). The task stays claimed and the timer keeps
+/// counting on the server, so nothing about the round is lost.
+///
+/// The app registers a `beforeunload` alert for some states; a capturing
+/// listener installed first swallows it, so the navigation can never hang on
+/// a "leave this page?" prompt nobody is there to answer. If the reload lands
+/// on the start-gate dialog (timer paused, "Open Multimango"), that is pressed
+/// too -- the wizard behind it is unreachable until it goes.
+async fn reload_task_page(ctx: &mut WorkflowCtx) -> Result<()> {
+    let url = ctx.browser.current_url().await?;
+    let _ = ctx
+        .eval(
+            "(function(){ window.addEventListener('beforeunload', function(e){ \
+             e.stopImmediatePropagation(); }, true); return true; })()",
+        )
+        .await;
+    ctx.output(format!("reloading {url}"));
+    ctx.browser.navigate(&url).await?;
+    util::focus_and_settle(ctx).await?;
+    // The page is hydrated once its timer widget renders; the wizard card
+    // follows a beat later.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+    loop {
+        ctx.guard().await?;
+        if let Ok(v) = ctx.eval(TIMER_READ_JS).await
+            && v.get("secs").is_some()
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            ctx.warn("the reloaded task page didn't render its timer within 25s -- carrying on");
+            break;
+        }
+        ctx.human_pause(400, 700).await?;
+    }
+    ctx.human_pause(1500, 2500).await?;
+    dismiss_start_gate(ctx).await?;
+    Ok(())
+}
+
+/// If Handshake's start-gate dialog ("Timer paused" with its own Open
+/// Multimango button) is up, press that button and close the multimango tab
+/// it spawns. A no-op when the dialog isn't showing -- the inline Multimango
+/// links on the normal page are prose, not a gate, and are left alone.
+async fn dismiss_start_gate(ctx: &mut WorkflowCtx) -> Result<()> {
+    let Ok(v) = ctx.eval(OPEN_MULTIMANGO_JS).await else {
+        return Ok(());
+    };
+    if v.get("kind").and_then(Value::as_str) != Some("button") {
+        return Ok(());
+    }
+    let (Some(x), Some(y)) = (
+        v.get("x").and_then(Value::as_f64),
+        v.get("y").and_then(Value::as_f64),
+    ) else {
+        return Ok(());
+    };
+    ctx.output("the start-gate dialog is up after the reload -- clicking its Open Multimango");
+    let before = ctx
+        .browser
+        .list_targets("multimango.com")
+        .await
+        .unwrap_or_default();
+    let (jx, jy) = util::jittered(ctx, x, y);
+    ctx.click_at_cdp(jx, jy).await?;
+    ctx.human_pause(900, 1600).await?;
+    if let Ok(now) = ctx.browser.list_targets("multimango.com").await {
+        for id in now.iter().filter(|id| !before.contains(id)) {
+            let _ = ctx.browser.close_target_by_id(id).await;
+        }
+    }
+    util::focus_and_settle(ctx).await
+}
+
 /// The task-type options the wizard is currently offering. An unreadable or
 /// unparseable result is reported as "none on offer" rather than failing the
 /// step: the caller's next move either way is to hand over to a human.
@@ -1190,6 +1339,7 @@ struct TaskTypePick {
     exact: bool,
 }
 
+/// Escape a literal string for embedding in a JS regex source.
 fn regex_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1536,6 +1686,10 @@ const WIZARD_OPTIONS_JS: &str = r#"(function(){
   return JSON.stringify(out);
 })()"#;
 
+// Text-less buttons are named by their aria-label in brackets, and a
+// disabled one is marked: a Handshake wizard button mid-submit is exactly
+// that -- label swapped for a spinner, disabled -- and reading "[Continue]
+// (disabled)" in the log is what tells that state apart from a missing button.
 const DUMP_BUTTONS_JS: &str = r#"(function(){
   var btns = document.querySelectorAll('button, [role="button"]');
   var out = [];
@@ -1543,7 +1697,13 @@ const DUMP_BUTTONS_JS: &str = r#"(function(){
     var r = btns[i].getBoundingClientRect();
     if (r.width < 1 || r.height < 1) continue;
     var t = (btns[i].textContent || '').trim().slice(0, 50);
-    if (t) out.push(t);
+    if (!t) {
+      var al = (btns[i].getAttribute('aria-label') || '').trim().slice(0, 50);
+      if (!al) continue;
+      t = '[' + al + ']';
+    }
+    if (btns[i].disabled || btns[i].getAttribute('aria-disabled') === 'true') t += ' (disabled)';
+    out.push(t);
   }
   return out.join(' | ');
 })()"#;

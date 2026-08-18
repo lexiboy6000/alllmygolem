@@ -1258,7 +1258,38 @@ pub async fn click_submit_if_enabled(ctx: &mut WorkflowCtx) -> Result<bool> {
 /// instead, and only re-click once the button has genuinely outlasted that
 /// wait -- clicking again early is the actual danger here, since it aims a
 /// second press at a page that already accepted the first.
+///
+/// No bounce grace (see [`click_submit_with_grace`]): the multimango Submit
+/// loads the next task on success, and that task's own Submit is disabled
+/// until it is rated, so a re-check could not mistake it for a bounce -- but
+/// it also gains nothing from one.
 pub async fn click_submit_with(ctx: &mut WorkflowCtx, find_js: &str) -> Result<bool> {
+    click_submit_with_grace(ctx, find_js, Duration::ZERO).await
+}
+
+/// [`click_submit_with`], plus a re-check `grace` after the control has gone:
+/// if it is back on the page by then, the press was TAKEN but REJECTED, and
+/// this counts it as a miss (so the escalation to CDP runs) instead of
+/// reporting success.
+///
+/// Why that matters: Handshake's wizard buttons swap their text for a
+/// spinner and disable themselves while the block submit is in flight, which
+/// to a text-matching finder is indistinguishable from "gone". When the
+/// server then rejects the submit (2026-08-17/18: the instructions step's
+/// Continue did exactly this in two rounds -- pressed, spinner, back a second
+/// later, and the wizard never advanced), the old check had already declared
+/// the press landed, and every later step ran against a wizard that was still
+/// on its first question. With the grace, that shows up here as "came back",
+/// gets logged along with whatever the page toasted, and is retried.
+///
+/// A control that goes away and stays away for `grace` is a landed press. A
+/// torn-down JS context during the grace is a navigation -- the control is
+/// gone with the page.
+pub async fn click_submit_with_grace(
+    ctx: &mut WorkflowCtx,
+    find_js: &str,
+    grace: Duration,
+) -> Result<bool> {
     const ATTEMPTS: usize = 3;
     /// How long the page gets to react before a click counts as missed.
     /// Deliberately generous: the two outcomes here are not symmetric. Waiting
@@ -1301,11 +1332,74 @@ pub async fn click_submit_with(ctx: &mut WorkflowCtx, find_js: &str) -> Result<b
         clicked = true;
         let patience = if attempt == ATTEMPTS { FINAL_SETTLE } else { SETTLE };
         if wait_until_gone(ctx, find_js, patience).await? {
-            return Ok(true);
+            if grace.is_zero() || stays_gone(ctx, find_js, grace).await? {
+                return Ok(true);
+            }
+            // Taken, then rejected: the page put the control straight back.
+            // Say what it complained about while the toast is still up.
+            let why = page_alerts(ctx)
+                .await
+                .map(|t| format!(" -- the page says: {t}"))
+                .unwrap_or_default();
+            ctx.warn(format!(
+                "the control went away and came straight back -- the page took the press \
+                 and rejected it{why}"
+            ));
         }
     }
     Ok(false)
 }
+
+/// After a control has been seen gone, whether it STAYS gone for `grace`.
+/// `false` means it re-appeared (with coordinates, i.e. visible and enabled
+/// again): a press that was taken and then rejected. A torn-down JS context
+/// is the page navigating away, which is "gone" in every sense.
+async fn stays_gone(ctx: &mut WorkflowCtx, find_js: &str, grace: Duration) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        ctx.human_pause(350, 650).await?;
+        match ctx.eval(find_js).await {
+            Ok(v) => {
+                if v.get("x").is_some() {
+                    return Ok(false);
+                }
+            }
+            Err(e @ (GolemError::StoppedByUser | GolemError::Halted(_))) => return Err(e),
+            Err(e) if is_context_destroyed(&e) => return Ok(true),
+            Err(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(true);
+        }
+    }
+}
+
+/// The text of whatever the page is currently toasting or announcing:
+/// sonner/radix toasts, `role=alert|status` regions and `aria-live` areas.
+/// `None` when there is nothing visible. Read this promptly after a rejected
+/// press -- toasts dismiss themselves within a few seconds -- and only for
+/// the log: it is the one place the page says WHY it refused something.
+pub async fn page_alerts(ctx: &WorkflowCtx) -> Option<String> {
+    let v = ctx.eval(PAGE_ALERTS_JS).await.ok()?;
+    let s = v.as_str()?.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+const PAGE_ALERTS_JS: &str = r#"(function(){
+  var sel = '[data-sonner-toast], [role="alert"], [role="status"], [aria-live="assertive"], [aria-live="polite"], [class*="toast" i]';
+  var els = document.querySelectorAll(sel);
+  var out = [], seen = {};
+  for (var i = 0; i < els.length && out.length < 6; i++) {
+    var e = els[i];
+    var r = e.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    var t = (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 300 || seen[t]) continue;
+    seen[t] = 1;
+    out.push(t);
+  }
+  return out.join(' | ');
+})()"#;
 
 /// Poll `find_js` until it stops finding its target, giving up after
 /// `patience`. `true` means it went away (the click registered).
