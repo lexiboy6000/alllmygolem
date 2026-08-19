@@ -1296,30 +1296,211 @@ pub async fn click_submit_if_enabled(ctx: &mut WorkflowCtx) -> Result<bool> {
     click_submit_with(ctx, FIND_SUBMIT_JS).await
 }
 
-/// Submit the multimango evaluation: press Save & Continue (or Submit), and
-/// if the page answers with its "All ratings are the same" confirmation
-/// instead of submitting, fill that in and confirm it. `true` means the
-/// evaluation is submitted; `false` means the submit control couldn't be
-/// pressed, or the dialog came up and couldn't be answered (each case is
-/// logged before returning). The one entry point both step 7 (standalone)
-/// and step 8 use, so a submit is never declared done with that dialog
-/// still up -- which is exactly how a uniform verdict used to strand a
-/// round: the press "landed" (the button went behind the modal), the
-/// workflow moved on to Handshake, and the evaluation was never sent.
+/// Submit the multimango evaluation: press Submit (or Save & Continue), wait
+/// for the page to settle, and if it answers with its "All ratings are the
+/// same" confirmation instead of submitting, fill that in and confirm it.
+/// `true` means the evaluation is submitted; `false` means the submit
+/// control couldn't be pressed, the page took the press and put the button
+/// back (rejected it) every time, the dialog came up and couldn't be
+/// answered, or the page was still mid-submit when patience ran out (each
+/// case is logged before returning). The one entry point both step 7
+/// (standalone) and step 8 use, so a submit is never declared done with
+/// that dialog still up -- which is exactly how a uniform verdict used to
+/// strand a round: the press "landed" (the button went behind the modal),
+/// the workflow moved on to Handshake, and the evaluation was never sent.
+///
+/// Why "wait for the page to settle" and not "check for the dialog once":
+/// on the arena layout (`MultimodalAgentArenaComparison`, 2026-08-19) the
+/// Submit button's handler first POSTs the evaluation sample to
+/// `/api/tasks/<id>/secure-datasets/submit-annotation` -- with the button
+/// swapped for a disabled "Submitting..." spinner the whole time, which to
+/// the submit finder is "gone" -- and only when THAT resolves calls the
+/// arena's vote handler, which is what opens the dialog (or sends the
+/// vote). A one-shot dialog check a second after "gone" ran ahead of a slow
+/// save and declared the evaluation submitted; the dialog then sat
+/// unanswered on a tab the run had walked away from (task154, 2026-08-19
+/// 07:53Z). And when that save fails, the page puts Submit back with "Could
+/// not save the evaluation sample. Please try again." -- a rejection, not
+/// a submission, which the old check also read as success.
 pub async fn submit_evaluation(ctx: &mut WorkflowCtx, answers: &ClaudeAnswers) -> Result<bool> {
-    // A dialog already up (an earlier attempt opened it) means the press
-    // has been made; pressing again would only hit the overlay.
-    if same_ratings_dialog(ctx).await?.is_none() {
+    /// Presses in total: the first, plus re-presses after the page hands
+    /// the button back (a rejected save or vote). Two retries is plenty for
+    /// a transient server error; anything past that is a halt for a hand.
+    const PRESSES: usize = 3;
+    for press in 1..=PRESSES {
+        // A dialog already up (an earlier attempt opened it, or a hand
+        // pressed Submit) means the press has been made; pressing again
+        // would only hit the overlay.
+        if same_ratings_dialog(ctx).await?.is_some() {
+            return answer_same_ratings_dialog(ctx, answers).await;
+        }
         if !click_submit_if_enabled(ctx).await? {
             return Ok(false);
         }
-        // The dialog, when it comes, is React state set in the click handler
-        // -- rendered by the time the wait-until-gone poll saw the button go
-        // -- but give it a beat anyway before deciding it isn't there.
-        ctx.human_pause(500, 1000).await?;
+        match wait_submit_settled(ctx).await? {
+            SubmitState::Dialog => return answer_same_ratings_dialog(ctx, answers).await,
+            SubmitState::Gone => return Ok(true),
+            SubmitState::Submitting { error } => {
+                let why = page_says(&error);
+                ctx.warn(format!(
+                    "the submit control has shown 'Submitting...' for {}s and the page hasn't \
+                     moved on{why} -- NOT declaring the evaluation submitted; check the page",
+                    SUBMIT_SETTLE.as_secs()
+                ));
+                return Ok(false);
+            }
+            SubmitState::Ready { label, error } => {
+                let why = page_says(&error);
+                if press == PRESSES {
+                    ctx.warn(format!(
+                        "the page took the submit press ('{label}') and put the button back \
+                         {PRESSES} times{why} -- giving up; submit by hand"
+                    ));
+                    return Ok(false);
+                }
+                ctx.warn(format!(
+                    "the page took the submit press ('{label}') and put the button back -- it \
+                     rejected the submission{why}; pressing again"
+                ));
+                // a person reads the error before trying again
+                ctx.human_pause(1500, 3000).await?;
+            }
+        }
     }
-    answer_same_ratings_dialog(ctx, answers).await
+    Ok(false)
 }
+
+/// `" -- the page says: ..."` for a log line, or nothing when the page
+/// showed no error text.
+fn page_says(error: &str) -> String {
+    let error = error.trim();
+    if error.is_empty() {
+        String::new()
+    } else {
+        format!(" -- the page says: {error}")
+    }
+}
+
+/// How long a pressed submit gets to resolve -- the sample save, the vote,
+/// or the confirmation dialog. Generous on purpose: the save carries the
+/// whole evaluation and has taken over a second on an ordinary night, and
+/// declaring victory early is the failure this guards against.
+const SUBMIT_SETTLE: Duration = Duration::from_secs(60);
+
+/// Where a multimango submit stands, as [`SUBMIT_STATE_JS`] reads the page.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum SubmitState {
+    /// The "All ratings are the same" confirmation is up (its Confirm &
+    /// Submit button is visible).
+    Dialog,
+    /// The submit control is a "Submitting..." spinner: the sample save or
+    /// the vote is in flight and the page hasn't decided yet.
+    Submitting {
+        #[serde(default)]
+        error: String,
+    },
+    /// An enabled submit control is on the page -- after a press, that
+    /// means the page handed it back (rejected the submission). `error` is
+    /// whatever it is showing in red.
+    Ready {
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        error: String,
+    },
+    /// No enabled or in-flight submit control at all: the page moved on
+    /// (next task loading, or loaded with its submit disabled until rated).
+    Gone,
+}
+
+/// Poll [`SUBMIT_STATE_JS`] after a submit press until the page settles:
+/// the dialog is up, the page has moved on, or it has handed the button
+/// back. `Submitting` is returned only when it is STILL in flight after
+/// [`SUBMIT_SETTLE`]. `Ready` has to hold for two consecutive reads, since
+/// the arena re-enables Submit for one render between the sample save
+/// resolving and the vote handler disabling it again. A torn-down JS
+/// context is a navigation -- the page has moved on.
+async fn wait_submit_settled(ctx: &mut WorkflowCtx) -> Result<SubmitState> {
+    let deadline = tokio::time::Instant::now() + SUBMIT_SETTLE;
+    let mut last_ready = false;
+    let mut last_error = String::new();
+    loop {
+        ctx.human_pause(400, 750).await?;
+        match ctx.eval(SUBMIT_STATE_JS).await {
+            Ok(v) => {
+                let state = v
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<SubmitState>(s).ok());
+                match state {
+                    Some(SubmitState::Dialog) => return Ok(SubmitState::Dialog),
+                    Some(SubmitState::Gone) => return Ok(SubmitState::Gone),
+                    Some(r @ SubmitState::Ready { .. }) => {
+                        if last_ready {
+                            return Ok(r);
+                        }
+                        last_ready = true;
+                    }
+                    Some(SubmitState::Submitting { error }) => {
+                        last_ready = false;
+                        last_error = error;
+                    }
+                    // unreadable: a CDP wobble or a mid-render page; ask again
+                    None => last_ready = false,
+                }
+            }
+            Err(e @ (GolemError::StoppedByUser | GolemError::Halted(_))) => return Err(e),
+            Err(e) if is_context_destroyed(&e) => return Ok(SubmitState::Gone),
+            Err(_) => {
+                // a CDP wobble mid-poll; the next iteration re-asks, and the
+                // deadline below still bounds the whole wait
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(SubmitState::Submitting { error: last_error });
+        }
+    }
+}
+
+/// The page's submit state as a JSON string -- see [`SubmitState`]. The
+/// submit control is any visible button reading "Save & Continue" or
+/// containing "submit" (bar bug/report/issue buttons; the dialog's own
+/// "Confirm & Submit" is checked first and wins). "Submitting..." text or a
+/// spinner inside it is in-flight; an enabled one is ready; none of either
+/// is gone. `error` is the visible red text (`p.text-destructive`, which is
+/// how both the sample-save and the vote errors render) plus any toast.
+const SUBMIT_STATE_JS: &str = r#"(function(){
+  function vis(e){ var r = e.getBoundingClientRect(); return r.width >= 1 && r.height >= 1; }
+  function txt(e){ return (e.textContent || '').replace(/\s+/g, ' ').trim(); }
+  var btns = document.querySelectorAll('button');
+  var i, t;
+  for (i = 0; i < btns.length; i++) {
+    if (/^confirm\s*(&|and)\s*submit$/i.test(txt(btns[i])) && vis(btns[i])) {
+      return JSON.stringify({ state: 'dialog' });
+    }
+  }
+  var error = [];
+  var errs = document.querySelectorAll('p.text-destructive, [role="alert"], [data-sonner-toast]');
+  for (i = 0; i < errs.length && error.length < 4; i++) {
+    if (!vis(errs[i])) continue;
+    t = txt(errs[i]);
+    if (t && t.length <= 300 && error.indexOf(t) === -1) error.push(t);
+  }
+  var ready = null, inflight = false;
+  for (i = 0; i < btns.length; i++) {
+    var b = btns[i];
+    t = txt(b);
+    var isSubmit = /^save\s*(&|and)\s*continue$/i.test(t)
+      || (/submit/i.test(t) && !/bug|report|issue/i.test(t));
+    if (!isSubmit || !vis(b)) continue;
+    if (/submitting/i.test(t) || b.querySelector('.animate-spin')) { inflight = true; continue; }
+    if (b.disabled || b.getAttribute('aria-disabled') === 'true') continue;
+    ready = t;
+  }
+  if (inflight) return JSON.stringify({ state: 'submitting', error: error.join(' | ') });
+  if (ready !== null) return JSON.stringify({ state: 'ready', label: ready, error: error.join(' | ') });
+  return JSON.stringify({ state: 'gone', error: error.join(' | ') });
+})()"#;
 
 /// The "All ratings are the same" confirmation as it currently stands, or
 /// `None` when it isn't up (see `SAME_RATINGS_DIALOG_BODY`). A torn-down JS
@@ -4293,6 +4474,38 @@ mod tests {
 
     fn answers(json: &str) -> ClaudeAnswers {
         serde_json::from_str(json).expect("test JSON parses")
+    }
+
+    /// The four shapes `SUBMIT_STATE_JS` emits (verified against the saved
+    /// arena page and mocks of the other states in headless Chromium,
+    /// 2026-08-19) parse into the matching `SubmitState`, including the
+    /// tag-only ones -- an internally-tagged enum that mixes unit and
+    /// struct variants is easy to break from either side.
+    #[test]
+    fn submit_state_parses_every_shape_the_probe_emits() {
+        let parse = |s: &str| serde_json::from_str::<SubmitState>(s).expect("probe JSON parses");
+        assert_eq!(parse(r#"{"state":"dialog"}"#), SubmitState::Dialog);
+        assert_eq!(parse(r#"{"state":"gone","error":""}"#), SubmitState::Gone);
+        assert_eq!(
+            parse(r#"{"state":"submitting","error":""}"#),
+            SubmitState::Submitting {
+                error: String::new()
+            }
+        );
+        assert_eq!(
+            parse(
+                r#"{"state":"ready","label":"Submit","error":"Could not save the evaluation sample. Please try again."}"#
+            ),
+            SubmitState::Ready {
+                label: "Submit".into(),
+                error: "Could not save the evaluation sample. Please try again.".into(),
+            }
+        );
+        assert_eq!(
+            page_says("Could not save the evaluation sample."),
+            " -- the page says: Could not save the evaluation sample."
+        );
+        assert_eq!(page_says("  "), "");
     }
 
     /// The "All ratings are the same" dialog gets claude's dedicated reason

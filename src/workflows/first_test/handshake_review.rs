@@ -356,11 +356,13 @@ impl Workflow for HandshakeReviewAndSubmit {
         if !util::submit_evaluation(ctx, &answers).await? {
             return Err(util::halt_now(
                 ctx,
-                "the multimango evaluation didn't go through: the submit control (\"Save & \
-                 Continue\" inside the evaluation-criteria panel on the newest layout, or \
-                 Submit next to Skip on older ones) wasn't found or never enabled, or the \
-                 page's confirmation dialog couldn't be answered (see the log line above) -- \
-                 submit by hand, then continue on the Handshake side manually.",
+                "the multimango evaluation didn't go through: the submit control (Submit in \
+                 the rating panel, \"Save & Continue\" inside the evaluation-criteria panel, \
+                 or Submit next to Skip on older layouts) wasn't found or never enabled, the \
+                 page kept handing it back (rejected the submission), it was still \
+                 'Submitting...' when patience ran out, or the page's confirmation dialog \
+                 couldn't be answered (see the log line above) -- submit by hand, then \
+                 continue on the Handshake side manually.",
             )
             .await);
         }
