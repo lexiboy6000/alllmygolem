@@ -80,14 +80,18 @@ impl Workflow for AnswerAndApplyCriteria {
                 ))
                 .await);
         }
-        // Optionally vary the open-feedback wording through the local
-        // rewriter (llama.cpp + Qwen3) before anything reads or types it:
-        // rewritten sentence by sentence, mechanically guarded, checked by
-        // the same local model, and persisted back into claude_answers so
-        // every later read sees one consistent text. Skips itself cleanly
-        // when no rewriter is running; never fails the round.
-        if !feedback_questions.is_empty() {
-            ctx.step("vary the open feedback wording").await?;
+        // Optionally vary the wording of everything claude wrote to be TYPED
+        // into the page -- the open-feedback answer(s) and the
+        // same_verdict_reason for the "All ratings are the same" dialog --
+        // through the local rewriter (llama.cpp + Qwen3) before anything
+        // reads or types it: rewritten sentence by sentence, mechanically
+        // guarded, checked by the same local model, and persisted back into
+        // claude_answers so every later read sees one consistent text. Skips
+        // itself cleanly when no rewriter is running; never fails the round.
+        // The reason only exists when the page has comparison questions, so
+        // either kind of question warrants the pass.
+        if !feedback_questions.is_empty() || !comparison_questions.is_empty() {
+            ctx.step("vary the written answers' wording").await?;
             super::vary_feedback::vary_open_feedback(ctx, &task_dir, &feedback_questions)
                 .await?;
         }

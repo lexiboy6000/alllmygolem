@@ -125,7 +125,9 @@ pub struct ClaudeAnswers {
     /// [`answer_same_ratings_dialog`]). Asked for whenever the page shows a
     /// comparison rubric; older files and terse runs may lack it, in which
     /// case [`ClaudeAnswers::same_verdict_justification`] falls back to the
-    /// notes claude did write.
+    /// notes claude did write. Like the open feedback, it is varied through
+    /// the local rewriter in step 7 (see `vary_feedback`) since it too gets
+    /// typed into the page.
     #[serde(default)]
     pub same_verdict_reason: Option<String>,
 }

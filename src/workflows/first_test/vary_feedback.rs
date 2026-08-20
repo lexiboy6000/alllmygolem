@@ -1,8 +1,11 @@
-//! Optional variation pass over claude's open-feedback answers, run by
-//! workflow 7 between the judging and the typing: a LOCAL model (Qwen3 via a
-//! llama.cpp server) rewrites each sentence with slight-but-noticeable
-//! variation, so the typed feedback doesn't carry one fixed authorial voice
-//! across every submission.
+//! Optional variation pass over claude's written answers, run by workflow 7
+//! between the judging and the typing: a LOCAL model (Qwen3 via a llama.cpp
+//! server) rewrites each sentence with slight-but-noticeable variation, so
+//! the typed text doesn't carry one fixed authorial voice across every
+//! submission. Covers the `open_feedback` paragraphs AND the
+//! `same_verdict_reason` note -- both get typed into the page for real (the
+//! feedback boxes always, the reason whenever the "All ratings are the same"
+//! confirmation pops on submit), so both need the same treatment.
 //!
 //! Fidelity is the whole design problem: feedback must keep every number,
 //! filename, quoted string, attribution and verdict exactly (the platform's
@@ -71,10 +74,21 @@ Style and wording differences are fine; identical sentences are fine. Then on th
 output only a JSON object: {\"ok\": true} if all checks pass, else {\"ok\": false, \"issue\": \
 \"<one short sentence>\"}";
 
-/// Rewrite the `open_feedback` paragraphs inside `task_dir/claude_answers`
-/// with slight variation, checked as described in the module docs, and write
-/// the file back. `questions` supplies each paragraph's minimum length (the
-/// page's own gate) so a shrunken rewrite can never disable the submit.
+/// The `same_verdict_reason` floor a varied rewrite must stay above. The
+/// dialog it answers states its real minimum only when it pops at submit
+/// time (see `SameRatingsDialog::min`), so it can't be read here; the
+/// judging prompt asks claude for 60-300 characters for exactly that
+/// reason, and the same 60 serves as the revert threshold -- a rewrite
+/// below it risks `same_verdict_justification` skipping the reason for a
+/// fallback that was never varied.
+const SAME_VERDICT_FLOOR: usize = 60;
+
+/// Rewrite the written answers inside `task_dir/claude_answers` -- the
+/// `open_feedback` paragraphs and the `same_verdict_reason` note -- with
+/// slight variation, checked as described in the module docs, and write the
+/// file back. `questions` supplies each feedback paragraph's minimum length
+/// (the page's own gate) so a shrunken rewrite can never disable the submit;
+/// the reason uses [`SAME_VERDICT_FLOOR`].
 pub async fn vary_open_feedback(
     ctx: &mut WorkflowCtx,
     task_dir: &std::path::Path,
@@ -95,7 +109,12 @@ pub async fn vary_open_feedback(
             .collect(),
         _ => Vec::new(),
     };
-    if paragraphs.is_empty() {
+    let reason: Option<String> = value
+        .get("same_verdict_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.trim().is_empty());
+    if paragraphs.is_empty() && reason.is_none() {
         return Ok(());
     }
 
@@ -121,7 +140,7 @@ pub async fn vary_open_feedback(
     let mut any_changed = false;
     for (pi, par) in paragraphs.iter().enumerate() {
         let min_chars = questions.get(pi).map(|q| q.min).unwrap_or(0).max(1) as usize;
-        match vary_paragraph(ctx, &url, par).await? {
+        match vary_paragraph(ctx, &url, "feedback", par).await? {
             Some(varied) => {
                 let final_len = varied.trim().chars().count();
                 // The page gates the submit on this length; claude was asked
@@ -143,15 +162,44 @@ pub async fn vary_open_feedback(
         }
     }
 
+    // The same-verdict reason goes through the identical pipeline. Its
+    // revert floor is fixed (see SAME_VERDICT_FLOOR): the dialog that
+    // consumes it states its minimum only when it pops at submit time.
+    let mut out_reason: Option<String> = None;
+    if let Some(orig) = &reason {
+        match vary_paragraph(ctx, &url, "same-verdict reason", orig).await? {
+            Some(varied) => {
+                let final_len = varied.trim().chars().count();
+                if final_len < SAME_VERDICT_FLOOR
+                    || final_len * 10 < orig.trim().chars().count() * 7
+                {
+                    ctx.warn(format!(
+                        "same-verdict reason: the varied text came out too short \
+                         ({final_len} chars) -- keeping claude's wording"
+                    ));
+                } else if varied != *orig {
+                    any_changed = true;
+                    out_reason = Some(varied);
+                }
+            }
+            None => {}
+        }
+    }
+
     if !any_changed {
-        ctx.output("feedback wording unchanged -- nothing usable came back from the rewriter");
+        ctx.output("wording unchanged -- nothing usable came back from the rewriter");
         return Ok(());
     }
     if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "open_feedback".to_string(),
-            Value::Array(out_paragraphs.into_iter().map(Value::String).collect()),
-        );
+        if !paragraphs.is_empty() {
+            obj.insert(
+                "open_feedback".to_string(),
+                Value::Array(out_paragraphs.into_iter().map(Value::String).collect()),
+            );
+        }
+        if let Some(r) = out_reason {
+            obj.insert("same_verdict_reason".to_string(), Value::String(r));
+        }
     }
     let pretty = serde_json::to_string_pretty(&value)
         .map_err(|e| GolemError::Other(format!("re-serialize claude_answers: {e}")))?;
@@ -162,9 +210,11 @@ pub async fn vary_open_feedback(
 
 /// One paragraph through the split -> rewrite -> guard -> check -> fix
 /// pipeline. `None` means "leave the original alone" (rewriter failure).
+/// `label` names the paragraph in the summary log line.
 async fn vary_paragraph(
     ctx: &mut WorkflowCtx,
     url: &str,
+    label: &str,
     par: &str,
 ) -> Result<Option<String>> {
     let sents = split_sentences(par);
@@ -224,7 +274,7 @@ async fn vary_paragraph(
     }
     let kept = guarded + reverted;
     ctx.output(format!(
-        "feedback: varied {varied} of {} sentence(s){}{}",
+        "{label}: varied {varied} of {} sentence(s){}{}",
         sents.len(),
         if fixed > 0 {
             format!(" ({fixed} repaired after the checker flagged it)")
