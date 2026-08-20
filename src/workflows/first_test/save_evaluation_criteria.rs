@@ -112,7 +112,8 @@ impl Workflow for SaveEvaluationCriteria {
         // The Good/Bad list is only one of the shapes the rating UI takes.
         // Record the others too, so the task folder reflects everything the
         // page actually asked: the multi-question A/B/Tie rubric (which
-        // REPLACES the criteria list on that layout) and any required open
+        // replaces the criteria list on some layouts and accompanies it on
+        // others) and any required open
         // feedback questions. Step 7 re-probes the live page for these same
         // questions before the judging run; these files are the durable
         // record, written with the same formatting the prompt uses.

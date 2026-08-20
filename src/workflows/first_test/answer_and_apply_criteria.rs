@@ -47,11 +47,12 @@ impl Workflow for AnswerAndApplyCriteria {
 
         ctx.step("ask Claude to judge each criterion").await?;
         // Some tasks also ask required open feedback question(s) -- freeform
-        // textareas that gate the submit -- and some replace the Good/Bad
-        // criteria with a multi-question comparison rubric (per-question
-        // Response A/B/Tie picks). Read both off the live page first so the
-        // judging prompt asks for everything the page requires; anything
-        // unanswered keeps the submit disabled and step 8 cannot finish.
+        // textareas that gate the submit -- and some show a multi-question
+        // comparison rubric (per-question Response A/B/Tie picks) INSTEAD of
+        // or ALONGSIDE the Good/Bad criteria. Read both off the live page
+        // first so the judging prompt asks for everything the page requires;
+        // anything unanswered keeps the submit disabled and step 8 cannot
+        // finish.
         let feedback_questions = util::open_feedback_questions(ctx).await?;
         if !feedback_questions.is_empty() {
             ctx.output(format!(

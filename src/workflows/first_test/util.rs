@@ -243,6 +243,59 @@ impl ComparisonQuestion {
     }
 }
 
+/// The numbers of the criteria step 6 saved for this task -- the exact set a
+/// `claude_answers` "criteria" array must cover. Read from the same questions
+/// file the judging prompt tells claude to read, so the validator and the
+/// prompt can never disagree about what the page asked. Empty when the file
+/// is missing or empty (a task with no Good/Bad list).
+fn saved_criteria_numbers(task_dir: &std::path::Path) -> Vec<u32> {
+    let path = task_dir
+        .join("task_data")
+        .join("evaluation_criteria")
+        .join("questions");
+    std::fs::read_to_string(&path)
+        .map(|t| criteria_numbers_in(&t))
+        .unwrap_or_default()
+}
+
+/// The leading "N." numbers in a saved questions file, one per line; lines
+/// that don't start with one (wrapped continuations, blanks) don't count.
+fn criteria_numbers_in(text: &str) -> Vec<u32> {
+    text.lines()
+        .filter_map(|l| {
+            l.trim_start()
+                .split('.')
+                .next()
+                .and_then(|n| n.parse::<u32>().ok())
+        })
+        .collect()
+}
+
+/// Whether `answers` carries a Good/Bad judgment for every numbered criterion
+/// step 6 saved: the same numbers (no more, no fewer, any order -- the clicks
+/// look rows up by number), each rating both responses "Good" or "Bad"
+/// (spelling normalized by [`read_claude_answers`]). Part of the success test
+/// for a claude run: the criteria grid gates the submit exactly like the
+/// other controls ("Rate all rubrics to submit"), so a file that skips it
+/// cannot finish the round. Not hypothetical -- when the page first showed a
+/// comparison rubric ALONGSIDE the criteria list (2026-08-19), the
+/// then-"INSTEAD of a Good/Bad criteria list" comparison addendum talked
+/// claude into writing "criteria": [] and nothing caught it: the round
+/// applied everything else, left the grid at 0/26, and the submit never
+/// enabled.
+fn criteria_answers_ok(answers: &ClaudeAnswers, expected: &[u32]) -> bool {
+    let mut got: Vec<u32> = answers.criteria.iter().map(|c| c.number).collect();
+    got.sort_unstable();
+    let mut want = expected.to_vec();
+    want.sort_unstable();
+    got == want
+        && answers
+            .criteria
+            .iter()
+            .all(|c| matches!(c.response_a.as_str(), "Good" | "Bad")
+                && matches!(c.response_b.as_str(), "Good" | "Bad"))
+}
+
 /// Whether `answers` carries a valid pick for every comparison question on
 /// the page: one per question in order, each choosing one of that question's
 /// actual options. Part of the success test for a claude run -- like the
@@ -345,7 +398,10 @@ fn feedback_answers_ok(answers: &ClaudeAnswers, questions: &[FeedbackQuestion]) 
 /// as failed -- an unanswered required feedback box keeps the submit disabled,
 /// so a file without those answers cannot finish the round.
 /// `comparison_questions` work the same way for the multi-question A/B/Tie
-/// rubric (see [`comparison_questions`]).
+/// rubric (see [`comparison_questions`]) -- which can appear INSTEAD of the
+/// Good/Bad criteria list or (since 2026-08-19) ALONGSIDE it, so the criteria
+/// answers are validated too: a file must cover every criterion step 6 saved,
+/// or the run counts as failed and retries with the reason.
 pub async fn ask_claude_for_answers(
     ctx: &WorkflowCtx,
     task_dir: &std::path::Path,
@@ -365,9 +421,16 @@ pub async fn ask_claude_for_answers(
     let mut model = ctx.settings.solve_model.clone();
     let fallback = ctx.settings.solve_model_fallback.clone();
     let effort = ctx.settings.solve_effort.clone();
+    // What the questions file actually lists decides both how the comparison
+    // addendum is worded (alongside vs instead of the criteria) and what a
+    // successful claude_answers must contain.
+    let expected_criteria = saved_criteria_numbers(task_dir);
     let mut prompt: String = ANSWER_CRITERIA_PROMPT.to_string();
     if !comparison_questions.is_empty() {
-        prompt.push_str(&comparison_prompt_addendum(comparison_questions));
+        prompt.push_str(&comparison_prompt_addendum(
+            comparison_questions,
+            !expected_criteria.is_empty(),
+        ));
     }
     if !feedback_questions.is_empty() {
         prompt.push_str(&feedback_prompt_addendum(feedback_questions));
@@ -428,7 +491,8 @@ pub async fn ask_claude_for_answers(
                 // complete claude_answers (exit non-zero, output fine), and can
                 // exit zero having written nothing usable.
                 match read_claude_answers(&answers_path) {
-                    Ok(a) if feedback_answers_ok(&a, feedback_questions)
+                    Ok(a) if criteria_answers_ok(&a, &expected_criteria)
+                        && feedback_answers_ok(&a, feedback_questions)
                         && comparison_answers_ok(&a, comparison_questions) =>
                     {
                         if attempt > 1 {
@@ -436,14 +500,25 @@ pub async fn ask_claude_for_answers(
                         }
                         return Ok(());
                     }
-                    // Parsed, but a required answer is missing: an
-                    // open-feedback answer absent or under the page's stated
-                    // minimum, or a comparison pick absent or naming an
-                    // option the row doesn't offer. Submitting is impossible
-                    // with a required control unfilled, so this run failed
-                    // even though the rest of the file may be fine.
+                    // Parsed, but a required answer is missing: a criterion
+                    // unjudged (or not judged Good/Bad), an open-feedback
+                    // answer absent or under the page's stated minimum, or a
+                    // comparison pick absent or naming an option the row
+                    // doesn't offer. Submitting is impossible with a required
+                    // control unfilled, so this run failed even though the
+                    // rest of the file may be fine.
                     Ok(a) => {
-                        last_err = if !comparison_answers_ok(&a, comparison_questions) {
+                        last_err = if !criteria_answers_ok(&a, &expected_criteria) {
+                            format!(
+                                "claude_answers' \"criteria\" array doesn't cover the {} \
+                                 numbered criteria in task_data/evaluation_criteria/questions \
+                                 with a Good/Bad rating per response (got {} entr(y/ies)) -- \
+                                 the page requires the criteria grid even when it also shows \
+                                 comparison questions",
+                                expected_criteria.len(),
+                                a.criteria.len()
+                            )
+                        } else if !comparison_answers_ok(&a, comparison_questions) {
                             format!(
                                 "claude_answers lacks a valid \"comparisons\" pick for each \
                                  of the {} comparison question(s) on the page",
@@ -510,15 +585,39 @@ pub async fn ask_claude_for_answers(
 }
 
 /// Read + parse `claude_answers` written by `ask_claude_for_answers`.
+///
+/// Criterion ratings are normalized to the page's own button spelling
+/// ("Good"/"Bad"): the click JS matches button text exactly, so a file
+/// saying "good" would locate nothing. Only that one casing slip is fixed;
+/// any other value is left as written for `criteria_answers_ok` to reject
+/// with a message, rather than guessed at.
 pub fn read_claude_answers(path: &std::path::Path) -> Result<ClaudeAnswers> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| GolemError::Io(format!("read {}: {e}", path.display())))?;
-    serde_json::from_str(&text).map_err(|e| {
+    let mut answers: ClaudeAnswers = serde_json::from_str(&text).map_err(|e| {
         GolemError::Other(format!(
             "parse {}: {e} (claude may not have written the exact JSON shape asked for)",
             path.display()
         ))
-    })
+    })?;
+    for c in &mut answers.criteria {
+        canon_good_bad(&mut c.response_a);
+        canon_good_bad(&mut c.response_b);
+    }
+    Ok(answers)
+}
+
+/// See [`read_claude_answers`]: "  good " -> "Good", "BAD" -> "Bad",
+/// anything else only trimmed.
+fn canon_good_bad(s: &mut String) {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("good") {
+        *s = "Good".to_string();
+    } else if t.eq_ignore_ascii_case("bad") {
+        *s = "Bad".to_string();
+    } else if t.len() != s.len() {
+        *s = t.to_string();
+    }
 }
 
 /// Apply a full set of Claude answers onto the multimango page: bring the
@@ -549,9 +648,10 @@ pub async fn apply_answers(
     ensure_criteria_panel_open(ctx).await?;
     // Some tasks also ask open feedback question(s) -- required freeform
     // textareas that gate the submit exactly like the buttons -- and some
-    // show a multi-question comparison rubric instead of Good/Bad criteria.
-    // Both are found up front so the pacer can give each its own budget
-    // slot, then worked in page order: comparisons, overall, feedback.
+    // show a multi-question comparison rubric instead of (or alongside) the
+    // Good/Bad criteria. Both are found up front so the pacer can give each
+    // its own budget slot, then worked in page order: criteria, comparisons,
+    // overall, feedback.
     let feedback = feedback_fields(ctx).await?;
     let comparisons = comparison_rows(ctx).await?;
     let mut applied = 0usize;
@@ -2071,13 +2171,27 @@ pub fn feedback_question_lines(questions: &[FeedbackQuestion]) -> String {
 /// multi-question comparison rubric: each question with its judging rules and
 /// its OWN option set, answered by picking one option verbatim. The overall
 /// pick stays separate -- these are the per-dimension questions above it.
-fn comparison_prompt_addendum(questions: &[ComparisonQuestion]) -> String {
-    let mut s = String::from(
+///
+/// `has_criteria` says whether the page ALSO shows the numbered Good/Bad
+/// criteria list (both together first seen 2026-08-19). The distinction is
+/// load-bearing: the addendum used to always open with "INSTEAD of a Good/Bad
+/// criteria list", and on a page that had both, claude took that at its word
+/// and wrote "criteria": [] -- the grid stayed 0/26 and the submit never
+/// enabled.
+fn comparison_prompt_addendum(questions: &[ComparisonQuestion], has_criteria: bool) -> String {
+    let mut s = String::from(if has_criteria {
+        "\n\nIN ADDITION to the Good/Bad criteria list (which is still required: judge \
+         every numbered criterion and fill the \"criteria\" array exactly as instructed \
+         above), this task's evaluation page ALSO asks you to pick a winner for each of \
+         the following comparison questions. The description after each question is that \
+         question's judging rule -- follow it exactly (including any instruction about \
+         when to mark Tie):\n"
+    } else {
         "\n\nINSTEAD of a Good/Bad criteria list, this task's evaluation page asks you to \
          pick a winner for each of the following comparison questions. The description \
          after each question is that question's judging rule -- follow it exactly \
-         (including any instruction about when to mark Tie):\n",
-    );
+         (including any instruction about when to mark Tie):\n"
+    });
     s.push_str(&comparison_question_lines(questions));
     s.push_str(
         "Add a top-level \"comparisons\" field to the claude_answers JSON: an array with \
@@ -4474,6 +4588,90 @@ mod tests {
 
     fn answers(json: &str) -> ClaudeAnswers {
         serde_json::from_str(json).expect("test JSON parses")
+    }
+
+    /// The judging run only counts as successful when the "criteria" array
+    /// covers exactly the numbered criteria step 6 saved. The regression this
+    /// guards is the 2026-08-19 both-rubrics layout: the then-"INSTEAD of a
+    /// Good/Bad criteria list" comparison addendum talked claude into writing
+    /// "criteria": [] on a page that showed 13 criteria, nothing caught it,
+    /// and the round stalled on a submit that read "Rate all rubrics".
+    #[test]
+    fn criteria_answers_must_cover_every_saved_criterion() {
+        let a = answers(
+            r#"{"criteria":[{"number":1,"response_a":"Good","response_b":"Bad"},
+                            {"number":2,"response_a":"Bad","response_b":"Bad"}],
+                "overall":{"winner":"Response A"}}"#,
+        );
+        assert!(criteria_answers_ok(&a, &[1, 2]));
+        // order-insensitive: the clicks look rows up by number
+        assert!(criteria_answers_ok(&a, &[2, 1]));
+        // one criterion unjudged
+        assert!(!criteria_answers_ok(&a, &[1, 2, 3]));
+        // a judgment for a criterion the page doesn't have
+        assert!(!criteria_answers_ok(&a, &[1]));
+        let empty = answers(r#"{"criteria":[],"overall":{"winner":"Tie"}}"#);
+        // a task with no Good/Bad list at all
+        assert!(criteria_answers_ok(&empty, &[]));
+        // THE regression: criteria saved, none judged
+        assert!(!criteria_answers_ok(&empty, &[1]));
+        // a rating the buttons don't offer
+        let sloppy = answers(
+            r#"{"criteria":[{"number":1,"response_a":"Excellent","response_b":"Bad"}],
+                "overall":{"winner":"Tie"}}"#,
+        );
+        assert!(!criteria_answers_ok(&sloppy, &[1]));
+    }
+
+    /// "good"/"BAD" get the page's button spelling (the click JS matches text
+    /// exactly); anything else is only trimmed, so the validator rejects it
+    /// with a message instead of a guess getting clicked in.
+    #[test]
+    fn canon_good_bad_fixes_only_the_casing_slip() {
+        let canon = |s: &str| {
+            let mut s = s.to_string();
+            canon_good_bad(&mut s);
+            s
+        };
+        assert_eq!(canon("  good "), "Good");
+        assert_eq!(canon("BAD"), "Bad");
+        assert_eq!(canon("Good"), "Good");
+        assert_eq!(canon(" Excellent "), "Excellent");
+    }
+
+    /// The questions file's numbered lines are the validator's ground truth;
+    /// wrapped continuation lines and blanks must not count as criteria.
+    #[test]
+    fn criteria_numbers_come_from_numbered_lines_only() {
+        assert_eq!(
+            criteria_numbers_in(
+                "1. The reply is written in English.\n\
+                 2. The response drafts the reply as a complete email,\n\
+                    with a salutation addressed to the university.\n\
+                 \n\
+                 3. The drafted email includes a subject line.\n"
+            ),
+            vec![1, 2, 3]
+        );
+        assert!(criteria_numbers_in("").is_empty());
+    }
+
+    /// The comparison addendum's opening must match what the page actually
+    /// shows: "INSTEAD of" on a comparison-only rubric, and an explicit
+    /// the-criteria-are-still-required opener when the page has both.
+    #[test]
+    fn comparison_addendum_wording_tracks_whether_criteria_exist() {
+        let q: Vec<ComparisonQuestion> = serde_json::from_str(
+            r#"[{"name":"Overall preference","question":"Which side satisfies more?",
+                 "options":["Response A","Response B","Tie"]}]"#,
+        )
+        .expect("test question parses");
+        let both = comparison_prompt_addendum(&q, true);
+        assert!(both.contains("IN ADDITION to the Good/Bad criteria list"));
+        assert!(!both.contains("INSTEAD of"));
+        let only = comparison_prompt_addendum(&q, false);
+        assert!(only.contains("INSTEAD of a Good/Bad criteria list"));
+        assert!(!only.contains("IN ADDITION"));
     }
 
     /// The four shapes `SUBMIT_STATE_JS` emits (verified against the saved
