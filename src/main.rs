@@ -36,6 +36,7 @@ mod workflows;
 use eframe::egui;
 
 use crate::backend::{BrowserBackend, MouseButton};
+use crate::checkpoint::RunState;
 use crate::cdp::{CdpBrowser, ConnectionConfig};
 use crate::engine::Engine;
 use crate::geometry::Point;
@@ -164,13 +165,40 @@ fn main() -> eframe::Result<()> {
     // on a remote desktop is usable the moment its window appears instead of
     // sitting there disconnected. The channel is unbounded, so this queues
     // until the supervisor is ready to read it.
-    if std::env::args().any(|a| a == "--connect")
-        || std::env::var("GOLEM_AUTO_CONNECT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    {
+    let auto_connect = std::env::args().any(|a| a == "--connect") || env_flag("GOLEM_AUTO_CONNECT");
+    // `--resume` / GOLEM_AUTO_RESUME=1: pick the latest still-running
+    // checkpoint back up without anyone pressing the banner's Resume button,
+    // so a Golem restarted after a fix mid-round (or after a crash) carries on
+    // unattended. Implies the connect above -- a resume with no browser is
+    // refused -- and skips the checkpointed workflow's prerequisites outright:
+    // they had finished before the checkpoint could exist, and re-running them
+    // on a half-done round is exactly what a restart must not do.
+    let auto_resume = std::env::args().any(|a| a == "--resume") || env_flag("GOLEM_AUTO_RESUME");
+    if auto_connect || auto_resume {
         tracing::info!("auto-connect requested; attaching to the browser at startup");
         let _ = cmd_tx.send(crate::messages::UiCommand::Connect);
+    }
+    if auto_resume {
+        // The engine handles commands in order, so this runs once the Connect
+        // above has attached (or failed, in which case it is refused with the
+        // usual "not connected" error).
+        match RunState::latest(&settings.checkpoint_dir()) {
+            Ok(Some(rs)) if rs.status == "running" => {
+                tracing::info!(
+                    "auto-resume requested; resuming '{}' @ '{}' ({}) with its prerequisites \
+                     skipped",
+                    rs.workflow,
+                    rs.step_name,
+                    rs.run_id
+                );
+                let _ = cmd_tx.send(crate::messages::UiCommand::ResumeCheckpoint {
+                    run_id: rs.run_id,
+                    skip_prereqs: true,
+                });
+            }
+            Ok(_) => tracing::info!("auto-resume requested, but there is no running checkpoint"),
+            Err(e) => tracing::warn!("auto-resume requested, but the checkpoint scan failed: {e}"),
+        }
     }
 
     // Run the GUI on the main thread.
@@ -599,6 +627,13 @@ fn run_typing_preview(file: Option<String>, rest: &[String]) -> i32 {
 /// `golem run "<workflow>" [k=v ...]`: run a workflow (and its dependencies)
 /// headlessly, streaming engine events to stdout and auto-answering prompts
 /// (Confirm=yes, others dismissed). Exit 0 unless a workflow failed/halted/stopped.
+/// Is the environment variable `name` set to `1`/`true`?
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn run_workflow_cli(
     mut settings: Settings,
     workflow: Option<String>,

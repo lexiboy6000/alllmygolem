@@ -32,7 +32,7 @@ use crate::messages::{
 use crate::registry::WorkflowRegistry;
 use crate::settings::Settings;
 
-use chain::ChainArgs;
+use chain::{ChainArgs, Prereqs};
 
 pub struct Engine;
 
@@ -148,7 +148,7 @@ impl Engine {
                                         targets: workflows,
                                         inputs,
                                         restore: None,
-                                        confirm_prereqs: false,
+                                        prereqs: Prereqs::RunAll,
                                     };
                                     current = Some(tokio::spawn(args.run()));
                                 }
@@ -321,7 +321,7 @@ impl Engine {
                                     targets,
                                     inputs,
                                     restore: None,
-                                    confirm_prereqs: true,
+                                    prereqs: Prereqs::Ask,
                                 };
                                 current = Some(tokio::spawn(args.run()));
                             }
@@ -370,7 +370,7 @@ impl Engine {
                                     targets,
                                     inputs,
                                     restore: None,
-                                    confirm_prereqs: false,
+                                    prereqs: Prereqs::RunAll,
                                 };
                                 current = Some(tokio::spawn(args.run()));
                             }
@@ -434,7 +434,10 @@ impl Engine {
                     });
                 }
 
-                UiCommand::ResumeCheckpoint { run_id } => {
+                UiCommand::ResumeCheckpoint {
+                    run_id,
+                    skip_prereqs,
+                } => {
                     if busy.load(Ordering::SeqCst) {
                         let _ = events
                             .send(EngineEvent::Error("a workflow is already running".into()));
@@ -463,7 +466,11 @@ impl Engine {
                                             targets,
                                             inputs: rs.inputs.clone(),
                                             restore: Some(rs),
-                                            confirm_prereqs: true,
+                                            prereqs: if skip_prereqs {
+                                                Prereqs::Skip
+                                            } else {
+                                                Prereqs::Ask
+                                            },
                                         };
                                         current = Some(tokio::spawn(args.run()));
                                     }

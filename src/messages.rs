@@ -159,8 +159,10 @@ pub enum UiCommand {
     PromptResponse { id: Uuid, value: PromptResponse },
     /// Apply edited settings.
     UpdateSettings(Box<Settings>),
-    /// Resume a workflow from a saved checkpoint.
-    ResumeCheckpoint { run_id: String },
+    /// Resume a workflow from a saved checkpoint. `skip_prereqs` leaves its
+    /// prerequisite workflows out without asking (an unattended `--resume`);
+    /// otherwise the usual prerequisites prompt is shown.
+    ResumeCheckpoint { run_id: String, skip_prereqs: bool },
     /// Graceful shutdown (window closing).
     Shutdown,
 }

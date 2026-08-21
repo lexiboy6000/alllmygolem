@@ -49,10 +49,25 @@ pub struct ChainArgs {
     /// When resuming from a checkpoint, the saved state to seed into the
     /// matching workflow's context before it runs.
     pub restore: Option<RunState>,
-    /// Whether to ask the user to confirm before running resolved prerequisites
-    /// that weren't explicitly listed. `true` for a manual single Run; `false`
-    /// for an explicit programmatic RunChain (e.g. the pipeline).
-    pub confirm_prereqs: bool,
+    /// What to do with resolved prerequisites that weren't explicitly listed.
+    pub prereqs: Prereqs,
+}
+
+/// What a run does with the prerequisite workflows its targets pull in but
+/// the caller didn't list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prereqs {
+    /// Ask before running them: a manual single Run, or a Resume pressed in
+    /// the GUI.
+    Ask,
+    /// Run them without asking: an explicit programmatic RunChain (the
+    /// pipeline, its queued next round) -- the caller already chose the set.
+    RunAll,
+    /// Leave them out without asking: an unattended resume from a checkpoint.
+    /// A workflow only writes a checkpoint once every prerequisite has
+    /// finished, so re-running them would redo a half-done round (workflow 0
+    /// pressing Open Multimango again, workflow 1 opening a fresh taskN).
+    Skip,
 }
 
 /// Best-effort event send; a closed GUI channel must never fail a run.
@@ -91,7 +106,7 @@ impl ChainArgs {
             targets,
             inputs,
             restore,
-            confirm_prereqs,
+            prereqs,
         } = self;
 
         busy.store(true, Ordering::SeqCst);
@@ -100,7 +115,7 @@ impl ChainArgs {
 
         run_inner(
             &registry, &browser, &input, &control, &prompts, &events, &settings, &commands,
-            &targets, &inputs, restore.as_ref(), confirm_prereqs,
+            &targets, &inputs, restore.as_ref(), prereqs,
         )
         .await;
 
@@ -125,7 +140,7 @@ async fn run_inner(
     targets: &[String],
     inputs: &BTreeMap<String, String>,
     restore: Option<&RunState>,
-    confirm_prereqs: bool,
+    prereq_policy: Prereqs,
 ) {
     // `queued` dedups across resolve_order expansions and run_after follow-ups so
     // nothing runs twice. `pending` is the deterministic FIFO of resolved names.
@@ -141,27 +156,34 @@ async fn run_inner(
     }
 
     // If this run pulls in prerequisite workflows the user did not explicitly
-    // select (resolved recursively), ask them to confirm before doing anything.
-    // Running a workflow with no dependencies shows no prompt.
+    // select (resolved recursively), apply `prereq_policy` before doing
+    // anything -- by default, ask. Running a workflow with no dependencies
+    // shows no prompt.
     let target_set: BTreeSet<&str> = targets.iter().map(String::as_str).collect();
     let prereqs: Vec<String> = pending
         .iter()
         .filter(|n| !target_set.contains(n.as_str()))
         .cloned()
         .collect();
-    if confirm_prereqs && !prereqs.is_empty() {
+    if prereq_policy != Prereqs::RunAll && !prereqs.is_empty() {
         let target_label = targets.join("\", \"");
-        let list = prereqs
-            .iter()
-            .map(|n| format!("  - {n}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let message = format!(
-            "Running \"{target_label}\" normally runs its prerequisite workflow(s) first, in \
-             order:\n\n{list}\n\nRun them too, or skip straight to \"{target_label}\" (use skip \
-             when the prerequisites' work is already done, e.g. re-running just this leg)?"
-        );
-        match ask_prereqs(prompts, events, control, message).await {
+        let decision = if prereq_policy == Prereqs::Skip {
+            PrereqDecision::SkipPrereqs
+        } else {
+            let list = prereqs
+                .iter()
+                .map(|n| format!("  - {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let message = format!(
+                "Running \"{target_label}\" normally runs its prerequisite workflow(s) first, \
+                 in order:\n\n{list}\n\nRun them too, or skip straight to \"{target_label}\" \
+                 (use skip when the prerequisites' work is already done, e.g. re-running just \
+                 this leg)?"
+            );
+            ask_prereqs(prompts, events, control, message).await
+        };
+        match decision {
             PrereqDecision::RunAll => {}
             PrereqDecision::SkipPrereqs => {
                 pending.retain(|n| target_set.contains(n.as_str()));

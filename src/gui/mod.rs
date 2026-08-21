@@ -252,7 +252,13 @@ impl GolemApp {
                         self.prompt_input.clear();
                     }
                 }
-                EngineEvent::WorkflowStarted { name } => self.push_log(format!(">> {name}")),
+                EngineEvent::WorkflowStarted { name } => {
+                    // A run is under way (possibly the resume itself, via
+                    // `--resume`): the banner's Resume would only be refused
+                    // with "a workflow is already running" now.
+                    self.resume = None;
+                    self.push_log(format!(">> {name}"));
+                }
                 EngineEvent::WorkflowFinished { name, outcome } => {
                     self.push_log(format!("[done] {name}: {outcome:?}"));
                     self.pipeline_on_finished(&name, &outcome);
@@ -492,6 +498,7 @@ impl GolemApp {
                 if ui.button("Resume").clicked() {
                     self.send(UiCommand::ResumeCheckpoint {
                         run_id: run_id.clone(),
+                        skip_prereqs: false,
                     });
                     self.resume = None;
                 }

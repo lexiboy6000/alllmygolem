@@ -185,6 +185,12 @@ escape hatches.
 - A non-aborting panic hook logs panics; the engine catches panics per workflow.
 - **Checkpoints** are written atomically after every `ctx.step(...)` to
   `golem-output/checkpoints/`. On startup Golem offers to resume the latest.
+  Start with `--connect` (or `GOLEM_AUTO_CONNECT=1`) to attach to Chrome
+  without pressing Connect, and `--resume` (or `GOLEM_AUTO_RESUME=1`) to also
+  pick the latest running checkpoint back up unattended -- it connects first
+  and skips the checkpointed workflow's prerequisites, which had already
+  finished when the checkpoint was written. That is how a Golem restarted
+  after a fix mid-round carries on with the same task.
 - **CDP auto-reconnect** with exponential backoff, and optional Chrome relaunch.
 
 ## Output layout
