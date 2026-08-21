@@ -20,9 +20,25 @@ proceeds untouched. Starting the server IS enabling the feature; stopping
 it disables it. It can never fail a round.
 
 - URL: `GOLEM_REWRITER_URL` env var, default `http://127.0.0.1:8091`
-- Stop: `pkill -x llama-server`
+- Stop: `systemctl --user stop llama-rewriter` (or `pkill -x llama-server` if launched by hand)
 
 ## Starting it
+
+On this machine it runs as a user systemd service that starts at login
+(`~/.config/systemd/user/llama-rewriter.service`, enabled 2026-08-21):
+
+```sh
+systemctl --user status llama-rewriter    # is it up?
+systemctl --user stop llama-rewriter      # disable the feature for now
+systemctl --user start llama-rewriter     # re-enable
+systemctl --user disable --now llama-rewriter   # stop and don't autostart
+```
+
+It restarts itself on failure, runs at `Nice=10` so it never starves the
+browser, and appends to `~/models/llama-server.log`. The manual launch
+below is the equivalent for a machine without the unit.
+
+### Manual launch
 
 The binary and model live outside the repo (they are ~2.5 GB):
 
