@@ -510,6 +510,18 @@ impl BrowserBackend for CdpBrowser {
         exclude: &str,
         timeout: Duration,
     ) -> Result<bool> {
+        self.switch_to_target_where(
+            &|u: &str| u.contains(url_substring) && (exclude.is_empty() || !u.contains(exclude)),
+            timeout,
+        )
+        .await
+    }
+
+    async fn switch_to_target_where(
+        &self,
+        accept: &(dyn for<'a> Fn(&'a str) -> bool + Send + Sync),
+        timeout: Duration,
+    ) -> Result<bool> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             // Clone the browser handle out of the lock so `pages()` (async) doesn't
@@ -521,8 +533,7 @@ impl BrowserBackend for CdpBrowser {
                 let mut matches: Vec<Page> = Vec::new();
                 for p in pages {
                     if let Some(u) = page_url_opt(&p, self.config.call_timeout).await
-                        && u.contains(url_substring)
-                        && (exclude.is_empty() || !u.contains(exclude))
+                        && accept(&u)
                     {
                         matches.push(p);
                     }

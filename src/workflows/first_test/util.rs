@@ -79,6 +79,42 @@ pub async fn focus_and_settle(ctx: &mut WorkflowCtx) -> Result<()> {
     Ok(())
 }
 
+/// Is `url` a Handshake task run page
+/// (`ai.joinhandshake.com/annotations/fellow/task/<uuid>/run`)? The same test
+/// the review leg applies to the tab it lands on.
+pub fn is_handshake_task_url(url: &str) -> bool {
+    url.contains("joinhandshake.com") && url.contains("/task/") && url.contains("/run")
+}
+
+/// Switch to the Handshake TASK tab -- not merely the newest Handshake tab.
+///
+/// `switch_to_target("ai.joinhandshake.com", ..)` adopts the newest tab on the
+/// domain, whichever page it shows. On 2026-08-21 (task200) that was a
+/// Projects page the user had opened in a second Chromium window while the
+/// multimango leg ran: the review leg adopted it, read `/fellow/projects`
+/// back, and halted with the evaluation fully entered and the claimed task's
+/// run page sitting untouched in the other window. So look for a run page
+/// first; only when none shows up within a few seconds fall back to the plain
+/// domain match -- the old behaviour, whose callers go on to check the URL or
+/// halt with guidance.
+pub async fn switch_to_handshake_tab(ctx: &WorkflowCtx, timeout: Duration) -> Result<bool> {
+    let quick = timeout.min(Duration::from_secs(5));
+    if ctx
+        .browser
+        .switch_to_target_where(&is_handshake_task_url, quick)
+        .await?
+    {
+        return Ok(true);
+    }
+    ctx.warn(
+        "no Handshake tab is on a task run page (.../task/<uuid>/run) -- falling back to the \
+         newest Handshake tab",
+    );
+    ctx.browser
+        .switch_to_target("ai.joinhandshake.com", "", timeout)
+        .await
+}
+
 // ----- step 7: ask Claude, then click its answers in ----------------------
 
 /// One criterion's judgment, as Claude is instructed to write it to the

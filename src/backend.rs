@@ -44,6 +44,19 @@ pub trait BrowserBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Like [`switch_to_target`](Self::switch_to_target), but the tab is chosen
+    /// by `accept(url)` instead of a substring pair -- for pages a plain
+    /// substring can't tell apart from their neighbours (a Handshake task run
+    /// page vs. any other Handshake page). Still picks the NEWEST accepted tab
+    /// and polls up to `timeout`. Default: unsupported.
+    async fn switch_to_target_where(
+        &self,
+        _accept: &(dyn for<'a> Fn(&'a str) -> bool + Send + Sync),
+        _timeout: Duration,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Close every page/tab whose URL contains `url_substring` EXCEPT the one
     /// currently being controlled. Returns how many were closed. Used to clear
     /// duplicate Vagon desktops (a blocked-then-retried connect, or a stale

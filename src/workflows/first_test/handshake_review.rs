@@ -138,16 +138,12 @@ impl Workflow for HandshakeReviewAndSubmit {
 
         // ---- switch to the Handshake task page --------------------------
         ctx.step("switch to the Handshake task page").await?;
-        if !ctx
-            .browser
-            .switch_to_target("ai.joinhandshake.com", "", timeout)
-            .await?
-        {
+        if !util::switch_to_handshake_tab(ctx, timeout).await? {
             return Err(ctx.halt("couldn't switch to the Handshake tab"));
         }
         util::focus_and_settle(ctx).await?;
         let hs_url = current_url_settled(ctx).await;
-        if !(hs_url.contains("/task/") && hs_url.contains("/run")) {
+        if !util::is_handshake_task_url(&hs_url) {
             return Err(util::halt_now(
                 ctx,
                 format!(
@@ -370,11 +366,7 @@ impl Workflow for HandshakeReviewAndSubmit {
 
         // ---- submit on Handshake ----------------------------------------
         ctx.step("submit on Handshake").await?;
-        if !ctx
-            .browser
-            .switch_to_target("ai.joinhandshake.com", "", timeout)
-            .await?
-        {
+        if !util::switch_to_handshake_tab(ctx, timeout).await? {
             return Err(ctx.halt("couldn't switch back to the Handshake tab"));
         }
         util::focus_and_settle(ctx).await?;
@@ -580,11 +572,7 @@ async fn wait_for_timer(
     target_secs: u64,
     epoch: tokio::time::Instant,
 ) -> Result<TimerWaitOutcome> {
-    if !ctx
-        .browser
-        .switch_to_target("ai.joinhandshake.com", "", switch_timeout)
-        .await?
-    {
+    if !util::switch_to_handshake_tab(ctx, switch_timeout).await? {
         return Err(ctx.halt("couldn't switch to the Handshake tab to read the timer"));
     }
     let mut first_read = true;

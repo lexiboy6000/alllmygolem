@@ -71,11 +71,7 @@ impl Workflow for OpenMultimango {
 
         // ---- switch to Handshake ----------------------------------------
         ctx.step("switch to the Handshake tab").await?;
-        if !ctx
-            .browser
-            .switch_to_target("ai.joinhandshake.com", "", timeout)
-            .await?
-        {
+        if !util::switch_to_handshake_tab(ctx, timeout).await? {
             return Err(util::halt_now(
                 ctx,
                 "no Handshake tab to click 'Open Multimango' in -- open the task run page \
